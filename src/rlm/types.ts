@@ -24,24 +24,51 @@ export interface LLMConfig {
 
 /** A single chat message in OpenAI format. */
 export interface ChatMessage {
-  role: "system" | "user" | "assistant";
+  role: "system" | "user" | "assistant" | "tool";
   content: string;
+  /** For assistant messages that called a tool */
+  tool_calls?: Array<{
+    id: string;
+    type: "function";
+    function: { name: string; arguments: string };
+  }>;
+  /** For role: "tool" — the id of the assistant's tool_call this responds to */
+  tool_call_id?: string;
 }
 
 /** The LLM's response from a single generation. */
 export interface LLMResponse {
   content: string;
   finishReason: string;
+  toolCalls?: Array<{
+    id: string;
+    type: "function";
+    function: { name: string; arguments: string };
+  }>;
   usage?: { promptTokens: number; completionTokens: number; totalTokens: number };
+}
+
+/** Options passed to chat() — includes OpenAI tools. */
+export interface ChatOptions {
+  tools?: Array<{
+    type: "function";
+    function: {
+      name: string;
+      description?: string;
+      parameters?: Record<string, unknown>;
+    };
+  }>;
+  toolChoice?: "auto" | "none" | "required" | { type: "function"; function: { name: string } };
 }
 
 /** LLM client interface. */
 export interface LLMClient {
-  chat(messages: ChatMessage[]): Promise<LLMResponse>;
+  chat(messages: ChatMessage[], options?: ChatOptions): Promise<LLMResponse>;
   /** Streaming variant — calls onChunk for each generated token. */
   chatStream?(
     messages: ChatMessage[],
     onChunk: (token: string) => void,
+    options?: ChatOptions,
   ): Promise<LLMResponse>;
   listModels(): Promise<string[]>;
 }

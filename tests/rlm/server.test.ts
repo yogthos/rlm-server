@@ -215,6 +215,72 @@ async function readSSE(resp: Response): Promise<Array<Record<string, unknown>>> 
   return events;
 }
 
+describe("RLM Server tool calls", () => {
+  it("accepts tools parameter without error", async () => {
+    const resp = await fetchRLM("/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        messages: [{ role: "user", content: "hi" }],
+        tools: [
+          {
+            type: "function",
+            function: {
+              name: "read_file",
+              description: "Read a file",
+              parameters: {
+                type: "object",
+                properties: { path: { type: "string" } },
+                required: ["path"],
+              },
+            },
+          },
+        ],
+      }),
+    });
+    expect(resp.status).toBe(200);
+  });
+
+  it("response has tool_calls field that is null when no tool invoked", async () => {
+    const resp = await fetchRLM("/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        messages: [{ role: "user", content: "hi" }],
+      }),
+    });
+    const data = (await resp.json()) as any;
+    // tool_calls should be absent or null when no tool invoked
+    const msg = data.choices[0].message;
+    expect(msg.tool_calls === undefined || msg.tool_calls === null).toBe(true);
+  });
+
+  it("accepts role: 'tool' messages in history", async () => {
+    const resp = await fetchRLM("/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        messages: [
+          { role: "user", content: "read /etc/hosts" },
+          {
+            role: "assistant",
+            content: "",
+            tool_calls: [
+              {
+                id: "call_abc",
+                type: "function",
+                function: { name: "read_file", arguments: '{"path":"/etc/hosts"}' },
+              },
+            ],
+          },
+          { role: "tool", tool_call_id: "call_abc", content: "127.0.0.1 localhost" },
+        ],
+      }),
+    });
+    expect(resp.status).toBe(200);
+  });
+});
+
 describe("RLM Server streaming", () => {
   it("streams with SSE content type", async () => {
     const resp = await fetchRLM("/v1/chat/completions", {

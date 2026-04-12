@@ -21,7 +21,18 @@ import {
   type LlamaContext,
   type LlamaContextSequence,
 } from "node-llama-cpp";
-import type { LLMConfig, LLMClient, ChatMessage, LLMResponse } from "./types.js";
+import type {
+  LLMConfig,
+  LLMClient,
+  ChatMessage,
+  LLMResponse,
+  ChatOptions,
+} from "./types.js";
+import {
+  convertToolsToFunctions,
+  convertToolCallToOpenAI,
+  type CapturedCall,
+} from "./tool-calls.js";
 
 // ─── Singleton model state ────────────────────────────────────────────
 
@@ -81,6 +92,7 @@ interface QueuedRequest {
   messages: ChatMessage[];
   config: LLMConfig;
   onChunk?: (token: string) => void;
+  options?: ChatOptions;
   resolve: (response: LLMResponse) => void;
   reject: (error: Error) => void;
 }
@@ -99,6 +111,7 @@ async function processQueue(): Promise<void> {
         req.messages,
         req.config,
         req.onChunk,
+        req.options,
       );
       req.resolve(response);
     } catch (err) {
@@ -113,9 +126,10 @@ function enqueue(
   messages: ChatMessage[],
   config: LLMConfig,
   onChunk?: (token: string) => void,
+  options?: ChatOptions,
 ): Promise<LLMResponse> {
   return new Promise<LLMResponse>((resolve, reject) => {
-    queue.push({ messages, config, onChunk, resolve, reject });
+    queue.push({ messages, config, onChunk, options, resolve, reject });
     processQueue();
   });
 }
@@ -202,6 +216,7 @@ async function runInference(
   messages: ChatMessage[],
   config: LLMConfig,
   onChunk?: (token: string) => void,
+  options?: ChatOptions,
 ): Promise<LLMResponse> {
   const { context, sequence } = await ensureModel(config);
   const { systemPrompt, priorHistory, lastUserMessage } =
@@ -248,7 +263,14 @@ async function runInference(
   }
 
   let tokenCount = 0;
-  const content = await activeSession!.prompt(lastUserMessage, {
+
+  // Build functions map from tools (if any) and capture calls
+  const captures: CapturedCall[] = [];
+  const functions = options?.tools && options.tools.length > 0
+    ? convertToolsToFunctions(options.tools, captures)
+    : undefined;
+
+  const promptOptions: Record<string, unknown> = {
     temperature: config.temperature ?? 0.7,
     topP: config.topP ?? 0.9,
     maxTokens: config.maxTokens ?? 4096,
@@ -256,15 +278,30 @@ async function runInference(
       tokenCount++;
       onChunk?.(chunk);
     },
-  });
+  };
+  if (functions) {
+    promptOptions.functions = functions;
+  }
+
+  const session = activeSession!;
+  const content = await session.prompt(
+    lastUserMessage,
+    promptOptions as Parameters<typeof session.prompt>[1],
+  );
 
   // Update activeHistory to reflect what was just added
   activeHistory.push({ type: "user", text: lastUserMessage });
   activeHistory.push({ type: "model", response: [content] });
 
+  // If any tool calls were captured, convert to OpenAI format
+  const toolCalls = captures.length > 0
+    ? captures.map(convertToolCallToOpenAI)
+    : undefined;
+
   return {
     content,
-    finishReason: "stop",
+    finishReason: toolCalls ? "tool_calls" : "stop",
+    toolCalls,
     usage: {
       promptTokens: 0,
       completionTokens: tokenCount,
@@ -277,15 +314,19 @@ async function runInference(
 
 export function createLocalLLMClient(config: LLMConfig): LLMClient {
   return {
-    chat(messages: ChatMessage[]): Promise<LLMResponse> {
-      return enqueue(messages, config);
+    chat(
+      messages: ChatMessage[],
+      options?: ChatOptions,
+    ): Promise<LLMResponse> {
+      return enqueue(messages, config, undefined, options);
     },
 
     chatStream(
       messages: ChatMessage[],
       onChunk: (token: string) => void,
+      options?: ChatOptions,
     ): Promise<LLMResponse> {
-      return enqueue(messages, config, onChunk);
+      return enqueue(messages, config, onChunk, options);
     },
 
     async listModels(): Promise<string[]> {

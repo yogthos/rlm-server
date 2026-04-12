@@ -11,10 +11,11 @@
 
 import http from "node:http";
 import crypto from "node:crypto";
-import type { ServerConfig, ChatMessage } from "./types.js";
+import type { ServerConfig, ChatMessage, ChatOptions } from "./types.js";
 import { createLLMClient } from "./llm-client.js";
 import { runRLMLoop } from "./loop.js";
 import { routeRequest } from "./routing.js";
+import type { OpenAITool } from "./tool-calls.js";
 
 const MAX_BODY_SIZE = 10 * 1024 * 1024; // 10MB
 
@@ -112,10 +113,12 @@ export function createServer(config: ServerConfig): http.Server {
         const body = await readBody(req);
         let request: {
           model?: string;
-          messages?: Array<{ role: string; content: string }>;
+          messages?: ChatMessage[];
           stream?: boolean;
           max_iterations?: number;
           rlm?: boolean;
+          tools?: OpenAITool[];
+          tool_choice?: ChatOptions["toolChoice"];
         };
 
         try {
@@ -183,22 +186,41 @@ export function createServer(config: ServerConfig): http.Server {
           // Initial role chunk
           emitChunk({ role: "assistant" });
 
+          const streamChatOptions: ChatOptions | undefined =
+            request.tools && request.tools.length > 0
+              ? { tools: request.tools, toolChoice: request.tool_choice }
+              : undefined;
+          // If tools are present, force direct mode (RLM doesn't support client tools)
+          const resolvedStreamMode = streamChatOptions ? "direct" : streamMode;
+
           try {
-            if (streamMode === "direct") {
+            if (resolvedStreamMode === "direct") {
               // Stream tokens directly from the model
+              let finalResp;
               if (llmClient.chatStream) {
-                await llmClient.chatStream(
+                finalResp = await llmClient.chatStream(
                   request.messages as ChatMessage[],
                   (token) => emitChunk({ content: token }),
+                  streamChatOptions,
                 );
               } else {
                 // Fallback: non-streaming client
-                const resp = await llmClient.chat(
+                finalResp = await llmClient.chat(
                   request.messages as ChatMessage[],
+                  streamChatOptions,
                 );
-                emitChunk({ content: resp.content });
+                emitChunk({ content: finalResp.content });
               }
-              emitChunk({}, "stop");
+
+              // If the model made tool calls, emit them as a delta before finishing
+              if (finalResp.toolCalls && finalResp.toolCalls.length > 0) {
+                emitChunk(
+                  { tool_calls: finalResp.toolCalls },
+                  "tool_calls",
+                );
+              } else {
+                emitChunk({}, "stop");
+              }
             } else {
               // RLM: emit iteration progress as content chunks
               const result = await runRLMLoop({
@@ -231,12 +253,32 @@ export function createServer(config: ServerConfig): http.Server {
           request.rlm,
         );
 
+        // Tools are always routed to direct mode — the RLM loop has its
+        // own sandbox tools and shouldn't mix with client tool calling.
+        const effectiveMode = request.tools && request.tools.length > 0
+          ? "direct"
+          : mode;
+
+        const chatOptions: ChatOptions | undefined =
+          request.tools && request.tools.length > 0
+            ? { tools: request.tools, toolChoice: request.tool_choice }
+            : undefined;
+
         try {
           let answer: string;
-          if (mode === "direct") {
-            // Short instruction / no tools needed — go straight to model
-            const resp = await llmClient.chat(request.messages as ChatMessage[]);
+          let toolCalls: ChatMessage["tool_calls"] | undefined;
+          let finishReason = "stop";
+
+          if (effectiveMode === "direct") {
+            const resp = await llmClient.chat(
+              request.messages as ChatMessage[],
+              chatOptions,
+            );
             answer = resp.content;
+            toolCalls = resp.toolCalls;
+            if (toolCalls && toolCalls.length > 0) {
+              finishReason = "tool_calls";
+            }
           } else {
             const result = await runRLMLoop({
               prompt,
@@ -248,20 +290,25 @@ export function createServer(config: ServerConfig): http.Server {
             answer = result.answer;
           }
 
+          const message: ChatMessage = {
+            role: "assistant",
+            content: answer,
+          };
+          if (toolCalls) {
+            message.tool_calls = toolCalls;
+          }
+
           jsonResponse(res, 200, {
             id: chatId,
             object: "chat.completion",
             created: Math.floor(Date.now() / 1000),
             model,
-            system_fingerprint: `mode=${mode}`,
+            system_fingerprint: `mode=${effectiveMode}`,
             choices: [
               {
                 index: 0,
-                message: {
-                  role: "assistant",
-                  content: answer,
-                } as ChatMessage,
-                finish_reason: "stop",
+                message,
+                finish_reason: finishReason,
               },
             ],
             usage: {
