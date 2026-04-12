@@ -190,7 +190,6 @@ export function createServer(config: ServerConfig): http.Server {
             "Cache-Control": "no-cache",
             Connection: "keep-alive",
             "Access-Control-Allow-Origin": "*",
-            "X-RLM-Mode": streamMode,
           });
 
           const emitChunk = (delta: Record<string, unknown>, finish: string | null = null) => {
@@ -335,7 +334,6 @@ export function createServer(config: ServerConfig): http.Server {
             object: "chat.completion",
             created: Math.floor(Date.now() / 1000),
             model,
-            system_fingerprint: `mode=${effectiveMode}`,
             choices: [
               {
                 index: 0,
