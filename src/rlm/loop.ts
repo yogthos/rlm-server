@@ -29,6 +29,7 @@ import { buildSystemPrompt } from "./system-prompt.js";
 import { z3Solve, Z3_IMPL } from "./z3-bridge.js";
 import { prologQuery, PROLOG_IMPL } from "./prolog-bridge.js";
 import { createGraphBridge, GRAPH_IMPL } from "./graph-bridge.js";
+import { debug } from "./debug.js";
 
 const MAX_NO_CODE_RETRIES = 3;
 const MAX_HISTORY_ENTRIES = 40;
@@ -46,6 +47,10 @@ function trimHistory(history: ChatMessage[]): ChatMessage[] {
 // ─── FSM State Handlers ───────────────────────────────────────────────
 
 async function initHandler(ctx: RLMContext): Promise<RLMContext> {
+  debug(
+    "rlm",
+    `init depth=${ctx.subRLMDepth}/${ctx.maxSubRLMDepth} prompt=${ctx.prompt.length}ch maxIter=${ctx.maxIterations}`,
+  );
   const handleStore = createHandleStore();
 
   // Build sub-RLM bridge for llm_query
@@ -121,10 +126,25 @@ async function initHandler(ctx: RLMContext): Promise<RLMContext> {
 
 async function generateHandler(ctx: RLMContext): Promise<RLMContext> {
   const trimmed = trimHistory(ctx.history);
+  const totalHistoryChars = trimmed.reduce((s, m) => s + m.content.length, 0);
+  debug(
+    "rlm",
+    `generate iter=${ctx.iteration} history=${trimmed.length}msg/${totalHistoryChars}ch`,
+  );
+  const chatStart = Date.now();
   const response = await ctx.llmClient.chat(trimmed);
+  const chatMs = Date.now() - chatStart;
   const llmOutput = response.content;
+  debug(
+    "rlm",
+    `generate completed in ${chatMs}ms, response ${llmOutput.length}ch`,
+  );
 
   const extraction = extractCode(llmOutput);
+  debug(
+    "rlm",
+    `extraction: code=${extraction.code ? extraction.code.length + "ch" : "none"} final=${!!extraction.finalAnswer} finalVar=${extraction.finalVar ?? "none"}`,
+  );
 
   // Append assistant message to history
   const history = [...ctx.history, { role: "assistant" as const, content: llmOutput }];
@@ -164,9 +184,14 @@ async function generateHandler(ctx: RLMContext): Promise<RLMContext> {
 async function executeHandler(ctx: RLMContext): Promise<RLMContext> {
   if (!ctx.sandbox || !ctx.lastCode) return ctx;
 
+  debug("rlm", `execute iter=${ctx.iteration} code=${ctx.lastCode.length}ch`);
   const startMs = Date.now();
   const result = await ctx.sandbox.execute(ctx.lastCode, ctx.sandboxTimeoutMs);
   const durationMs = Date.now() - startMs;
+  debug(
+    "rlm",
+    `execute completed in ${durationMs}ms, logs=${result.logs.length}, error=${result.error ?? "none"}`,
+  );
 
   const stdout = result.logs.join("\n");
   const error = result.error ?? null;
@@ -261,6 +286,10 @@ async function checkFinalHandler(ctx: RLMContext): Promise<RLMContext> {
 }
 
 function doneHandler(ctx: RLMContext): RLMContext {
+  debug(
+    "rlm",
+    `done depth=${ctx.subRLMDepth} iter=${ctx.iteration} answer=${ctx.finalAnswer?.length ?? 0}ch`,
+  );
   // Cleanup
   ctx.sandbox?.dispose();
   return {
@@ -387,6 +416,7 @@ export async function runRLMLoop(options: RunRLMOptions): Promise<RLMResult> {
 
   const finalCtx = await engine.run(spec, initialCtx, {
     onTransition: (from, to) => {
+      debug("rlm", `transition: ${from} → ${to}`);
       options.onIteration?.(initialCtx.iteration, `${from} → ${to}`);
     },
   });

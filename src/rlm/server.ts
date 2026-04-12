@@ -16,6 +16,7 @@ import { createLLMClient } from "./llm-client.js";
 import { runRLMLoop } from "./loop.js";
 import { routeRequest } from "./routing.js";
 import type { OpenAITool } from "./tool-calls.js";
+import { debug } from "./debug.js";
 
 const MAX_BODY_SIZE = 10 * 1024 * 1024; // 10MB
 
@@ -279,6 +280,10 @@ export function createServer(config: ServerConfig): http.Server {
           request.messages as ChatMessage[],
           request.rlm,
         );
+        debug(
+          "server",
+          `chat id=${chatId.slice(-8)} mode=${mode} msgs=${request.messages!.length} prompt=${prompt.length}ch tools=${request.tools?.length ?? 0}`,
+        );
 
         // Tools or response_format → always direct mode
         // (RLM loop has its own sandbox tools and free-form output)
@@ -295,6 +300,7 @@ export function createServer(config: ServerConfig): http.Server {
             }
           : undefined;
 
+        const reqStart = Date.now();
         try {
           let answer: string;
           let toolCalls: ChatMessage["tool_calls"] | undefined;
@@ -329,6 +335,12 @@ export function createServer(config: ServerConfig): http.Server {
             message.tool_calls = toolCalls;
           }
 
+          const totalMs = Date.now() - reqStart;
+          debug(
+            "server",
+            `chat completed id=${chatId.slice(-8)} mode=${effectiveMode} ${totalMs}ms answer=${answer.length}ch finish=${finishReason}`,
+          );
+
           jsonResponse(res, 200, {
             id: chatId,
             object: "chat.completion",
@@ -349,6 +361,8 @@ export function createServer(config: ServerConfig): http.Server {
           });
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
+          const totalMs = Date.now() - reqStart;
+          debug("server", `chat failed id=${chatId.slice(-8)} ${totalMs}ms error=${msg}`);
           errorResponse(res, 500, `RLM loop failed: ${msg}`, "server_error");
         }
 

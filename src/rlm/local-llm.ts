@@ -33,6 +33,7 @@ import {
   convertToolCallToOpenAI,
   type CapturedCall,
 } from "./tool-calls.js";
+import { debug } from "./debug.js";
 
 // ─── Singleton model state ────────────────────────────────────────────
 
@@ -106,6 +107,8 @@ async function processQueue(): Promise<void> {
 
   while (queue.length > 0) {
     const req = queue.shift()!;
+    debug("queue", `processing request, ${queue.length} more queued`);
+    const start = Date.now();
     try {
       const response = await runInference(
         req.messages,
@@ -113,8 +116,15 @@ async function processQueue(): Promise<void> {
         req.onChunk,
         req.options,
       );
+      const ms = Date.now() - start;
+      debug(
+        "queue",
+        `completed in ${ms}ms, ${response.usage?.completionTokens ?? 0} tokens`,
+      );
       req.resolve(response);
     } catch (err) {
+      const ms = Date.now() - start;
+      debug("queue", `failed after ${ms}ms:`, err);
       req.reject(err instanceof Error ? err : new Error(String(err)));
     }
   }
@@ -129,6 +139,10 @@ function enqueue(
   options?: ChatOptions,
 ): Promise<LLMResponse> {
   return new Promise<LLMResponse>((resolve, reject) => {
+    debug(
+      "queue",
+      `enqueue ${messages.length} messages, queue depth now ${queue.length + 1}`,
+    );
     queue.push({ messages, config, onChunk, options, resolve, reject });
     processQueue();
   });
