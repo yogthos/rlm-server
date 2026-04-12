@@ -45,7 +45,7 @@ Client (OpenAI format)
 │  │  JS Sandbox (VM)    │  │  llama.cpp   │  │
 │  │  • grep, fuzzy      │  │  (in-process │  │
 │  │  • z3 (WASM)        │  │   GGUF)      │  │
-│  │  • prolog            │  │              │  │
+│  │  • prolog           │  │              │  │
 │  │  • llm_query (sub)  │  └──────────────┘  │
 │  └─────────────────────┘                    │
 │                                             │
