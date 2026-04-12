@@ -156,12 +156,28 @@ function convertHistory(messages: ChatMessage[]): {
 
   const nonSystem = messages.filter((m) => m !== firstSystem);
 
-  // Pull off the trailing user message as the new prompt
-  let lastUserMessage = "";
+  // Format tool messages as text the model can understand. OpenAI's
+  // "role: tool" messages carry function results we need to inject
+  // back into the conversation so the model can reason over them.
+  const formatTool = (m: ChatMessage): string => {
+    const id = m.tool_call_id ? ` (id: ${m.tool_call_id})` : "";
+    return `Tool result${id}:\n${m.content}`;
+  };
+
+  // Build the history + identify the "prompt" (the last thing that
+  // needs a response). This is either a user message or a tool result.
+  let lastPrompt = "";
   const historyMessages = [...nonSystem];
+
   for (let i = historyMessages.length - 1; i >= 0; i--) {
-    if (historyMessages[i].role === "user") {
-      lastUserMessage = historyMessages[i].content;
+    const m = historyMessages[i];
+    if (m.role === "user") {
+      lastPrompt = m.content;
+      historyMessages.splice(i, 1);
+      break;
+    }
+    if (m.role === "tool") {
+      lastPrompt = formatTool(m);
       historyMessages.splice(i, 1);
       break;
     }
@@ -171,13 +187,27 @@ function convertHistory(messages: ChatMessage[]): {
     if (msg.role === "user") {
       priorHistory.push({ type: "user", text: msg.content });
     } else if (msg.role === "assistant") {
-      priorHistory.push({ type: "model", response: [msg.content] });
+      // For assistants that called a tool, synthesize the tool call
+      // back into text form so the model sees what it "said" before.
+      let text = msg.content ?? "";
+      if (msg.tool_calls && msg.tool_calls.length > 0) {
+        const callsStr = msg.tool_calls
+          .map(
+            (tc) =>
+              `[called ${tc.function.name} with ${tc.function.arguments}]`,
+          )
+          .join("\n");
+        text = text ? `${text}\n${callsStr}` : callsStr;
+      }
+      priorHistory.push({ type: "model", response: [text] });
+    } else if (msg.role === "tool") {
+      priorHistory.push({ type: "user", text: formatTool(msg) });
     } else if (msg.role === "system") {
       priorHistory.push({ type: "user", text: msg.content });
     }
   }
 
-  return { systemPrompt, priorHistory, lastUserMessage };
+  return { systemPrompt, priorHistory, lastUserMessage: lastPrompt };
 }
 
 /**
@@ -333,6 +363,11 @@ export function createLocalLLMClient(config: LLMConfig): LLMClient {
       return [config.model];
     },
   };
+}
+
+/** Exposed for tests — converts OpenAI messages to node-llama-cpp history. */
+export function convertMessagesForTesting(messages: ChatMessage[]) {
+  return convertHistory(messages);
 }
 
 /** Dispose the loaded model and free resources. */
