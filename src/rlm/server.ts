@@ -132,6 +132,18 @@ export function createServer(config: ServerConfig): http.Server {
 
       // ── Chat Completions ──
       if (url === "/v1/chat/completions" && req.method === "POST") {
+        // Abort when the client disconnects so we don't burn GPU cycles
+        // on a response no one will read.
+        const abortController = new AbortController();
+        const onClose = () => {
+          if (!res.writableEnded) {
+            debug("server", "client disconnected, aborting generation");
+            abortController.abort();
+          }
+        };
+        req.on("close", onClose);
+        res.on("close", onClose);
+
         const body = await readBody(req);
         let request: {
           model?: string;
@@ -211,13 +223,16 @@ export function createServer(config: ServerConfig): http.Server {
           const streamHasClientTools =
             (request.tools && request.tools.length > 0) ||
             request.response_format !== undefined;
-          const streamChatOptions: ChatOptions | undefined = streamHasClientTools
-            ? {
-                tools: request.tools,
-                toolChoice: request.tool_choice,
-                responseFormat: request.response_format,
-              }
-            : undefined;
+          const streamChatOptions: ChatOptions = {
+            signal: abortController.signal,
+            ...(streamHasClientTools
+              ? {
+                  tools: request.tools,
+                  toolChoice: request.tool_choice,
+                  responseFormat: request.response_format,
+                }
+              : {}),
+          };
           // If tools/response_format are present, force direct mode
           const resolvedStreamMode = streamHasClientTools ? "direct" : streamMode;
 
@@ -292,13 +307,16 @@ export function createServer(config: ServerConfig): http.Server {
           request.response_format !== undefined;
         const effectiveMode = hasClientTools ? "direct" : mode;
 
-        const chatOptions: ChatOptions | undefined = hasClientTools
-          ? {
-              tools: request.tools,
-              toolChoice: request.tool_choice,
-              responseFormat: request.response_format,
-            }
-          : undefined;
+        const chatOptions: ChatOptions = {
+          signal: abortController.signal,
+          ...(hasClientTools
+            ? {
+                tools: request.tools,
+                toolChoice: request.tool_choice,
+                responseFormat: request.response_format,
+              }
+            : {}),
+        };
 
         const reqStart = Date.now();
         // RLM mode can run for minutes; HTTP clients like undici have a

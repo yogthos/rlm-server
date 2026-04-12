@@ -31,7 +31,7 @@ export function loadConfig(overrides?: Partial<ServerConfig>): ServerConfig {
       maxTokens:
         num(process.env.RLM_MAX_TOKENS) ??
         overrides?.llm?.maxTokens ??
-        4096,
+        2048,
       temperature:
         num(process.env.RLM_TEMPERATURE) ??
         overrides?.llm?.temperature ??

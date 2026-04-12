@@ -63,6 +63,8 @@ export interface ChatOptions {
   responseFormat?:
     | { type: "json_object" }
     | { type: "json_schema"; json_schema: { schema: Record<string, unknown>; name?: string; strict?: boolean } };
+  /** Abort signal — cancel generation on client disconnect or timeout. */
+  signal?: AbortSignal;
 }
 
 /** LLM client interface. */

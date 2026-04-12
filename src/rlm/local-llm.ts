@@ -332,12 +332,16 @@ async function runInference(
   const promptOptions: Record<string, unknown> = {
     temperature: config.temperature ?? 0.7,
     topP: config.topP ?? 0.9,
-    maxTokens: config.maxTokens ?? 4096,
+    maxTokens: config.maxTokens ?? 2048,
     onTextChunk: (chunk: string) => {
       tokenCount++;
       onChunk?.(chunk);
     },
   };
+  if (options?.signal) {
+    promptOptions.signal = options.signal;
+    promptOptions.stopOnAbortSignal = true;
+  }
   if (functions) {
     promptOptions.functions = functions;
   } else if (grammar) {
