@@ -1,86 +1,143 @@
 # rlm-sandbox
 
-An RLM (Recursive Language Model) system that runs a GGUF model in-process and gives it a JavaScript sandbox with persistent variables, text search, Z3 constraint solving, and Prolog logic programming. Exposes an OpenAI-compatible HTTP API.
+An OpenAI-compatible LLM server that makes a local GGUF model smarter by giving it tools: a JavaScript sandbox, Z3 constraint solver, Tau Prolog, and tree-sitter code graph analysis. Designed as a drop-in backend for coding tools like opencode, Cursor, or Aider.
 
-Based on the [RLM paper](https://arxiv.org/abs/2512.24601) — improved with a JS sandbox (instead of Python), a descriptive handle system for token savings, and formal reasoning tools.
+Based on the [RLM paper](https://arxiv.org/abs/2512.24601). For tasks that need tool support (computation, constraint solving, large context analysis), the server runs a recursive loop that lets the model iterate through a sandbox. For routine queries it passes straight through to the model with no overhead.
 
 ## Quick Start
 
 ```bash
 npm install
 
-# Local inference (recommended — model downloads automatically)
-RLM_MODEL_PATH="hf:unsloth/gemma-4-26B-A4B-it-GGUF:Q4_K_M" npm start
+# Local inference — model downloads from HuggingFace automatically on first run
+RLM_MODEL_PATH="hf:unsloth/gemma-4-26B-A4B-it-GGUF:Q8_0" npm start
 
-# Or point to a local GGUF file
-RLM_MODEL_PATH=./models/gemma4.gguf npm start
+# Or point to an already-downloaded GGUF file
+RLM_MODEL_PATH=./models/gemma-4-q8.gguf npm start
 ```
 
-Then query the OpenAI-compatible API:
+Query as OpenAI:
 
 ```bash
 curl -s http://localhost:3000/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model":"gemma4","messages":[{"role":"user","content":"Find all primes under 20 and verify with z3"}]}' | jq .choices[0].message.content
+  -d '{
+    "messages": [{"role": "user", "content": "Hello"}]
+  }'
+```
+
+Tools:
+
+```bash
+curl -s http://localhost:3000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "messages": [{"role": "user", "content": "Read /etc/hosts"}],
+    "tools": [{
+      "type": "function",
+      "function": {
+        "name": "read_file",
+        "parameters": {"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}
+      }
+    }]
+  }'
+# → {"choices":[{"message":{"tool_calls":[{"id":"call_...","function":{"name":"read_file","arguments":"{\"path\":\"/etc/hosts\"}"}}]}, "finish_reason":"tool_calls"}]}
 ```
 
 ## Architecture
 
 ```
-Client (OpenAI format)
-  │
-  ▼
-┌─────────────────────────────────────────────┐
-│  RLM Server  (POST /v1/chat/completions)    │
-│                                             │
-│  ┌─────────────────────────────────────┐    │
-│  │  RLM Loop (FSM)                     │    │
-│  │                                     │    │
-│  │  init → generate → execute → check  │    │
-│  │           ▲                  │      │    │
-│  │           └──────────────────┘      │    │
-│  └──────────┬──────────────────────────┘    │
-│             │                               │
-│  ┌──────────▼──────────┐  ┌──────────────┐  │
-│  │  JS Sandbox (VM)    │  │  llama.cpp   │  │
-│  │  • grep, fuzzy      │  │  (in-process │  │
-│  │  • z3 (WASM)        │  │   GGUF)      │  │
-│  │  • prolog           │  │              │  │
-│  │  • llm_query (sub)  │  └──────────────┘  │
-│  └─────────────────────┘                    │
-│                                             │
-│  ┌─────────────────────────────────────┐    │
-│  │  Handle Store                       │    │
-│  │  $grep_error: Array(1000) [...]     │    │
-│  │  $z3_result: Object {status, ...}   │    │
-│  │  LLM sees stubs, not full data      │    │
-│  └─────────────────────────────────────┘    │
-└─────────────────────────────────────────────┘
+   ┌──────────────────┐
+   │  opencode / IDE  │       OpenAI-compatible API
+   └────────┬─────────┘
+            │ /v1/chat/completions
+            ▼
+   ┌──────────────────────────────────────────────┐
+   │                  Router                      │
+   │  short prompt, no tool keywords → direct     │
+   │  verify/z3/prolog/graph, large ctx → RLM     │
+   └───┬─────────────────────────────┬────────────┘
+       │                             │
+    direct                         RLM loop (FSM)
+       │                             │
+       │                             ▼
+       │                   ┌─────────────────────┐
+       │                   │  init → generate    │
+       │                   │  ↑         ↓        │
+       │                   │  check ← execute    │
+       │                   └──────┬──────────────┘
+       │                          │
+       │                          ▼
+       │          ┌─────────────────────────────────┐
+       │          │  JS Sandbox (VM)                │
+       │          │  • grep, fuzzy_search, stats    │
+       │          │  • z3 (WASM)                    │
+       │          │  • prolog (Tau Prolog)          │
+       │          │  • graph (tree-sitter, O(V+E))  │
+       │          │  • llm_query (recursive)        │
+       │          └─────────────────────────────────┘
+       │                          │
+       ▼                          ▼
+   ┌────────────────────────────────────────────┐
+   │  llama.cpp (in-process GGUF)               │
+   │  - single persistent context               │
+   │  - KV cache reuse across iterations        │
+   │  - request queue serializes access         │
+   └────────────────────────────────────────────┘
 ```
 
-The RLM loop iterates: the model generates JavaScript code, the sandbox executes it, results are stored as descriptive handles (stubs only fed back to the model), and the loop continues until the model calls `FINAL(answer)`. This lets the model do arbitrarily complex reasoning across many iterations while keeping its context window small.
+## Dual Routing
 
-## How It Works
+Not every request benefits from the RLM loop. The router decides per-request:
 
-1. Client sends a message via the OpenAI chat API
-2. The RLM loop loads the message as a `context` variable in a JS sandbox
-3. The model writes code in `` ```repl `` blocks to analyze the context
-4. Each execution result is stored as a **handle** — the model sees only compact stubs like `$grep_error: Array(1000) ["ERROR: timeout...", ...]` (~97% token savings)
-5. The model can use `z3()` for constraint solving, `prolog()` for logic programming, and `llm_query()` for recursive sub-calls
-6. When done, the model calls `FINAL(answer)` and the answer is returned to the client
+- **Direct mode**: short instruction prompts go straight to the model with token-level streaming. No overhead.
+- **RLM mode**: prompts with tool keywords (`verify`, `z3`, `prolog`, `call graph`, `impact`, etc.) or large attached context (> 2KB) run through the full loop where the model writes code, executes it, and iterates.
 
-## Tools Available in the Sandbox
+Override via the `rlm` request parameter: `"rlm": true` forces RLM, `"rlm": false` forces direct.
 
-| Tool | Description |
+Requests with `tools` or `response_format` are always direct (the client is handling tool calling itself).
+
+## RLM Loop Tools
+
+When the loop activates, the model has access to these tools inside the sandbox:
+
+| Tool | Use for |
 |---|---|
 | `grep(pattern, flags)` | Regex search with line numbers and capture groups |
-| `fuzzy_search(query, limit)` | Bitap fuzzy text matching |
+| `fuzzy_search(query, limit)` | Fuzzy text matching |
 | `locate_line(start, end)` | Extract lines by number |
 | `count_tokens(text)` | Token estimation |
-| `text_stats()` | Document metadata (length, line count, samples) |
-| `llm_query(prompt)` | Recursive sub-RLM call |
-| `z3(smtlib)` | Z3 constraint solver (SMT-LIB format, WASM) |
+| `text_stats()` | Context metadata |
+| `z3(smtlib, opts)` | Z3 constraint solver (WASM) |
 | `prolog(program, goal, opts)` | Tau Prolog logic engine |
+| `graph(files, analysis, opts)` | Tree-sitter code analysis: callers, callees, cycles, dead-code, impact, reachability, path |
+| `llm_query(prompt)` | Recursive sub-RLM call |
+
+Execution results are stored server-side as **handles**. The model sees stubs like `$grep_error: Array(1000) ["ERROR: timeout...", ...]` instead of full data (~97% token savings).
+
+The model finishes with `FINAL(answer)` or `FINAL_VAR(variableName)`.
+
+## API
+
+OpenAI-compatible surface. Tested with opencode. The server accepts all standard OpenAI fields plus a few extensions:
+
+| Endpoint | Description |
+|---|---|
+| `POST /v1/chat/completions` | Chat completion (non-streaming + SSE streaming) |
+| `GET /v1/models` | List available models |
+| `GET /v1/models/{id}` | Retrieve a specific model |
+| `GET /health` | Health check |
+
+Supported request fields:
+- `messages` — OpenAI chat messages (supports `role: "tool"` for function results)
+- `stream` — SSE streaming with OpenAI `chat.completion.chunk` deltas
+- `tools`, `tool_choice` — function calling
+- `response_format` — `{"type": "json_object"}` or `{"type": "json_schema", "json_schema": {"schema": ...}}`
+- `temperature`, `max_tokens`, `top_p`
+- `rlm` — extension flag for explicit direct/RLM routing
+- `max_iterations` — extension (clamped to server ceiling)
+
+Tool calling returns OpenAI-format `tool_calls` with `finish_reason: "tool_calls"`.
 
 ## Configuration
 
@@ -89,20 +146,18 @@ All via environment variables:
 | Variable | Default | Description |
 |---|---|---|
 | `RLM_MODEL_PATH` | — | GGUF path or HuggingFace URI (local inference) |
-| `OLLAMA_BASE_URL` | `http://localhost:11434` | Remote LLM endpoint (fallback) |
-| `RLM_MODEL` | `gemma4` | Model name for API responses |
+| `OLLAMA_BASE_URL` | — | Remote LLM endpoint (fallback if no local model path) |
+| `RLM_MODEL` | `gemma4` | Model name reported to clients |
 | `RLM_PORT` | `3000` | Server port |
-| `RLM_MAX_ITERATIONS` | `30` | Max reasoning iterations per request |
-| `RLM_TEMPERATURE` | `0.7` | Sampling temperature |
+| `RLM_HOST` | `0.0.0.0` | Bind host |
+| `RLM_MAX_ITERATIONS` | `30` | Max RLM iterations per request |
+| `RLM_TEMPERATURE` | `0.7` | Default sampling temperature |
+| `RLM_MAX_TOKENS` | `4096` | Default max generation tokens |
 | `RLM_CONTEXT_WINDOW` | `131072` | Context window size (tokens) |
 | `RLM_GPU_LAYERS` | auto | GPU layers to offload (-1=all, 0=CPU) |
 | `RLM_SANDBOX_TIMEOUT` | `30000` | Sandbox execution timeout (ms) |
-
-## API Endpoints
-
-- `POST /v1/chat/completions` — OpenAI-compatible chat (streaming supported with `"stream": true`)
-- `GET /v1/models` — List available models
-- `GET /health` — Health check
+| `RLM_MAX_HANDLES` | `200` | Max handles before LRU eviction |
+| `RLM_MAX_SUB_DEPTH` | `3` | Max sub-RLM recursion depth |
 
 ## Programmatic Usage
 
@@ -110,12 +165,12 @@ All via environment variables:
 import { runRLMLoop, createLLMClient } from "rlm-sandbox/rlm";
 
 const client = createLLMClient({
-  modelPath: "hf:unsloth/gemma-4-26B-A4B-it-GGUF:Q4_K_M",
+  modelPath: "hf:unsloth/gemma-4-26B-A4B-it-GGUF:Q8_0",
   model: "gemma4",
 });
 
 const result = await runRLMLoop({
-  prompt: "Analyze this data and find anomalies...",
+  prompt: "Analyze these 100k log lines and find anomalies...",
   llmClient: client,
   maxIterations: 10,
 });
@@ -126,7 +181,7 @@ console.log(`Completed in ${result.iterations} iterations`);
 
 ## Paper
 
-This project implements and extends the RLM (Recursive Language Model) inference paradigm:
+Implements and extends the RLM paradigm:
 
 > **Scaling Inference-Time Search with Recursive Language Models**
 > Sehoon Kim, Shobhit Gupta, Amir Gholami, Kurt Keutzer
@@ -135,9 +190,11 @@ This project implements and extends the RLM (Recursive Language Model) inference
 Key differences from the paper:
 - JavaScript sandbox instead of Python REPL
 - Descriptive handle system for ~97% token savings (from [Matryoshka](https://github.com/yogthos/Matryoshka))
-- Z3 constraint solver and Tau Prolog available as sandbox tools (from [Chiasmus](https://github.com/yogthos/chiasmus))
-- Tree-sitter code graph analysis for structural reasoning about code
-- In-process GGUF inference via node-llama-cpp (no Ollama dependency)
+- Z3 constraint solver and Tau Prolog as sandbox tools (from [Chiasmus](https://github.com/yogthos/chiasmus))
+- Tree-sitter code graph analysis with O(V+E) native algorithms
+- In-process GGUF inference via node-llama-cpp (no separate inference server)
+- Dual routing so simple queries don't pay RLM overhead
+- OpenAI-compatible API with full tool calling + structured output
 
 See [docs/benchmark.md](docs/benchmark.md) for comparison results.
 
