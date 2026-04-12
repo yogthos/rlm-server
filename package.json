@@ -1,0 +1,80 @@
+{
+  "name": "rlm-sandbox",
+  "version": "0.1.1",
+  "type": "module",
+  "description": "RLM system with JS sandbox, descriptive handles, Z3 solver, and Tau Prolog — exposes OpenAI-compatible API",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "rlm-server": "./dist/bin/rlm-server.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./sandbox": {
+      "types": "./dist/sandbox.d.ts",
+      "default": "./dist/sandbox.js"
+    },
+    "./builtins": {
+      "types": "./dist/builtins/index.d.ts",
+      "default": "./dist/builtins/index.js"
+    },
+    "./session": {
+      "types": "./dist/session.d.ts",
+      "default": "./dist/session.js"
+    },
+    "./fsm": {
+      "types": "./dist/fsm.d.ts",
+      "default": "./dist/fsm.js"
+    },
+    "./correction-loop": {
+      "types": "./dist/correction-loop.d.ts",
+      "default": "./dist/correction-loop.js"
+    },
+    "./rlm": {
+      "types": "./dist/rlm/index.d.ts",
+      "default": "./dist/rlm/index.js"
+    }
+  },
+  "files": [
+    "dist/",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run build",
+    "start": "tsx bin/rlm-server.ts",
+    "test": "vitest",
+    "test:run": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "rlm",
+    "reasoning",
+    "sandbox",
+    "repl",
+    "z3",
+    "prolog",
+    "openai-api",
+    "llm"
+  ],
+  "license": "Apache-2.0",
+  "author": "yogthos",
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0",
+    "vitest": "^4.0.17"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "node-llama-cpp": "^3.18.1",
+    "tau-prolog": "^0.3.4",
+    "z3-solver": "^4.16.0"
+  }
+}
