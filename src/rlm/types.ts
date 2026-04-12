@@ -38,6 +38,11 @@ export interface LLMResponse {
 /** LLM client interface. */
 export interface LLMClient {
   chat(messages: ChatMessage[]): Promise<LLMResponse>;
+  /** Streaming variant — calls onChunk for each generated token. */
+  chatStream?(
+    messages: ChatMessage[],
+    onChunk: (token: string) => void,
+  ): Promise<LLMResponse>;
   listModels(): Promise<string[]>;
 }
 

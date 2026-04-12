@@ -155,88 +155,69 @@ export function createServer(config: ServerConfig): http.Server {
 
         if (stream) {
           // ── Streaming SSE ──
+          const streamMode = routeRequest(
+            request.messages as ChatMessage[],
+            request.rlm,
+          );
+
           res.writeHead(200, {
             "Content-Type": "text/event-stream",
             "Cache-Control": "no-cache",
             Connection: "keep-alive",
             "Access-Control-Allow-Origin": "*",
+            "X-RLM-Mode": streamMode,
           });
 
+          const emitChunk = (delta: Record<string, unknown>, finish: string | null = null) => {
+            res.write(
+              sseChunk({
+                id: chatId,
+                object: "chat.completion.chunk",
+                created: Math.floor(Date.now() / 1000),
+                model,
+                choices: [{ index: 0, delta, finish_reason: finish }],
+              }),
+            );
+          };
+
           // Initial role chunk
-          res.write(
-            sseChunk({
-              id: chatId,
-              object: "chat.completion.chunk",
-              created: Math.floor(Date.now() / 1000),
-              model,
-              choices: [
-                { index: 0, delta: { role: "assistant" }, finish_reason: null },
-              ],
-            }),
-          );
+          emitChunk({ role: "assistant" });
 
           try {
-            const result = await runRLMLoop({
-              prompt,
-              llmClient,
-              maxIterations,
-              sandboxTimeoutMs: config.sandboxTimeoutMs,
-              maxSubRLMDepth: config.maxSubRLMDepth,
-              onIteration: (iteration, state) => {
-                // Emit progress as content chunks
-                res.write(
-                  sseChunk({
-                    id: chatId,
-                    object: "chat.completion.chunk",
-                    created: Math.floor(Date.now() / 1000),
-                    model,
-                    choices: [
-                      {
-                        index: 0,
-                        delta: {
-                          content: `[iteration ${iteration}: ${state}]\n`,
-                        },
-                        finish_reason: null,
-                      },
-                    ],
-                  }),
+            if (streamMode === "direct") {
+              // Stream tokens directly from the model
+              if (llmClient.chatStream) {
+                await llmClient.chatStream(
+                  request.messages as ChatMessage[],
+                  (token) => emitChunk({ content: token }),
                 );
-              },
-            });
-
-            // Final content chunk
-            res.write(
-              sseChunk({
-                id: chatId,
-                object: "chat.completion.chunk",
-                created: Math.floor(Date.now() / 1000),
-                model,
-                choices: [
-                  {
-                    index: 0,
-                    delta: { content: result.answer },
-                    finish_reason: "stop",
-                  },
-                ],
-              }),
-            );
+              } else {
+                // Fallback: non-streaming client
+                const resp = await llmClient.chat(
+                  request.messages as ChatMessage[],
+                );
+                emitChunk({ content: resp.content });
+              }
+              emitChunk({}, "stop");
+            } else {
+              // RLM: emit iteration progress as content chunks
+              const result = await runRLMLoop({
+                prompt,
+                llmClient,
+                maxIterations,
+                sandboxTimeoutMs: config.sandboxTimeoutMs,
+                maxSubRLMDepth: config.maxSubRLMDepth,
+                onIteration: (iteration, state) => {
+                  emitChunk({
+                    content: `[iteration ${iteration}: ${state}]\n`,
+                  });
+                },
+              });
+              emitChunk({ content: result.answer }, "stop");
+            }
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
-            res.write(
-              sseChunk({
-                id: chatId,
-                object: "chat.completion.chunk",
-                created: Math.floor(Date.now() / 1000),
-                model,
-                choices: [
-                  {
-                    index: 0,
-                    delta: { content: `Error: ${msg}` },
-                    finish_reason: "stop",
-                  },
-                ],
-              }),
-            );
+            emitChunk({ content: `Error: ${msg}` }, "stop");
           }
 
           res.write("data: [DONE]\n\n");

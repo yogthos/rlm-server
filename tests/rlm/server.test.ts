@@ -196,3 +196,102 @@ describe("RLM Server", () => {
     expect(resp.headers.get("Access-Control-Allow-Origin")).toBe("*");
   });
 });
+
+// ─── SSE parsing helper ───
+
+async function readSSE(resp: Response): Promise<Array<Record<string, unknown>>> {
+  const text = await resp.text();
+  const events: Array<Record<string, unknown>> = [];
+  for (const line of text.split("\n")) {
+    if (!line.startsWith("data: ")) continue;
+    const payload = line.slice(6).trim();
+    if (payload === "[DONE]") continue;
+    try {
+      events.push(JSON.parse(payload));
+    } catch {
+      /* skip malformed */
+    }
+  }
+  return events;
+}
+
+describe("RLM Server streaming", () => {
+  it("streams with SSE content type", async () => {
+    const resp = await fetchRLM("/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        messages: [{ role: "user", content: "hi" }],
+        stream: true,
+      }),
+    });
+
+    expect(resp.status).toBe(200);
+    expect(resp.headers.get("Content-Type")).toContain("text/event-stream");
+  });
+
+  it("streaming short prompt routes to direct mode", async () => {
+    const resp = await fetchRLM("/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        messages: [{ role: "user", content: "hi" }],
+        stream: true,
+      }),
+    });
+
+    const events = await readSSE(resp);
+    expect(events.length).toBeGreaterThan(0);
+
+    // Should NOT contain RLM iteration progress markers
+    const allContent = events
+      .flatMap((e: any) => e.choices ?? [])
+      .map((c: any) => c.delta?.content ?? "")
+      .join("");
+    expect(allContent).not.toContain("[iteration");
+
+    // Last event should have finish_reason
+    const lastChoice = events[events.length - 1] as any;
+    const finishReason = lastChoice?.choices?.[0]?.finish_reason;
+    expect(finishReason).toBe("stop");
+  });
+
+  it("streaming with rlm:true forces RLM mode", async () => {
+    const resp = await fetchRLM("/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        messages: [{ role: "user", content: "compute" }],
+        stream: true,
+        rlm: true,
+      }),
+    });
+
+    const events = await readSSE(resp);
+    expect(events.length).toBeGreaterThan(0);
+    // RLM mode emits iteration progress markers
+    const allContent = events
+      .flatMap((e: any) => e.choices ?? [])
+      .map((c: any) => c.delta?.content ?? "")
+      .join("");
+    expect(allContent).toContain("[iteration");
+  });
+
+  it("streaming emits OpenAI-format chunks", async () => {
+    const resp = await fetchRLM("/v1/chat/completions", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        messages: [{ role: "user", content: "hi" }],
+        stream: true,
+      }),
+    });
+
+    const events = await readSSE(resp);
+    for (const event of events) {
+      expect(event.object).toBe("chat.completion.chunk");
+      expect(event.id).toMatch(/^chatcmpl-/);
+      expect(Array.isArray(event.choices)).toBe(true);
+    }
+  });
+});

@@ -80,6 +80,7 @@ async function ensureModel(config: LLMConfig): Promise<{
 interface QueuedRequest {
   messages: ChatMessage[];
   config: LLMConfig;
+  onChunk?: (token: string) => void;
   resolve: (response: LLMResponse) => void;
   reject: (error: Error) => void;
 }
@@ -94,7 +95,11 @@ async function processQueue(): Promise<void> {
   while (queue.length > 0) {
     const req = queue.shift()!;
     try {
-      const response = await runInference(req.messages, req.config);
+      const response = await runInference(
+        req.messages,
+        req.config,
+        req.onChunk,
+      );
       req.resolve(response);
     } catch (err) {
       req.reject(err instanceof Error ? err : new Error(String(err)));
@@ -104,9 +109,13 @@ async function processQueue(): Promise<void> {
   processing = false;
 }
 
-function enqueue(messages: ChatMessage[], config: LLMConfig): Promise<LLMResponse> {
+function enqueue(
+  messages: ChatMessage[],
+  config: LLMConfig,
+  onChunk?: (token: string) => void,
+): Promise<LLMResponse> {
   return new Promise<LLMResponse>((resolve, reject) => {
-    queue.push({ messages, config, resolve, reject });
+    queue.push({ messages, config, onChunk, resolve, reject });
     processQueue();
   });
 }
@@ -192,6 +201,7 @@ function canReuseSession(
 async function runInference(
   messages: ChatMessage[],
   config: LLMConfig,
+  onChunk?: (token: string) => void,
 ): Promise<LLMResponse> {
   const { context, sequence } = await ensureModel(config);
   const { systemPrompt, priorHistory, lastUserMessage } =
@@ -242,8 +252,9 @@ async function runInference(
     temperature: config.temperature ?? 0.7,
     topP: config.topP ?? 0.9,
     maxTokens: config.maxTokens ?? 4096,
-    onTextChunk: () => {
+    onTextChunk: (chunk: string) => {
       tokenCount++;
+      onChunk?.(chunk);
     },
   });
 
@@ -268,6 +279,13 @@ export function createLocalLLMClient(config: LLMConfig): LLMClient {
   return {
     chat(messages: ChatMessage[]): Promise<LLMResponse> {
       return enqueue(messages, config);
+    },
+
+    chatStream(
+      messages: ChatMessage[],
+      onChunk: (token: string) => void,
+    ): Promise<LLMResponse> {
+      return enqueue(messages, config, onChunk);
     },
 
     async listModels(): Promise<string[]> {
