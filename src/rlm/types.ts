@@ -135,6 +135,7 @@ export interface RLMContext {
   readonly sandboxTimeoutMs: number;
   readonly maxSubRLMDepth: number;
   readonly subRLMDepth: number;
+  readonly signal?: AbortSignal;
 
   // Mutable state
   sandbox: Sandbox | null;
@@ -146,6 +147,8 @@ export interface RLMContext {
   lastLLMOutput: string | null;
   lastError: string | null;
   noCodeCount: number;
+  /** Number of consecutive iterations where the last error was the same. */
+  repeatedErrorCount: number;
   trace: TraceEntry[];
 }
 

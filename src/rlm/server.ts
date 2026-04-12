@@ -272,6 +272,7 @@ export function createServer(config: ServerConfig): http.Server {
                 maxIterations,
                 sandboxTimeoutMs: config.sandboxTimeoutMs,
                 maxSubRLMDepth: config.maxSubRLMDepth,
+                signal: abortController.signal,
                 onIteration: (iteration, state) => {
                   emitChunk({
                     content: `[iteration ${iteration}: ${state}]\n`,
@@ -366,6 +367,7 @@ export function createServer(config: ServerConfig): http.Server {
               maxIterations,
               sandboxTimeoutMs: config.sandboxTimeoutMs,
               maxSubRLMDepth: config.maxSubRLMDepth,
+              signal: abortController.signal,
             });
             answer = result.answer;
           }

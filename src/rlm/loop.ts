@@ -32,6 +32,8 @@ import { createGraphBridge, GRAPH_IMPL } from "./graph-bridge.js";
 import { debug } from "./debug.js";
 
 const MAX_NO_CODE_RETRIES = 3;
+/** If the same error appears this many times in a row, force final answer. */
+const MAX_REPEATED_ERRORS = 3;
 /** Keep the last N assistant/user pairs in RLM history. The paper's
  *  approach: handles carry state across iterations, so recent turns
  *  are enough context. Everything older is redundant with the handles. */
@@ -141,7 +143,10 @@ async function generateHandler(ctx: RLMContext): Promise<RLMContext> {
     `generate iter=${ctx.iteration} history=${trimmed.length}msg/${totalHistoryChars}ch`,
   );
   const chatStart = Date.now();
-  const response = await ctx.llmClient.chat(trimmed);
+  const response = await ctx.llmClient.chat(
+    trimmed,
+    ctx.signal ? { signal: ctx.signal } : undefined,
+  );
   const chatMs = Date.now() - chatStart;
   const llmOutput = response.content;
   debug(
@@ -247,12 +252,21 @@ async function executeHandler(ctx: RLMContext): Promise<RLMContext> {
     { role: "user" as const, content: feedback },
   ];
 
+  // Track repeated-error streaks — same error message twice in a row
+  // means the model's self-correction is failing. We bail after N.
+  const isRepeat = error !== null && error === ctx.lastError;
+  const repeatedErrorCount = isRepeat ? ctx.repeatedErrorCount + 1 : 0;
+  if (isRepeat) {
+    debug("rlm", `repeated error (${repeatedErrorCount}): ${error?.slice(0, 80)}`);
+  }
+
   return {
     ...ctx,
     history,
     trace,
     lastError: error,
     lastCode: null,
+    repeatedErrorCount,
   };
 }
 
@@ -260,6 +274,32 @@ async function checkFinalHandler(ctx: RLMContext): Promise<RLMContext> {
   if (ctx.finalAnswer) return ctx;
 
   const nextIteration = ctx.iteration + 1;
+
+  // Abort signal from outside (e.g. client disconnected) → terminate loop
+  if (ctx.signal?.aborted) {
+    debug("rlm", "loop aborted by signal");
+    return {
+      ...ctx,
+      iteration: nextIteration,
+      finalAnswer: "Request aborted.",
+    };
+  }
+
+  // Stuck in a loop — same error repeating. Force final with error context.
+  if (ctx.repeatedErrorCount >= MAX_REPEATED_ERRORS) {
+    debug(
+      "rlm",
+      `forcing final after ${ctx.repeatedErrorCount} repeated errors`,
+    );
+    const history = [
+      ...ctx.history,
+      {
+        role: "user" as const,
+        content: `The same error has occurred ${ctx.repeatedErrorCount + 1} times in a row: ${ctx.lastError}. You are clearly stuck. Provide your FINAL(answer) based on what you've learned so far, or admit you cannot solve the task. Do not write more code.`,
+      },
+    ];
+    return { ...ctx, history, iteration: nextIteration, repeatedErrorCount: 0 };
+  }
 
   // Force final answer on last iteration
   if (nextIteration >= ctx.maxIterations) {
@@ -382,6 +422,8 @@ export interface RunRLMOptions {
   maxSubRLMDepth?: number;
   subRLMDepth?: number;
   onIteration?: (iteration: number, state: string) => void;
+  /** Aborts the entire loop — current generation AND subsequent iterations. */
+  signal?: AbortSignal;
 }
 
 /**
@@ -398,6 +440,7 @@ export async function runRLMLoop(options: RunRLMOptions): Promise<RLMResult> {
     sandboxTimeoutMs = 30_000,
     maxSubRLMDepth = 3,
     subRLMDepth = 0,
+    signal,
   } = options;
 
   const initialCtx: RLMContext = {
@@ -408,6 +451,7 @@ export async function runRLMLoop(options: RunRLMOptions): Promise<RLMResult> {
     sandboxTimeoutMs,
     maxSubRLMDepth,
     subRLMDepth,
+    signal,
     sandbox: null,
     handleStore: createHandleStore(),
     history: [],
@@ -417,6 +461,7 @@ export async function runRLMLoop(options: RunRLMOptions): Promise<RLMResult> {
     lastLLMOutput: null,
     lastError: null,
     noCodeCount: 0,
+    repeatedErrorCount: 0,
     trace: [],
   };
 
