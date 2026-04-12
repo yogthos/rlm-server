@@ -124,6 +124,23 @@ console.log(result.answer);
 console.log(`Completed in ${result.iterations} iterations`);
 ```
 
+## Paper
+
+This project implements and extends the RLM (Recursive Language Model) inference paradigm:
+
+> **Scaling Inference-Time Search with Recursive Language Models**
+> Sehoon Kim, Shobhit Gupta, Amir Gholami, Kurt Keutzer
+> [arXiv:2512.24601](https://arxiv.org/abs/2512.24601)
+
+Key differences from the paper:
+- JavaScript sandbox instead of Python REPL
+- Descriptive handle system for ~97% token savings (from [Matryoshka](https://github.com/yogthos/Matryoshka))
+- Z3 constraint solver and Tau Prolog available as sandbox tools (from [Chiasmus](https://github.com/yogthos/chiasmus))
+- Tree-sitter code graph analysis for structural reasoning about code
+- In-process GGUF inference via node-llama-cpp (no Ollama dependency)
+
+See [docs/benchmark.md](docs/benchmark.md) for comparison results.
+
 ## License
 
 Apache-2.0
