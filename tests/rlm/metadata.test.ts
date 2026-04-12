@@ -3,6 +3,8 @@ import {
   promptMetadata,
   stdoutMetadata,
   resultMetadata,
+  isLikelyCode,
+  guessContentType,
 } from "../../src/rlm/metadata.js";
 
 describe("promptMetadata", () => {
@@ -95,5 +97,57 @@ describe("resultMetadata", () => {
   it("shows primitives directly", () => {
     expect(resultMetadata(42)).toBe("Result: 42");
     expect(resultMetadata(true)).toBe("Result: true");
+  });
+});
+
+describe("isLikelyCode", () => {
+  it("detects TypeScript by file extension", () => {
+    expect(isLikelyCode("see src/app.ts for details")).toBe(true);
+  });
+
+  it("detects Python by patterns", () => {
+    expect(
+      isLikelyCode('def hello():\n    return "world"\nimport os'),
+    ).toBe(true);
+  });
+
+  it("detects JavaScript by patterns", () => {
+    expect(
+      isLikelyCode("function foo() {}\nconst bar = () => {};"),
+    ).toBe(true);
+  });
+
+  it("rejects regular prose", () => {
+    expect(
+      isLikelyCode("The quick brown fox jumps over the lazy dog."),
+    ).toBe(false);
+  });
+
+  it("rejects text that just mentions programming", () => {
+    expect(
+      isLikelyCode("I want to learn programming and write functions."),
+    ).toBe(false);
+  });
+});
+
+describe("guessContentType", () => {
+  it("identifies source code via strong patterns", () => {
+    expect(
+      guessContentType("function foo() { return 1; }\nconst x = foo();"),
+    ).toBe("source code");
+  });
+
+  it("identifies JSON", () => {
+    expect(guessContentType('{"key": "value"}')).toBe("JSON document");
+  });
+
+  it("identifies markdown", () => {
+    expect(guessContentType("# Title\n\nBody text")).toBe("Markdown document");
+  });
+
+  it("defaults to text document", () => {
+    expect(guessContentType("Just some plain prose here.")).toBe(
+      "text document",
+    );
   });
 });

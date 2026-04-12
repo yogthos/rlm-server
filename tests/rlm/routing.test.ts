@@ -1,0 +1,68 @@
+import { describe, it, expect } from "vitest";
+import { routeRequest } from "../../src/rlm/routing.js";
+import type { ChatMessage } from "../../src/rlm/types.js";
+
+function user(content: string): ChatMessage {
+  return { role: "user", content };
+}
+
+describe("routeRequest", () => {
+  it("explicit override: rlm=true forces RLM", () => {
+    expect(routeRequest([user("hello")], true)).toBe("rlm");
+  });
+
+  it("explicit override: rlm=false forces direct", () => {
+    expect(
+      routeRequest([user("search this long document for errors")], false),
+    ).toBe("direct");
+  });
+
+  it("short instruction → direct", () => {
+    expect(routeRequest([user("Write a function to sort an array")])).toBe(
+      "direct",
+    );
+  });
+
+  it("short conversational → direct", () => {
+    expect(routeRequest([user("What is TypeScript?")])).toBe("direct");
+  });
+
+  it("tool keyword 'verify' → rlm", () => {
+    expect(
+      routeRequest([user("Verify that this equation has a solution")]),
+    ).toBe("rlm");
+  });
+
+  it("tool keyword 'z3' → rlm", () => {
+    expect(routeRequest([user("Use z3 to find x where x^2 = 25")])).toBe(
+      "rlm",
+    );
+  });
+
+  it("tool keyword 'call graph' → rlm", () => {
+    expect(routeRequest([user("Show me the call graph of this code")])).toBe(
+      "rlm",
+    );
+  });
+
+  it("large prompt → rlm", () => {
+    const longContent = "log line " + "x".repeat(3000);
+    expect(routeRequest([user(longContent)])).toBe("rlm");
+  });
+
+  it("no user message → direct", () => {
+    expect(
+      routeRequest([{ role: "system", content: "you are helpful" }]),
+    ).toBe("direct");
+  });
+
+  it("uses the LAST user message for routing", () => {
+    // Earlier messages don't matter
+    const messages: ChatMessage[] = [
+      user("short hi"),
+      { role: "assistant", content: "hi" },
+      user("verify this is prime: 97"),
+    ];
+    expect(routeRequest(messages)).toBe("rlm");
+  });
+});

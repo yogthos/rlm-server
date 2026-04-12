@@ -4,11 +4,13 @@
  * Runs a GGUF model in-process via llama.cpp — no HTTP overhead,
  * model stays loaded between requests.
  *
- * All LLM calls go through a serial queue since we have a single
- * model/context/sequence. Each caller gets a Promise that resolves
- * when the model finishes their request. This correctly handles
- * concurrent RLM iterations, sub-RLM llm_query() calls, and
- * multiple API requests.
+ * KV cache reuse: a persistent LlamaChatSession is kept. When incoming
+ * messages are a prefix-extension of the session's current history
+ * (common case: RLM loop iterations appending to history), we just call
+ * prompt() with the new user message — KV cache is preserved across
+ * iterations. When messages don't match (new conversation), we reset.
+ *
+ * All calls serialized through a queue since we have a single sequence.
  */
 
 import {
@@ -29,6 +31,11 @@ let modelContext: LlamaContext | null = null;
 let modelSequence: LlamaContextSequence | null = null;
 let loadedModelPath: string | null = null;
 
+// Persistent chat session + its history for cache reuse detection
+let activeSession: LlamaChatSession | null = null;
+let activeSystemPrompt: string = "";
+let activeHistory: ChatHistoryItem[] = [];
+
 async function ensureModel(config: LLMConfig): Promise<{
   model: LlamaModel;
   context: LlamaContext;
@@ -40,6 +47,7 @@ async function ensureModel(config: LLMConfig): Promise<{
     return { model: loadedModel, context: modelContext, sequence: modelSequence };
   }
 
+  if (activeSession) { activeSession = null; activeSystemPrompt = ""; activeHistory = []; }
   if (modelSequence) { modelSequence.dispose(); modelSequence = null; }
   if (modelContext) { await modelContext.dispose(); modelContext = null; }
   if (loadedModel) { await loadedModel.dispose(); loadedModel = null; }
@@ -80,7 +88,7 @@ let queue: QueuedRequest[] = [];
 let processing = false;
 
 async function processQueue(): Promise<void> {
-  if (processing) return; // another loop is already draining
+  if (processing) return;
   processing = true;
 
   while (queue.length > 0) {
@@ -99,12 +107,11 @@ async function processQueue(): Promise<void> {
 function enqueue(messages: ChatMessage[], config: LLMConfig): Promise<LLMResponse> {
   return new Promise<LLMResponse>((resolve, reject) => {
     queue.push({ messages, config, resolve, reject });
-    // Kick the queue — if already processing, this is a no-op
     processQueue();
   });
 }
 
-// ─── Inference ────────────────────────────────────────────────────────
+// ─── History conversion and matching ──────────────────────────────────
 
 type ChatHistoryItem =
   | { type: "system"; text: string }
@@ -113,24 +120,22 @@ type ChatHistoryItem =
 
 function convertHistory(messages: ChatMessage[]): {
   systemPrompt: string;
-  history: ChatHistoryItem[];
+  priorHistory: ChatHistoryItem[];
   lastUserMessage: string;
 } {
   let systemPrompt = "";
-  const history: ChatHistoryItem[] = [];
+  const priorHistory: ChatHistoryItem[] = [];
 
   const firstSystem = messages.find((m) => m.role === "system");
   if (firstSystem) {
     systemPrompt = firstSystem.content;
   }
 
-  const nonSystem = messages.filter(
-    (m) => m.role !== "system" || m !== firstSystem,
-  );
+  const nonSystem = messages.filter((m) => m !== firstSystem);
 
+  // Pull off the trailing user message as the new prompt
   let lastUserMessage = "";
   const historyMessages = [...nonSystem];
-
   for (let i = historyMessages.length - 1; i >= 0; i--) {
     if (historyMessages[i].role === "user") {
       lastUserMessage = historyMessages[i].content;
@@ -141,45 +146,99 @@ function convertHistory(messages: ChatMessage[]): {
 
   for (const msg of historyMessages) {
     if (msg.role === "user") {
-      history.push({ type: "user", text: msg.content });
+      priorHistory.push({ type: "user", text: msg.content });
     } else if (msg.role === "assistant") {
-      history.push({ type: "model", response: [msg.content] });
-    } else if (msg.role === "system" && msg !== firstSystem) {
-      history.push({ type: "user", text: msg.content });
+      priorHistory.push({ type: "model", response: [msg.content] });
+    } else if (msg.role === "system") {
+      priorHistory.push({ type: "user", text: msg.content });
     }
   }
 
-  return { systemPrompt, history, lastUserMessage };
+  return { systemPrompt, priorHistory, lastUserMessage };
 }
+
+/**
+ * Check if `priorHistory` extends `activeHistory` — i.e. the active
+ * session already has these messages cached. Requires same system
+ * prompt and priorHistory strictly extending activeHistory.
+ */
+function canReuseSession(
+  systemPrompt: string,
+  priorHistory: ChatHistoryItem[],
+): boolean {
+  if (!activeSession) return false;
+  if (systemPrompt !== activeSystemPrompt) return false;
+  if (priorHistory.length < activeHistory.length) return false;
+
+  for (let i = 0; i < activeHistory.length; i++) {
+    const a = activeHistory[i];
+    const b = priorHistory[i];
+    if (a.type !== b.type) return false;
+    if (a.type === "user" && b.type === "user") {
+      if (a.text !== b.text) return false;
+    } else if (a.type === "model" && b.type === "model") {
+      if (a.response.join("") !== b.response.join("")) return false;
+    } else if (a.type === "system" && b.type === "system") {
+      if (a.text !== b.text) return false;
+    } else {
+      return false;
+    }
+  }
+  return true;
+}
+
+// ─── Inference ────────────────────────────────────────────────────────
 
 async function runInference(
   messages: ChatMessage[],
   config: LLMConfig,
 ): Promise<LLMResponse> {
-  const { sequence } = await ensureModel(config);
-  const { systemPrompt, history, lastUserMessage } = convertHistory(messages);
+  const { context, sequence } = await ensureModel(config);
+  const { systemPrompt, priorHistory, lastUserMessage } =
+    convertHistory(messages);
 
-  // Create a fresh session on the persistent sequence.
-  // LlamaChatSession resets the sequence state internally when
-  // constructed, so no manual KV cache clearing needed.
-  const session = new LlamaChatSession({
-    contextSequence: sequence,
-    systemPrompt: systemPrompt || undefined,
-  });
+  const reuse = canReuseSession(systemPrompt, priorHistory);
 
-  // Set the full conversation history so the model sees prior turns.
-  const fullHistory: ChatHistoryItem[] = [
-    ...(systemPrompt
-      ? [{ type: "system" as const, text: systemPrompt }]
-      : []),
-    ...history,
-  ];
-  if (fullHistory.length > 0) {
-    session.setChatHistory(fullHistory);
+  if (!reuse) {
+    // Fresh session: clear KV cache and rebuild
+    sequence.eraseContextTokenRanges([{
+      start: 0,
+      end: context.contextSize,
+    }]);
+
+    activeSession = new LlamaChatSession({
+      contextSequence: sequence,
+      systemPrompt: systemPrompt || undefined,
+    });
+    activeSystemPrompt = systemPrompt;
+
+    const fullHistory: ChatHistoryItem[] = [
+      ...(systemPrompt
+        ? [{ type: "system" as const, text: systemPrompt }]
+        : []),
+      ...priorHistory,
+    ];
+    if (fullHistory.length > 0) {
+      activeSession.setChatHistory(fullHistory);
+    }
+    activeHistory = [...priorHistory];
+  } else {
+    // Reuse: priorHistory may have new messages beyond activeHistory.
+    // Apply the delta so the session's state matches.
+    if (priorHistory.length > activeHistory.length) {
+      const fullHistory: ChatHistoryItem[] = [
+        ...(systemPrompt
+          ? [{ type: "system" as const, text: systemPrompt }]
+          : []),
+        ...priorHistory,
+      ];
+      activeSession!.setChatHistory(fullHistory);
+      activeHistory = [...priorHistory];
+    }
   }
 
   let tokenCount = 0;
-  const content = await session.prompt(lastUserMessage, {
+  const content = await activeSession!.prompt(lastUserMessage, {
     temperature: config.temperature ?? 0.7,
     topP: config.topP ?? 0.9,
     maxTokens: config.maxTokens ?? 4096,
@@ -187,6 +246,10 @@ async function runInference(
       tokenCount++;
     },
   });
+
+  // Update activeHistory to reflect what was just added
+  activeHistory.push({ type: "user", text: lastUserMessage });
+  activeHistory.push({ type: "model", response: [content] });
 
   return {
     content,
@@ -201,14 +264,6 @@ async function runInference(
 
 // ─── Public API ───────────────────────────────────────────────────────
 
-/**
- * Create a local LLM client that runs the model in-process.
- *
- * All chat() calls are serialized through a queue — the single model
- * processes one request at a time. Callers get a Promise that resolves
- * when it's their turn. This handles RLM iterations, sub-RLM calls
- * via llm_query(), and concurrent API requests correctly.
- */
 export function createLocalLLMClient(config: LLMConfig): LLMClient {
   return {
     chat(messages: ChatMessage[]): Promise<LLMResponse> {
@@ -223,6 +278,9 @@ export function createLocalLLMClient(config: LLMConfig): LLMClient {
 
 /** Dispose the loaded model and free resources. */
 export function disposeLocalLLM(): void {
+  activeSession = null;
+  activeSystemPrompt = "";
+  activeHistory = [];
   if (modelSequence) { modelSequence.dispose(); modelSequence = null; }
   if (modelContext) { modelContext.dispose(); modelContext = null; }
   if (loadedModel) { loadedModel.dispose(); loadedModel = null; }

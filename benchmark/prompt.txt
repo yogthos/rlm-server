@@ -1,0 +1,16 @@
+Build a Node.js guestbook web application with these requirements:
+
+1. A single server.js file using only Node.js built-in modules (no npm dependencies)
+2. Stores entries in a JSON file (guestbook.json)
+3. HTTP server on port 3001 with these routes:
+   - GET / — serves an HTML page with:
+     - A form with fields: name, message, and a submit button
+     - Below the form, display all existing guestbook entries (newest first)
+     - Each entry shows: name, message, and timestamp
+     - Basic CSS styling (clean, readable)
+   - POST /sign — accepts form submission, adds entry to guestbook.json, redirects to /
+   - GET /api/entries — returns all entries as JSON
+4. Handle edge cases: empty name/message (reject with error), guestbook.json not existing yet (create it)
+5. The HTML should be embedded in the JS file (no separate template files)
+
+Provide the complete server.js file ready to run with `node server.js`.

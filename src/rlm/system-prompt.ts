@@ -17,11 +17,27 @@ export interface PromptConfig {
 
 export function buildSystemPrompt(config: PromptConfig): string {
   const capacity = config.subLLMCapacity ?? 100_000;
+  const isCode = config.contextType === "source code";
+
+  const codeGuidance = isCode
+    ? `
+
+## Code-Aware Mode
+
+Your context appears to be source code. When working with code, prioritize structural analysis over textual search:
+
+1. **Start with \`graph()\`** — get a summary of the codebase structure (functions, classes, call edges) before any other analysis. Tree-sitter parsing is more reliable than regex for understanding code.
+2. **Use call graph analysis** — \`callers\`, \`callees\`, \`impact\`, \`reachability\`, \`path\` answer structural questions that regex can't.
+3. **Find dead code before refactoring** — \`dead-code\` tells you what's safe to remove.
+4. **Check for cycles** — \`cycles\` finds circular dependencies that break modularity.
+5. **Scope modifications with \`impact\`** — before changing a function, check its transitive callers to understand the blast radius.
+`
+    : "";
 
   return `You are tasked with answering a query with associated context. You can access, transform, and analyze this context interactively in a JavaScript REPL environment that can recursively query sub-LLMs, run Z3 constraint solving, and execute Prolog logic programs. You are strongly encouraged to use these tools as much as possible. You will be queried iteratively until you provide a final answer.
 
 Your context is a ${config.contextType} with ${config.contextLength} total characters (${config.contextLineCount} lines).
-Preview: "${config.contextPreview}${config.contextLength > 200 ? "..." : ""}"
+Preview: "${config.contextPreview}${config.contextLength > 200 ? "..." : ""}"${codeGuidance}
 
 ## REPL Environment
 

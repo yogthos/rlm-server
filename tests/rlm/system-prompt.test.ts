@@ -69,4 +69,22 @@ describe("buildSystemPrompt", () => {
     expect(prompt).toContain("```repl");
     expect(prompt).toContain("```js");
   });
+
+  it("adds code-aware guidance when contextType is source code", () => {
+    const codePrompt = buildSystemPrompt({
+      ...config,
+      contextType: "source code",
+    });
+    expect(codePrompt).toContain("Code-Aware Mode");
+    expect(codePrompt).toContain("Start with `graph()`");
+    expect(codePrompt).toContain("impact");
+  });
+
+  it("skips code-aware guidance for non-code contexts", () => {
+    const textPrompt = buildSystemPrompt({
+      ...config,
+      contextType: "text document",
+    });
+    expect(textPrompt).not.toContain("Code-Aware Mode");
+  });
 });

@@ -74,14 +74,37 @@ function summarizeValue(value: unknown): string {
   return String(value);
 }
 
-function guessContentType(content: string): string {
+export function guessContentType(content: string): string {
   const trimmed = content.trimStart();
   if (trimmed.startsWith("{") || trimmed.startsWith("[")) return "JSON document";
   if (trimmed.startsWith("<!") || trimmed.startsWith("<html")) return "HTML document";
   if (trimmed.startsWith("<?xml")) return "XML document";
   if (trimmed.startsWith("#") || /^#{1,6}\s/m.test(trimmed)) return "Markdown document";
-  if (trimmed.includes("function ") || trimmed.includes("const ") || trimmed.includes("import "))
-    return "source code";
-  if (trimmed.includes("def ") || trimmed.includes("class ")) return "source code";
+  if (isLikelyCode(trimmed)) return "source code";
   return "text document";
+}
+
+/** Heuristic: does the content look like source code? */
+export function isLikelyCode(content: string): boolean {
+  // File path references with code extensions
+  if (/\.(ts|tsx|js|jsx|py|go|rb|rs|java|c|cpp|h|clj|cljs|cljc)\b/.test(content))
+    return true;
+
+  // Strong code patterns
+  const codePatterns = [
+    /\bfunction\s+\w+\s*\(/,
+    /\bconst\s+\w+\s*=/,
+    /\blet\s+\w+\s*=/,
+    /\bdef\s+\w+\s*\(/,
+    /\bclass\s+\w+/,
+    /\bimport\s+(?:\{|\*|\w+)/,
+    /\bfrom\s+['"]/,
+    /\bpackage\s+\w+/,
+    /\b(?:public|private|protected)\s+(?:static\s+)?(?:void|int|String|class)/,
+  ];
+  let hits = 0;
+  for (const p of codePatterns) {
+    if (p.test(content)) hits++;
+  }
+  return hits >= 2;
 }

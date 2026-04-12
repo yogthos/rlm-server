@@ -46,6 +46,10 @@ export { loadConfig } from "./config.js";
 export { runRLMLoop } from "./loop.js";
 export type { RunRLMOptions } from "./loop.js";
 
+// Routing
+export { routeRequest } from "./routing.js";
+export type { Mode } from "./routing.js";
+
 // Code graph analysis
 export { createGraphBridge, GRAPH_IMPL } from "./graph-bridge.js";
 export { extractGraph, runAnalysis, runAnalysisFromGraph } from "./graph/index.js";

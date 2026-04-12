@@ -24,7 +24,7 @@ import {
 import type { RLMContext, RLMResult, LLMClient, ChatMessage } from "./types.js";
 import { createHandleStore } from "./handles.js";
 import { extractCode } from "./code-extractor.js";
-import { promptMetadata, stdoutMetadata } from "./metadata.js";
+import { promptMetadata, stdoutMetadata, guessContentType } from "./metadata.js";
 import { buildSystemPrompt } from "./system-prompt.js";
 import { z3Solve, Z3_IMPL } from "./z3-bridge.js";
 import { prologQuery, PROLOG_IMPL } from "./prolog-bridge.js";
@@ -32,14 +32,6 @@ import { createGraphBridge, GRAPH_IMPL } from "./graph-bridge.js";
 
 const MAX_NO_CODE_RETRIES = 3;
 const MAX_HISTORY_ENTRIES = 40;
-
-function guessContentType(content: string): string {
-  const trimmed = content.trimStart();
-  if (trimmed.startsWith("{") || trimmed.startsWith("[")) return "JSON document";
-  if (trimmed.startsWith("<!") || trimmed.startsWith("<html")) return "HTML document";
-  if (trimmed.startsWith("#") || /^#{1,6}\s/m.test(trimmed)) return "Markdown document";
-  return "text document";
-}
 
 /** Trim history to stay within context window budget. */
 function trimHistory(history: ChatMessage[]): ChatMessage[] {

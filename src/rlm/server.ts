@@ -14,6 +14,7 @@ import crypto from "node:crypto";
 import type { ServerConfig, ChatMessage } from "./types.js";
 import { createLLMClient } from "./llm-client.js";
 import { runRLMLoop } from "./loop.js";
+import { routeRequest } from "./routing.js";
 
 const MAX_BODY_SIZE = 10 * 1024 * 1024; // 10MB
 
@@ -114,6 +115,7 @@ export function createServer(config: ServerConfig): http.Server {
           messages?: Array<{ role: string; content: string }>;
           stream?: boolean;
           max_iterations?: number;
+          rlm?: boolean;
         };
 
         try {
@@ -243,26 +245,40 @@ export function createServer(config: ServerConfig): http.Server {
         }
 
         // ── Non-streaming ──
+        const mode = routeRequest(
+          request.messages as ChatMessage[],
+          request.rlm,
+        );
+
         try {
-          const result = await runRLMLoop({
-            prompt,
-            llmClient,
-            maxIterations,
-            sandboxTimeoutMs: config.sandboxTimeoutMs,
-            maxSubRLMDepth: config.maxSubRLMDepth,
-          });
+          let answer: string;
+          if (mode === "direct") {
+            // Short instruction / no tools needed — go straight to model
+            const resp = await llmClient.chat(request.messages as ChatMessage[]);
+            answer = resp.content;
+          } else {
+            const result = await runRLMLoop({
+              prompt,
+              llmClient,
+              maxIterations,
+              sandboxTimeoutMs: config.sandboxTimeoutMs,
+              maxSubRLMDepth: config.maxSubRLMDepth,
+            });
+            answer = result.answer;
+          }
 
           jsonResponse(res, 200, {
             id: chatId,
             object: "chat.completion",
             created: Math.floor(Date.now() / 1000),
             model,
+            system_fingerprint: `mode=${mode}`,
             choices: [
               {
                 index: 0,
                 message: {
                   role: "assistant",
-                  content: result.answer,
+                  content: answer,
                 } as ChatMessage,
                 finish_reason: "stop",
               },
