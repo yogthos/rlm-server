@@ -300,6 +300,21 @@ async function runInference(
     ? convertToolsToFunctions(options.tools, captures)
     : undefined;
 
+  // If response_format is set, build a JSON grammar to constrain output.
+  // tools + grammar are mutually exclusive in node-llama-cpp — tools
+  // already use grammar-guided output internally.
+  let grammar: import("node-llama-cpp").LlamaGrammar | undefined;
+  if (options?.responseFormat && !functions) {
+    const rf = options.responseFormat;
+    const llama = llamaInstance!;
+    if (rf.type === "json_schema") {
+      grammar = await llama.createGrammarForJsonSchema(rf.json_schema.schema as any);
+    } else if (rf.type === "json_object") {
+      // Generic JSON object grammar — any valid JSON
+      grammar = await llama.getGrammarFor("json");
+    }
+  }
+
   const promptOptions: Record<string, unknown> = {
     temperature: config.temperature ?? 0.7,
     topP: config.topP ?? 0.9,
@@ -311,6 +326,8 @@ async function runInference(
   };
   if (functions) {
     promptOptions.functions = functions;
+  } else if (grammar) {
+    promptOptions.grammar = grammar;
   }
 
   const session = activeSession!;

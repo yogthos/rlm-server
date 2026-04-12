@@ -119,6 +119,7 @@ export function createServer(config: ServerConfig): http.Server {
           rlm?: boolean;
           tools?: OpenAITool[];
           tool_choice?: ChatOptions["toolChoice"];
+          response_format?: ChatOptions["responseFormat"];
         };
 
         try {
@@ -186,12 +187,18 @@ export function createServer(config: ServerConfig): http.Server {
           // Initial role chunk
           emitChunk({ role: "assistant" });
 
-          const streamChatOptions: ChatOptions | undefined =
-            request.tools && request.tools.length > 0
-              ? { tools: request.tools, toolChoice: request.tool_choice }
-              : undefined;
-          // If tools are present, force direct mode (RLM doesn't support client tools)
-          const resolvedStreamMode = streamChatOptions ? "direct" : streamMode;
+          const streamHasClientTools =
+            (request.tools && request.tools.length > 0) ||
+            request.response_format !== undefined;
+          const streamChatOptions: ChatOptions | undefined = streamHasClientTools
+            ? {
+                tools: request.tools,
+                toolChoice: request.tool_choice,
+                responseFormat: request.response_format,
+              }
+            : undefined;
+          // If tools/response_format are present, force direct mode
+          const resolvedStreamMode = streamHasClientTools ? "direct" : streamMode;
 
           try {
             if (resolvedStreamMode === "direct") {
@@ -253,16 +260,20 @@ export function createServer(config: ServerConfig): http.Server {
           request.rlm,
         );
 
-        // Tools are always routed to direct mode — the RLM loop has its
-        // own sandbox tools and shouldn't mix with client tool calling.
-        const effectiveMode = request.tools && request.tools.length > 0
-          ? "direct"
-          : mode;
+        // Tools or response_format → always direct mode
+        // (RLM loop has its own sandbox tools and free-form output)
+        const hasClientTools =
+          (request.tools && request.tools.length > 0) ||
+          request.response_format !== undefined;
+        const effectiveMode = hasClientTools ? "direct" : mode;
 
-        const chatOptions: ChatOptions | undefined =
-          request.tools && request.tools.length > 0
-            ? { tools: request.tools, toolChoice: request.tool_choice }
-            : undefined;
+        const chatOptions: ChatOptions | undefined = hasClientTools
+          ? {
+              tools: request.tools,
+              toolChoice: request.tool_choice,
+              responseFormat: request.response_format,
+            }
+          : undefined;
 
         try {
           let answer: string;

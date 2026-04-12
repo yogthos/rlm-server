@@ -48,7 +48,7 @@ export interface LLMResponse {
   usage?: { promptTokens: number; completionTokens: number; totalTokens: number };
 }
 
-/** Options passed to chat() — includes OpenAI tools. */
+/** Options passed to chat() — includes OpenAI tools and response_format. */
 export interface ChatOptions {
   tools?: Array<{
     type: "function";
@@ -59,6 +59,10 @@ export interface ChatOptions {
     };
   }>;
   toolChoice?: "auto" | "none" | "required" | { type: "function"; function: { name: string } };
+  /** OpenAI response_format: forces structured JSON output from the model. */
+  responseFormat?:
+    | { type: "json_object" }
+    | { type: "json_schema"; json_schema: { schema: Record<string, unknown>; name?: string; strict?: boolean } };
 }
 
 /** LLM client interface. */
