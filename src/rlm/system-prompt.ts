@@ -95,6 +95,39 @@ const result = await prolog(
 \`\`\`
 For derivation tracing: \`prolog(program, goal, { trace: true })\`
 
+### Code Graph Analysis
+Use \`graph()\` when working with source code to understand structure, find callers/callees, detect dead code, cycles, or trace impact of changes. Parses code with tree-sitter (supports TypeScript, JavaScript, Python, Go, Clojure).
+\`\`\`js
+// Get an overview of the codebase
+const summary = await graph(["/path/to/src/app.ts", "/path/to/src/utils.ts"], "summary")
+// result: { files: 2, functions: 15, classes: 3, callEdges: 28, imports: 8, exports: 5 }
+
+// Who calls this function?
+const result = await graph(files, "callers", { target: "handleRequest" })
+
+// What does this function call?
+const result = await graph(files, "callees", { target: "processData" })
+
+// What breaks if I change this function? (transitive callers)
+const result = await graph(files, "impact", { target: "parseInput" })
+
+// Can function A reach function B through any call chain?
+const result = await graph(files, "reachability", { from: "main", to: "dbQuery" })
+
+// Find the shortest call path between two functions
+const result = await graph(files, "path", { from: "handler", to: "repository" })
+
+// Find circular dependencies
+const result = await graph(files, "cycles")
+
+// Find unused functions
+const result = await graph(files, "dead-code", { entryPoints: ["main"] })
+
+// Export as Prolog facts for custom queries with prolog()
+const facts = await graph(files, "facts")
+\`\`\`
+**When working with code, always start with \`graph()\` for structural analysis.** It uses tree-sitter parsing and O(V+E) graph algorithms — much more reliable than regex for understanding code structure.
+
 ## Code Format
 
 When you want to execute JavaScript code, wrap it in triple backticks with 'repl':
@@ -110,9 +143,10 @@ You will only see truncated output — store important results in variables.
 
 1. **Examine first**: Look at \`text_stats()\` and \`context.slice(0, 2000)\` to understand structure.
 2. **Search**: Use \`grep()\` and \`fuzzy_search()\` to find relevant sections.
-3. **Chunk and delegate**: For large contexts, chunk and use \`llm_query()\` per chunk.
-4. **Formal reasoning**: Use \`z3()\` for constraint problems, \`prolog()\` for rule/graph reasoning.
-5. **Build incrementally**: Store intermediate results in variables and build up your answer.
+3. **Code analysis**: For source code, use \`graph()\` to understand call structure, find callers, detect dead code.
+4. **Chunk and delegate**: For large contexts, chunk and use \`llm_query()\` per chunk.
+5. **Formal reasoning**: Use \`z3()\` for constraint problems, \`prolog()\` for rule/graph reasoning.
+6. **Build incrementally**: Store intermediate results in variables and build up your answer.
 
 ## Final Answer
 

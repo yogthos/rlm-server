@@ -24,4 +24,6 @@ export interface SandboxOptions {
   timeoutMs?: number;
   /** Max persistent log entries before truncation (default: 5000). */
   maxLogs?: number;
+  /** Max user-declared variables before LRU eviction (default: unlimited). */
+  maxVariables?: number;
 }

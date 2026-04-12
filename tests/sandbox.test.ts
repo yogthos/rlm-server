@@ -204,6 +204,62 @@ describe("createSandbox", () => {
     sandbox.dispose();
   });
 
+  it("evicts oldest user variables when maxVariables exceeded", async () => {
+    const sandbox = createSandbox("test", { maxVariables: 3 });
+
+    await sandbox.execute("const a = 1");
+    await sandbox.execute("const b = 2");
+    await sandbox.execute("const c = 3");
+
+    // All three should still be accessible
+    expect((await sandbox.execute("a")).result).toBe(1);
+    expect((await sandbox.execute("b")).result).toBe(2);
+    expect((await sandbox.execute("c")).result).toBe(3);
+
+    // Adding a 4th should evict 'a' (oldest) — set to undefined to free data
+    await sandbox.execute("const d = 4");
+    expect((await sandbox.execute("d")).result).toBe(4);
+    expect((await sandbox.execute("a")).result).toBeUndefined();
+
+    // b and c should still be there
+    expect((await sandbox.execute("b")).result).toBe(2);
+    expect((await sandbox.execute("c")).result).toBe(3);
+
+    sandbox.dispose();
+  });
+
+  it("does not evict protected variables like context", async () => {
+    const sandbox = createSandbox("hello", {
+      maxVariables: 2,
+      globals: { myTool: () => 42 },
+    });
+
+    await sandbox.execute("const x = 1");
+    await sandbox.execute("const y = 2");
+    await sandbox.execute("const z = 3");
+
+    // context and myTool must survive regardless of eviction
+    expect((await sandbox.execute("context")).result).toBe("hello");
+    expect((await sandbox.execute("myTool()")).result).toBe(42);
+
+    sandbox.dispose();
+  });
+
+  it("does not evict when maxVariables is not set", async () => {
+    const sandbox = createSandbox("test");
+
+    // Declare many variables without limit
+    for (let i = 0; i < 50; i++) {
+      await sandbox.execute(`var v${i} = ${i}`);
+    }
+
+    // All should still be accessible
+    expect((await sandbox.execute("v0")).result).toBe(0);
+    expect((await sandbox.execute("v49")).result).toBe(49);
+
+    sandbox.dispose();
+  });
+
   it("grep returns empty for invalid regex", async () => {
     const sandbox = createSandbox("test content", {
       builtins: [GREP_IMPL],

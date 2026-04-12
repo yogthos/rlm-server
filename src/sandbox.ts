@@ -46,11 +46,29 @@ export function createSandbox(
     initCode = "",
     timeoutMs: defaultTimeout = 30000,
     maxLogs = 5000,
+    maxVariables,
   } = options;
 
   const logs: string[] = [];
   const memory: unknown[] = [];
   let disposed = false;
+
+  // LRU tracking for user-declared variables (when maxVariables is set).
+  // Maps variable name → insertion order counter. Protected names are
+  // never evicted (builtins, context, memory, console, etc.).
+  const varLRU = new Map<string, number>();
+  let varCounter = 0;
+  const protectedVars = new Set([
+    "context", "memory", "console", "text_stats", "__linesArray",
+    "__result__", "undefined", "NaN", "Infinity",
+    // safe globals
+    "JSON", "Math", "Date", "Array", "Object", "String", "Number",
+    "Boolean", "RegExp", "Map", "Set", "Promise", "Symbol",
+    "parseInt", "parseFloat", "isNaN", "isFinite",
+    "encodeURIComponent", "decodeURIComponent", "eval",
+    // add any injected global names
+    ...Object.keys(extraGlobals),
+  ]);
 
   // Pre-compute text stats and lines array for builtins
   const lines = context.split("\n");
@@ -183,6 +201,35 @@ export function createSandbox(
           }
           const declScript = new vm.Script(declCode);
           declScript.runInContext(vmContext);
+
+          // Track declared variable names for LRU eviction
+          if (maxVariables !== undefined) {
+            for (const decl of declarations) {
+              const match = decl.match(/^var\s+(\w+)/);
+              if (match && !protectedVars.has(match[1])) {
+                varLRU.set(match[1], varCounter++);
+              }
+            }
+            // Evict oldest variables when over limit
+            while (varLRU.size > maxVariables) {
+              let oldestKey: string | null = null;
+              let oldestVal = Infinity;
+              for (const [k, v] of varLRU) {
+                if (v < oldestVal) {
+                  oldestVal = v;
+                  oldestKey = k;
+                }
+              }
+              if (oldestKey) {
+                varLRU.delete(oldestKey);
+                try {
+                  // var declarations in vm contexts can't be deleted,
+                  // but we can null them out to free the referenced data.
+                  vmContext[oldestKey] = undefined;
+                } catch { /* ignore */ }
+              }
+            }
+          }
         }
 
         // Wrap main code in async IIFE for proper async handling

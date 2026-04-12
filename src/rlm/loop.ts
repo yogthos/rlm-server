@@ -28,6 +28,7 @@ import { promptMetadata, stdoutMetadata } from "./metadata.js";
 import { buildSystemPrompt } from "./system-prompt.js";
 import { z3Solve, Z3_IMPL } from "./z3-bridge.js";
 import { prologQuery, PROLOG_IMPL } from "./prolog-bridge.js";
+import { graphAnalyze, GRAPH_IMPL } from "./graph-bridge.js";
 
 const MAX_NO_CODE_RETRIES = 3;
 const MAX_HISTORY_ENTRIES = 40;
@@ -90,13 +91,16 @@ async function initHandler(ctx: RLMContext): Promise<RLMContext> {
       LLM_QUERY_IMPL,
       Z3_IMPL,
       PROLOG_IMPL,
+      GRAPH_IMPL,
     ],
     globals: {
       __llmQueryBridge: llmQueryBridge,
       __z3Bridge: z3Solve,
       __prologBridge: prologQuery,
+      __graphBridge: graphAnalyze,
     },
     timeoutMs: ctx.sandboxTimeoutMs,
+    maxVariables: 200,
   });
 
   const lines = ctx.prompt.split("\n");
