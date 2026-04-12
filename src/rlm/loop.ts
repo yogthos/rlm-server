@@ -32,16 +32,25 @@ import { createGraphBridge, GRAPH_IMPL } from "./graph-bridge.js";
 import { debug } from "./debug.js";
 
 const MAX_NO_CODE_RETRIES = 3;
-const MAX_HISTORY_ENTRIES = 40;
+/** Keep the last N assistant/user pairs in RLM history. The paper's
+ *  approach: handles carry state across iterations, so recent turns
+ *  are enough context. Everything older is redundant with the handles. */
+const KEEP_RECENT_PAIRS = 3;
 
-/** Trim history to stay within context window budget. */
+/**
+ * Trim history aggressively — keep system prompt + initial user prompt
+ * + last N turn pairs. The handle store carries state across iterations
+ * so old assistant code/feedback is redundant.
+ */
 function trimHistory(history: ChatMessage[]): ChatMessage[] {
-  if (history.length <= MAX_HISTORY_ENTRIES) return history;
-
-  // Keep system prompt (first) and most recent messages
-  const system = history[0];
-  const keep = MAX_HISTORY_ENTRIES - 1;
-  return [system, ...history.slice(-keep)];
+  // [system, user-initial, asst1, fb1, asst2, fb2, ...]
+  // Always keep first 2 (system + initial user prompt)
+  // Keep last KEEP_RECENT_PAIRS * 2 messages (N asst + N feedback)
+  const prefix = history.slice(0, 2);
+  const tail = history.slice(2);
+  const keepCount = KEEP_RECENT_PAIRS * 2;
+  if (tail.length <= keepCount) return history;
+  return [...prefix, ...tail.slice(-keepCount)];
 }
 
 // ─── FSM State Handlers ───────────────────────────────────────────────

@@ -301,6 +301,29 @@ export function createServer(config: ServerConfig): http.Server {
           : undefined;
 
         const reqStart = Date.now();
+        // RLM mode can run for minutes; HTTP clients like undici have a
+        // bodyTimeout (default 300s) that drops the connection if no bytes
+        // arrive. For non-streaming RLM, start sending a whitespace
+        // keepalive every 20s — JSON allows leading whitespace, so the
+        // final parsed response is unaffected.
+        let keepaliveTimer: ReturnType<typeof setInterval> | undefined;
+        const startKeepalive = () => {
+          if (keepaliveTimer) return;
+          res.writeHead(200, {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*",
+          });
+          keepaliveTimer = setInterval(() => {
+            res.write(" ");
+          }, 20_000);
+        };
+        const stopKeepalive = () => {
+          if (keepaliveTimer) {
+            clearInterval(keepaliveTimer);
+            keepaliveTimer = undefined;
+          }
+        };
+
         try {
           let answer: string;
           let toolCalls: ChatMessage["tool_calls"] | undefined;
@@ -317,6 +340,8 @@ export function createServer(config: ServerConfig): http.Server {
               finishReason = "tool_calls";
             }
           } else {
+            // Open the response and start the keepalive heartbeat
+            startKeepalive();
             const result = await runRLMLoop({
               prompt,
               llmClient,
@@ -341,7 +366,7 @@ export function createServer(config: ServerConfig): http.Server {
             `chat completed id=${chatId.slice(-8)} mode=${effectiveMode} ${totalMs}ms answer=${answer.length}ch finish=${finishReason}`,
           );
 
-          jsonResponse(res, 200, {
+          const payload = {
             id: chatId,
             object: "chat.completion",
             created: Math.floor(Date.now() / 1000),
@@ -358,12 +383,37 @@ export function createServer(config: ServerConfig): http.Server {
               completion_tokens: 0,
               total_tokens: 0,
             },
-          });
+          };
+
+          stopKeepalive();
+          if (keepaliveTimer === undefined && !res.headersSent) {
+            // Happens when direct mode took no keepalive: normal json response
+            jsonResponse(res, 200, payload);
+          } else {
+            // Headers already sent with keepalive; write the final JSON body
+            res.write(JSON.stringify(payload));
+            res.end();
+          }
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           const totalMs = Date.now() - reqStart;
           debug("server", `chat failed id=${chatId.slice(-8)} ${totalMs}ms error=${msg}`);
-          errorResponse(res, 500, `RLM loop failed: ${msg}`, "server_error");
+          stopKeepalive();
+          if (!res.headersSent) {
+            errorResponse(res, 500, `RLM loop failed: ${msg}`, "server_error");
+          } else {
+            // Can't change status; write an error payload body and end
+            res.write(
+              JSON.stringify({
+                error: {
+                  message: `RLM loop failed: ${msg}`,
+                  type: "server_error",
+                  code: "500",
+                },
+              }),
+            );
+            res.end();
+          }
         }
 
         return;

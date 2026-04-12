@@ -224,6 +224,44 @@ describe("runRLMLoop", () => {
     expect(calls[1]).toBe("what is 2+2?");
   });
 
+  it("keeps history bounded across many iterations", async () => {
+    // Simulate a model that writes code for 8 iterations then gives FINAL
+    let iterCount = 0;
+    let lastHistoryLen = 0;
+    const maxObservedHistoryLen: number[] = [];
+
+    const llm: LLMClient = {
+      async chat(messages: ChatMessage[]): Promise<LLMResponse> {
+        iterCount++;
+        maxObservedHistoryLen.push(messages.length);
+        lastHistoryLen = messages.length;
+        if (iterCount < 8) {
+          return {
+            content: `\`\`\`repl\nconst x${iterCount} = ${iterCount};\nconsole.log('iter${iterCount}');\n\`\`\``,
+            finishReason: "stop",
+          };
+        }
+        return { content: "FINAL(done)", finishReason: "stop" };
+      },
+      async listModels() {
+        return ["mock"];
+      },
+    };
+
+    await runRLMLoop({
+      prompt: "test",
+      llmClient: llm,
+      maxIterations: 15,
+    });
+
+    // With trimming active (KEEP_RECENT_PAIRS=3), history should be
+    // bounded at ~8 messages (system + initial + 6 recent). Without
+    // trimming, it would grow to 16+ messages by iteration 8.
+    const maxLen = Math.max(...maxObservedHistoryLen);
+    expect(maxLen).toBeLessThanOrEqual(8);
+    expect(lastHistoryLen).toBeLessThanOrEqual(8);
+  });
+
   it("persists variables across iterations", async () => {
     const llm = createMockLLM([
       // Turn 1: define variable
