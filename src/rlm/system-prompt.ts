@@ -22,15 +22,27 @@ export function buildSystemPrompt(config: PromptConfig): string {
   const codeGuidance = isCode
     ? `
 
-## Code-Aware Mode
+## 🚨 CODE ANALYSIS: USE graph() — DO NOT WRITE YOUR OWN ANALYZER 🚨
 
-Your context appears to be source code. When working with code, prioritize structural analysis over textual search:
+Your context mentions source code. **NEVER** write regex or string-matching code to parse functions, find callers, or detect dead code. It will be slow, wrong, and waste iterations. Instead, use the built-in \`graph()\` tool which uses tree-sitter AST parsing + O(V+E) graph algorithms:
 
-1. **Start with \`graph()\`** — get a summary of the codebase structure (functions, classes, call edges) before any other analysis. Tree-sitter parsing is more reliable than regex for understanding code.
-2. **Use call graph analysis** — \`callers\`, \`callees\`, \`impact\`, \`reachability\`, \`path\` answer structural questions that regex can't.
-3. **Find dead code before refactoring** — \`dead-code\` tells you what's safe to remove.
-4. **Check for cycles** — \`cycles\` finds circular dependencies that break modularity.
-5. **Scope modifications with \`impact\`** — before changing a function, check its transitive callers to understand the blast radius.
+\`\`\`repl
+// Most-impacted function (most transitive callers)?
+const files = ["/abs/path/a.ts", "/abs/path/b.ts"];
+const summary = await graph(files, "summary");
+// For each function in summary, get impact:
+const impactByFn = {};
+for (const d of summary.result.defines || []) {
+  if (d.kind === "function") {
+    const r = await graph(files, "impact", { target: d.name });
+    impactByFn[d.name] = r.result.length;
+  }
+}
+\`\`\`
+
+Available analyses: \`summary\`, \`callers\`, \`callees\`, \`impact\`, \`reachability\`, \`path\`, \`cycles\`, \`dead-code\`, \`layer-violation\`.
+
+**If you find yourself writing code like \`regex.exec\`, \`line.match\`, or manually counting callers — STOP and use graph() instead.**
 `
     : "";
 

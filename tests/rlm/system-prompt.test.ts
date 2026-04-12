@@ -75,9 +75,10 @@ describe("buildSystemPrompt", () => {
       ...config,
       contextType: "source code",
     });
-    expect(codePrompt).toContain("Code-Aware Mode");
-    expect(codePrompt).toContain("Start with `graph()`");
+    expect(codePrompt).toContain("CODE ANALYSIS");
+    expect(codePrompt).toContain("graph()");
     expect(codePrompt).toContain("impact");
+    expect(codePrompt).toContain("DO NOT WRITE YOUR OWN ANALYZER");
   });
 
   it("skips code-aware guidance for non-code contexts", () => {
@@ -85,6 +86,7 @@ describe("buildSystemPrompt", () => {
       ...config,
       contextType: "text document",
     });
-    expect(textPrompt).not.toContain("Code-Aware Mode");
+    expect(textPrompt).not.toContain("CODE ANALYSIS");
+    expect(textPrompt).not.toContain("DO NOT WRITE YOUR OWN ANALYZER");
   });
 });
