@@ -145,7 +145,10 @@ export function createServer(config: ServerConfig): http.Server {
         const prompt = lastUserMsg.content;
         const chatId = `chatcmpl-${crypto.randomUUID()}`;
         const model = request.model ?? config.llm.model;
-        const maxIterations = request.max_iterations ?? config.maxIterations;
+        const maxIterations = Math.min(
+          request.max_iterations ?? config.maxIterations,
+          config.maxIterations,
+        );
         const stream = request.stream ?? false;
 
         if (stream) {

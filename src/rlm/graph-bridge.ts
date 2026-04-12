@@ -5,39 +5,55 @@
  * tree-sitter, and runs O(V+E) analyses.
  * Sandbox-side: `GRAPH_IMPL` injectable string wraps `__graphBridge`.
  *
- * Available analyses: summary, callers, callees, reachability,
- * dead-code, cycles, path, impact, facts.
+ * Security: file paths are validated against an allowed root directory
+ * to prevent the LLM from reading arbitrary files on disk.
  */
 
+import { resolve, normalize } from "node:path";
 import { runAnalysis } from "./graph/analyses.js";
 import type { AnalysisRequest, AnalysisResult } from "./graph/analyses.js";
 
 /**
- * Run a graph analysis on source files. Called from the host side.
- *
- * @param files - Array of absolute file paths to analyze.
- * @param analysis - Analysis type (summary, callers, callees, etc.).
- * @param options - Optional: target, from, to, entryPoints.
+ * Create a graph analysis function scoped to an allowed directory.
+ * Paths outside `allowedRoot` are rejected.
  */
-export async function graphAnalyze(
-  files: string[],
-  analysis: string,
-  options?: {
-    target?: string;
-    from?: string;
-    to?: string;
-    entryPoints?: string[];
-  },
-): Promise<AnalysisResult> {
-  const request: AnalysisRequest = {
-    analysis: analysis as AnalysisRequest["analysis"],
-    target: options?.target,
-    from: options?.from,
-    to: options?.to,
-    entryPoints: options?.entryPoints,
-  };
+export function createGraphBridge(allowedRoot: string) {
+  const root = resolve(allowedRoot);
 
-  return runAnalysis(files, request);
+  return async function graphAnalyze(
+    files: string[],
+    analysis: string,
+    options?: {
+      target?: string;
+      from?: string;
+      to?: string;
+      entryPoints?: string[];
+    },
+  ): Promise<AnalysisResult> {
+    // Validate every path is under the allowed root
+    const safePaths: string[] = [];
+    for (const f of files) {
+      const abs = resolve(f);
+      const normalized = normalize(abs);
+      if (!normalized.startsWith(root)) {
+        return {
+          analysis: analysis as AnalysisRequest["analysis"],
+          result: { error: `Path outside allowed directory: ${f}` },
+        };
+      }
+      safePaths.push(abs);
+    }
+
+    const request: AnalysisRequest = {
+      analysis: analysis as AnalysisRequest["analysis"],
+      target: options?.target,
+      from: options?.from,
+      to: options?.to,
+      entryPoints: options?.entryPoints,
+    };
+
+    return runAnalysis(safePaths, request);
+  };
 }
 
 /**

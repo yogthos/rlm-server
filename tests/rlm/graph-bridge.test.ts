@@ -2,7 +2,8 @@ import { describe, it, expect } from "vitest";
 import { writeFileSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { graphAnalyze, GRAPH_IMPL } from "../../src/rlm/graph-bridge.js";
+import { createGraphBridge, GRAPH_IMPL } from "../../src/rlm/graph-bridge.js";
+import type { AnalysisResult } from "../../src/rlm/graph/analyses.js";
 
 const TEST_DIR = join(tmpdir(), "rlm-graph-test-" + Date.now());
 
@@ -13,11 +14,12 @@ function writeTestFile(name: string, content: string): string {
 }
 
 describe("graphAnalyze", () => {
-  // Create test files
   const files: string[] = [];
+  let graphAnalyze: (files: string[], analysis: string, options?: any) => Promise<AnalysisResult>;
 
   it("setup test files", () => {
     mkdirSync(TEST_DIR, { recursive: true });
+    graphAnalyze = createGraphBridge(TEST_DIR);
 
     files.push(
       writeTestFile(
@@ -115,6 +117,11 @@ function transform(data: any) {
     const impacted = result.result as string[];
     expect(impacted).toContain("processData");
     expect(impacted).toContain("handleRequest");
+  });
+
+  it("rejects paths outside allowed root", async () => {
+    const result = await graphAnalyze(["/etc/passwd"], "summary");
+    expect((result.result as any).error).toContain("outside allowed directory");
   });
 
   it("cleanup", () => {
