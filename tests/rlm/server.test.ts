@@ -118,10 +118,36 @@ describe("RLM Server", () => {
     expect(resp.status).toBe(200);
     const data = (await resp.json()) as {
       object: string;
-      data: Array<{ id: string }>;
+      data: Array<{
+        id: string;
+        object: string;
+        created: number;
+        owned_by: string;
+      }>;
     };
     expect(data.object).toBe("list");
     expect(data.data[0].id).toBe("test-model");
+    expect(data.data[0].object).toBe("model");
+    expect(typeof data.data[0].created).toBe("number");
+    expect(data.data[0].owned_by).toBe("local");
+  });
+
+  it("retrieves a specific model by id", async () => {
+    const resp = await fetchRLM("/v1/models/test-model");
+    expect(resp.status).toBe(200);
+    const data = (await resp.json()) as {
+      id: string;
+      object: string;
+      owned_by: string;
+    };
+    expect(data.id).toBe("test-model");
+    expect(data.object).toBe("model");
+    expect(data.owned_by).toBe("local");
+  });
+
+  it("returns 404 for non-existent model", async () => {
+    const resp = await fetchRLM("/v1/models/nonexistent-model");
+    expect(resp.status).toBe(404);
   });
 
   it("handles chat completions", async () => {

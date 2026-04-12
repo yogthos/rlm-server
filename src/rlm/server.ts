@@ -69,6 +69,19 @@ function sseChunk(data: unknown): string {
   return `data: ${JSON.stringify(data)}\n\n`;
 }
 
+/** Generate an OpenAI-format model record. */
+function modelInfo(id: string, config: ServerConfig): Record<string, unknown> {
+  return {
+    id,
+    object: "model",
+    created: Math.floor(Date.now() / 1000),
+    owned_by: "local",
+    // Non-standard but commonly expected extension fields
+    context_length: config.llm.contextWindow ?? 131072,
+    max_output_tokens: config.llm.maxTokens ?? 4096,
+  };
+}
+
 export function createServer(config: ServerConfig): http.Server {
   const llmClient = createLLMClient(config.llm);
 
@@ -98,13 +111,21 @@ export function createServer(config: ServerConfig): http.Server {
         const models = await llmClient.listModels();
         jsonResponse(res, 200, {
           object: "list",
-          data: models.map((id) => ({
-            id,
-            object: "model",
-            created: Math.floor(Date.now() / 1000),
-            owned_by: "local",
-          })),
+          data: models.map((id) => modelInfo(id, config)),
         });
+        return;
+      }
+
+      // ── Retrieve Model ──
+      const modelMatch = url.match(/^\/v1\/models\/(.+)$/);
+      if (modelMatch && req.method === "GET") {
+        const modelId = decodeURIComponent(modelMatch[1]);
+        const models = await llmClient.listModels();
+        if (!models.includes(modelId)) {
+          errorResponse(res, 404, `Model not found: ${modelId}`);
+          return;
+        }
+        jsonResponse(res, 200, modelInfo(modelId, config));
         return;
       }
 
