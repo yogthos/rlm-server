@@ -56,7 +56,7 @@ export function loadConfig(overrides?: Partial<ServerConfig>): ServerConfig {
     sandboxTimeoutMs:
       num(process.env.RLM_SANDBOX_TIMEOUT) ??
       overrides?.sandboxTimeoutMs ??
-      30_000,
+      120_000,
     maxHandles:
       num(process.env.RLM_MAX_HANDLES) ??
       overrides?.maxHandles ??
