@@ -68,3 +68,36 @@ export function routeRequest(
 
   return "direct";
 }
+
+/** Indicators that a task should be planned/decomposed up front. */
+const DECOMPOSE_INDICATORS = [
+  // Multi-item / ranking tasks
+  "top ", "top-", "rank", "list all", "all functions",
+  "for each", "every function", "every file",
+  // Code analysis (multi-file / multi-function)
+  "analyze these", "analyze the", "callers", "callees", "impact",
+  "dead code", "cycles", "transitive",
+  // Multi-document / multi-chunk analysis
+  "across the", "summarize these", "compare these",
+];
+
+/**
+ * Decide whether a task should be planned up-front (Plan-Then-Execute).
+ * Used by the RLM loop to inject a planning directive in the initial
+ * prompt, encouraging the model to decompose before any tool use.
+ *
+ * Returns true for tasks that:
+ *   - Mention multiple items to process (top N, all X, for each)
+ *   - Code analysis tasks (almost always benefit from decomposition)
+ *   - Long prompts (probably have N items embedded)
+ */
+export function shouldPlanFirst(prompt: string): boolean {
+  const lower = prompt.toLowerCase();
+  for (const ind of DECOMPOSE_INDICATORS) {
+    if (lower.includes(ind)) return true;
+  }
+  // Multiple file paths in prompt → likely multi-file analysis
+  const pathLines = (prompt.match(/^\/[^\s]+\.(ts|tsx|js|py|go|rs|java|c|cpp|clj)/gm) ?? []).length;
+  if (pathLines >= 2) return true;
+  return false;
+}

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { routeRequest } from "../../src/rlm/routing.js";
+import { routeRequest, shouldPlanFirst } from "../../src/rlm/routing.js";
 import type { ChatMessage } from "../../src/rlm/types.js";
 
 function user(content: string): ChatMessage {
@@ -64,5 +64,38 @@ describe("routeRequest", () => {
       user("verify this is prime: 97"),
     ];
     expect(routeRequest(messages)).toBe("rlm");
+  });
+});
+
+describe("shouldPlanFirst", () => {
+  it("returns true for 'top N' tasks", () => {
+    expect(shouldPlanFirst("Find the top 5 most-impacted functions")).toBe(true);
+    expect(shouldPlanFirst("rank these items by score")).toBe(true);
+  });
+
+  it("returns true for 'for each' tasks", () => {
+    expect(shouldPlanFirst("for each function, compute X")).toBe(true);
+  });
+
+  it("returns true for code analysis keywords", () => {
+    expect(shouldPlanFirst("Analyze these files for callers")).toBe(true);
+    expect(shouldPlanFirst("Find dead code in the project")).toBe(true);
+  });
+
+  it("returns true when 2+ file paths are listed", () => {
+    expect(
+      shouldPlanFirst(
+        "Look at:\n/path/to/a.ts\n/path/to/b.ts\nand find issues",
+      ),
+    ).toBe(true);
+  });
+
+  it("returns false for simple single-question tasks", () => {
+    expect(shouldPlanFirst("What is 2+2?")).toBe(false);
+    expect(shouldPlanFirst("Write hello world in Python")).toBe(false);
+  });
+
+  it("returns false for short instruction tasks", () => {
+    expect(shouldPlanFirst("Reverse this string: hello")).toBe(false);
   });
 });

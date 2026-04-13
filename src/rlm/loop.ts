@@ -31,6 +31,7 @@ import { prologQuery, PROLOG_IMPL } from "./prolog-bridge.js";
 import { createGraphBridge, GRAPH_IMPL } from "./graph-bridge.js";
 import { debug } from "./debug.js";
 import { compactHistory, shouldCompact } from "./history.js";
+import { shouldPlanFirst } from "./routing.js";
 
 const MAX_NO_CODE_RETRIES = 3;
 /** If the same error appears this many times in a row, force final answer. */
@@ -140,9 +141,36 @@ async function initHandler(ctx: RLMContext): Promise<RLMContext> {
   });
 
   const meta = promptMetadata(ctx.prompt);
+
+  // For tasks that look like they should decompose (multi-item, code
+  // analysis, ranking, etc.), inject a planning directive in the
+  // initial user message. This is the Plan-Then-Execute pattern from
+  // ReWOO — front-load the decomposition decision so the model never
+  // gets a chance to silently iterate at the root.
+  let userContent = meta;
+  if (ctx.subRLMDepth === 0 && shouldPlanFirst(ctx.prompt)) {
+    debug("tree", "task requires planning — injecting plan-first directive");
+    userContent = [
+      meta,
+      "",
+      "PLAN PHASE — your FIRST response must be a skeleton plan only:",
+      "  // 1. <3-5 word step>",
+      "  // 2. <3-5 word step>",
+      "  // 3. <3-5 word step>",
+      "",
+      "Then in the SAME code block, dispatch the steps via batch_llm_query:",
+      "  const tasks = [\"<expanded prompt for step 1>\", ...];",
+      "  const results = await batch_llm_query(tasks);",
+      "  console.log(JSON.stringify(results));",
+      "",
+      "Each sub-task must be self-contained (it runs in a fresh sandbox).",
+      "Do NOT try to solve this task directly at the root level.",
+    ].join("\n");
+  }
+
   const history: ChatMessage[] = [
     { role: "system", content: systemPrompt },
-    { role: "user", content: meta },
+    { role: "user", content: userContent },
   ];
 
   return {
