@@ -133,16 +133,18 @@ export function createServer(config: ServerConfig): http.Server {
       // ── Chat Completions ──
       if (url === "/v1/chat/completions" && req.method === "POST") {
         // Abort when the client disconnects so we don't burn GPU cycles
-        // on a response no one will read.
+        // on a response no one will read. We only listen on res 'close'
+        // — req 'close' fires when the request BODY stream ends (normal
+        // end of POST body), not on disconnect. res 'close' fires both
+        // on normal end AND on disconnect; we check writableEnded to
+        // distinguish the two.
         const abortController = new AbortController();
-        const onClose = () => {
+        res.on("close", () => {
           if (!res.writableEnded) {
             debug("server", "client disconnected, aborting generation");
             abortController.abort();
           }
-        };
-        req.on("close", onClose);
-        res.on("close", onClose);
+        });
 
         const body = await readBody(req);
         let request: {
