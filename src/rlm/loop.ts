@@ -36,25 +36,47 @@ const MAX_NO_CODE_RETRIES = 3;
 /** If the same error appears this many times in a row, force final answer. */
 const MAX_REPEATED_ERRORS = 3;
 
-/** Compaction thresholds. When history exceeds either, we summarize. */
-const COMPACT_MAX_MESSAGES = 10;
-const COMPACT_MAX_CHARS = 24_000;
+/** Compaction thresholds. When history exceeds either, we summarize.
+ *  If the model is decomposing properly, top-level context should stay
+ *  small regardless of total work — compaction is a safety net, not
+ *  the primary bound. Looser thresholds reduce compaction overhead and
+ *  let the model keep more rich context per turn. */
+const COMPACT_MAX_MESSAGES = 20;
+const COMPACT_MAX_CHARS = 48_000;
 /** Always keep the last N messages verbatim even when compacting. */
-const COMPACT_KEEP_RECENT = 4;
+const COMPACT_KEEP_RECENT = 6;
 
 // ─── FSM State Handlers ───────────────────────────────────────────────
 
 async function initHandler(ctx: RLMContext): Promise<RLMContext> {
+  const indent = "  ".repeat(ctx.subRLMDepth);
   debug(
     "rlm",
     `init depth=${ctx.subRLMDepth}/${ctx.maxSubRLMDepth} prompt=${ctx.prompt.length}ch maxIter=${ctx.maxIterations}`,
   );
+  debug(
+    "tree",
+    `${indent}├─ SPAWN d=${ctx.subRLMDepth} prompt="${ctx.prompt.slice(0, 60).replace(/\n/g, " ")}..."`,
+  );
   const handleStore = createHandleStore();
+
+  // Track fan-out: how many sub-calls this context has dispatched.
+  // This is shared across calls to llmQueryBridge made from this ctx.
+  const spawnStats = { dispatched: 0, completed: 0 };
 
   // Build sub-RLM bridge for llm_query
   const llmQueryBridge = async (prompt: string): Promise<string> => {
+    spawnStats.dispatched++;
+    const myIdx = spawnStats.dispatched;
+    const indent = "  ".repeat(ctx.subRLMDepth + 1);
+    debug(
+      "tree",
+      `${indent}→ dispatched #${myIdx} from d=${ctx.subRLMDepth} (total dispatched=${spawnStats.dispatched}, returned=${spawnStats.completed})`,
+    );
+
     if (ctx.subRLMDepth >= ctx.maxSubRLMDepth) {
       // At max depth, do a single-shot LLM call
+      debug("tree", `${indent}  (single-shot at max depth)`);
       const resp = await ctx.llmClient.chat([
         {
           role: "system",
@@ -62,6 +84,11 @@ async function initHandler(ctx: RLMContext): Promise<RLMContext> {
         },
         { role: "user", content: prompt },
       ]);
+      spawnStats.completed++;
+      debug(
+        "tree",
+        `${indent}← #${myIdx} returned ${resp.content.length}ch (completed=${spawnStats.completed}/${spawnStats.dispatched})`,
+      );
       return resp.content;
     }
 
@@ -74,6 +101,11 @@ async function initHandler(ctx: RLMContext): Promise<RLMContext> {
       maxSubRLMDepth: ctx.maxSubRLMDepth,
       subRLMDepth: ctx.subRLMDepth + 1,
     });
+    spawnStats.completed++;
+    debug(
+      "tree",
+      `${indent}← #${myIdx} returned ${subResult.answer.length}ch (completed=${spawnStats.completed}/${spawnStats.dispatched})`,
+    );
     return subResult.answer;
   };
 
@@ -123,6 +155,16 @@ async function initHandler(ctx: RLMContext): Promise<RLMContext> {
 }
 
 async function generateHandler(ctx: RLMContext): Promise<RLMContext> {
+  // Log context-size growth at the ROOT level so we can see whether
+  // decomposition is actually keeping the root small. If root history
+  // grows linearly with iterations, the model isn't delegating.
+  if (ctx.subRLMDepth === 0) {
+    const chars = ctx.history.reduce((s, m) => s + m.content.length, 0);
+    debug(
+      "tree",
+      `ROOT iter=${ctx.iteration} history=${ctx.history.length}msg/${chars}ch handles=${ctx.handleStore.size}`,
+    );
+  }
   // Compact history if it has grown too large. This may trigger an
   // extra LLM call to produce a summary, but saves tokens on subsequent
   // iterations and keeps the active handle references visible.
@@ -351,9 +393,14 @@ async function checkFinalHandler(ctx: RLMContext): Promise<RLMContext> {
 }
 
 function doneHandler(ctx: RLMContext): RLMContext {
+  const indent = "  ".repeat(ctx.subRLMDepth);
   debug(
     "rlm",
     `done depth=${ctx.subRLMDepth} iter=${ctx.iteration} answer=${ctx.finalAnswer?.length ?? 0}ch`,
+  );
+  debug(
+    "tree",
+    `${indent}└─ RETURN d=${ctx.subRLMDepth} iter=${ctx.iteration} ans=${ctx.finalAnswer?.length ?? 0}ch`,
   );
   // Cleanup
   ctx.sandbox?.dispose();

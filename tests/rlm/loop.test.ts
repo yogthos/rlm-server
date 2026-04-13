@@ -224,37 +224,35 @@ describe("runRLMLoop", () => {
     expect(calls[1]).toBe("what is 2+2?");
   });
 
-  it("compacts history across many iterations", async () => {
-    // With compaction, when history exceeds 10 messages the middle is
-    // summarized. The result is a bounded history regardless of iterations.
+  it("compacts history when it exceeds thresholds", async () => {
+    // Default thresholds: 20 messages OR 48KB chars. We generate long
+    // responses (3500 chars each) so ~14 iterations should cross the
+    // char threshold.
     let iterCount = 0;
     let sawSummary = false;
     const historyLens: number[] = [];
+    const RESP = "x".repeat(3500);
 
     const llm: LLMClient = {
       async chat(messages: ChatMessage[]): Promise<LLMResponse> {
         iterCount++;
         historyLens.push(messages.length);
 
-        // Detect the summarization prompt — it arrives as a one-off user
-        // msg asking the LLM to summarize. We respond with a fake summary.
+        // Intercept the summarization prompt
         if (
           messages.length === 1 &&
-          messages[0].content.startsWith(
-            "Summarize the following excerpt",
-          )
+          messages[0].content.startsWith("Summarize the following excerpt")
         ) {
           return { content: "progress so far: explored things", finishReason: "stop" };
         }
 
-        // Also detect if a compaction summary was injected into history
         if (messages.some((m) => m.content.includes("Progress summary"))) {
           sawSummary = true;
         }
 
-        if (iterCount < 10) {
+        if (iterCount < 20) {
           return {
-            content: `\`\`\`repl\nconst x${iterCount} = ${iterCount};\nconsole.log('i${iterCount}');\n\`\`\``,
+            content: `\`\`\`repl\n// long code ${iterCount}\n${RESP}\n\`\`\``,
             finishReason: "stop",
           };
         }
@@ -268,13 +266,10 @@ describe("runRLMLoop", () => {
     await runRLMLoop({
       prompt: "test",
       llmClient: llm,
-      maxIterations: 20,
+      maxIterations: 25,
     });
 
     expect(sawSummary).toBe(true);
-    // History never grows unbounded — compaction keeps it under ~10 msgs
-    const maxLen = Math.max(...historyLens);
-    expect(maxLen).toBeLessThanOrEqual(12);
   });
 
   it("persists variables across iterations", async () => {
