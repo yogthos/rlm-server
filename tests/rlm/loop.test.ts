@@ -350,6 +350,75 @@ describe("runRLMLoop", () => {
     expect(nudgeIter).toBeLessThanOrEqual(5);
   });
 
+  it("rejects premature FINAL on tasks that require planning", async () => {
+    let rejected = false;
+    let iterCount = 0;
+
+    const llm: LLMClient = {
+      async chat(messages: ChatMessage[]): Promise<LLMResponse> {
+        iterCount++;
+        if (
+          messages.some((m) =>
+            m.content.includes("REJECTED. Your final answer is not acceptable"),
+          )
+        ) {
+          rejected = true;
+          return { content: "FINAL(ok, accepting after rejection)", finishReason: "stop" };
+        }
+        // Try to FINAL immediately without any tool use
+        return { content: "FINAL(quick guess)", finishReason: "stop" };
+      },
+      async listModels() {
+        return ["mock"];
+      },
+    };
+
+    // A prompt that triggers shouldPlanFirst (file paths)
+    const prompt = [
+      "Analyze these files for callers:",
+      "/abs/path/a.ts",
+      "/abs/path/b.ts",
+    ].join("\n");
+
+    await runRLMLoop({
+      prompt,
+      llmClient: llm,
+      maxIterations: 10,
+    });
+
+    expect(rejected).toBe(true);
+  });
+
+  it("does NOT reject FINAL on simple tasks", async () => {
+    let rejected = false;
+    let iterCount = 0;
+
+    const llm: LLMClient = {
+      async chat(messages: ChatMessage[]): Promise<LLMResponse> {
+        iterCount++;
+        if (
+          messages.some((m) =>
+            m.content.includes("REJECTED"),
+          )
+        ) {
+          rejected = true;
+        }
+        return { content: "FINAL(42)", finishReason: "stop" };
+      },
+      async listModels() {
+        return ["mock"];
+      },
+    };
+
+    await runRLMLoop({
+      prompt: "What is 2+2?",
+      llmClient: llm,
+      maxIterations: 5,
+    });
+
+    expect(rejected).toBe(false);
+  });
+
   it("does NOT nudge when root is solving efficiently", async () => {
     // Short responses, few iterations → no nudge even at iter 5+
     let nudged = false;

@@ -153,6 +153,10 @@ export interface RLMContext {
   spawnStats: { dispatched: number; completed: number };
   /** Whether we've already injected the "stop, decompose now" directive. */
   decompositionNudged: boolean;
+  /** Whether this task was determined to require planning/decomposition. */
+  requiresPlan: boolean;
+  /** How many times we've rejected a premature FINAL() (cap at 1). */
+  premateFinalRejections: number;
   trace: TraceEntry[];
 }
 

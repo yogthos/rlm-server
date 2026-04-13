@@ -147,8 +147,10 @@ async function initHandler(ctx: RLMContext): Promise<RLMContext> {
   // initial user message. This is the Plan-Then-Execute pattern from
   // ReWOO — front-load the decomposition decision so the model never
   // gets a chance to silently iterate at the root.
+  const requiresPlan =
+    ctx.subRLMDepth === 0 && shouldPlanFirst(ctx.prompt);
   let userContent = meta;
-  if (ctx.subRLMDepth === 0 && shouldPlanFirst(ctx.prompt)) {
+  if (requiresPlan) {
     debug("tree", "task requires planning — injecting plan-first directive");
     userContent = [
       meta,
@@ -180,6 +182,7 @@ async function initHandler(ctx: RLMContext): Promise<RLMContext> {
     systemPrompt,
     history,
     iteration: 0,
+    requiresPlan,
   };
 }
 
@@ -248,7 +251,49 @@ async function generateHandler(ctx: RLMContext): Promise<RLMContext> {
   );
 
   // Append assistant message to history
-  const history = [...ctx.history, { role: "assistant" as const, content: llmOutput }];
+  let history = [...ctx.history, { role: "assistant" as const, content: llmOutput }];
+
+  // FINAL() gating — for tasks that we determined should be planned/decomposed,
+  // reject a premature FINAL() if no sub-RLMs were dispatched. Only one
+  // rejection per request to avoid loops.
+  const isFinalAttempt = !!(extraction.finalAnswer || extraction.finalVar);
+  if (
+    ctx.subRLMDepth === 0 &&
+    ctx.requiresPlan &&
+    isFinalAttempt &&
+    ctx.spawnStats.dispatched === 0 &&
+    ctx.premateFinalRejections < 1
+  ) {
+    debug("tree", "rejecting premature FINAL — task requires decomposition but none happened");
+    history = [
+      ...history,
+      {
+        role: "user" as const,
+        content: [
+          "REJECTED. Your final answer is not acceptable because you did not",
+          "decompose this task. The task requires sub-question delegation via",
+          "batch_llm_query — see the planning instructions in the original prompt.",
+          "",
+          "Restart: write ONLY a code block that (1) builds a list of sub-task",
+          "prompts (one per item to analyze) and (2) calls",
+          "  const results = await batch_llm_query(tasks);",
+          "  console.log(JSON.stringify(results));",
+          "",
+          "Do not write FINAL() until batch_llm_query results are available.",
+        ].join("\n"),
+      },
+    ];
+    return {
+      ...ctx,
+      history,
+      lastLLMOutput: llmOutput,
+      lastCode: null,
+      finalAnswer: null,
+      lastError: null,
+      noCodeCount: 0,
+      premateFinalRejections: ctx.premateFinalRejections + 1,
+    };
+  }
 
   // Check for FINAL_VAR — resolve from sandbox
   if (extraction.finalVar && !extraction.code) {
@@ -616,6 +661,8 @@ export async function runRLMLoop(options: RunRLMOptions): Promise<RLMResult> {
     repeatedErrorCount: 0,
     spawnStats: { dispatched: 0, completed: 0 },
     decompositionNudged: false,
+    requiresPlan: false,
+    premateFinalRejections: 0,
     trace: [],
   };
 
