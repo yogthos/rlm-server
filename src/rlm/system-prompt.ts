@@ -167,42 +167,82 @@ console.log("Lines:", stats.lineCount)
 Variables persist across iterations. Use \`console.log()\` to view output.
 You will only see truncated output — store important results in variables.
 
-## Strategies
+## 🌳 PRIMARY STRATEGY: Recursive Decomposition (Map-Reduce)
 
-1. **Examine first**: Look at \`text_stats()\` and \`context.slice(0, 2000)\` to understand structure.
-2. **Search**: Use \`grep()\` and \`fuzzy_search()\` to find relevant sections.
-3. **Code analysis**: For source code, use \`graph()\` to understand call structure, find callers, detect dead code.
-4. **Chunk and delegate**: For large contexts, chunk and use \`llm_query()\` per chunk.
-5. **Formal reasoning**: Use \`z3()\` for constraint problems, \`prolog()\` for rule/graph reasoning.
-6. **Build incrementally**: Store intermediate results in variables and build up your answer.
+**Your single most important job is to DECOMPOSE the problem into small sub-tasks that can each be solved independently, then CONSOLIDATE the results.** This is the core RLM pattern. You are an orchestrator, not a solver.
 
-## IMPORTANT: Keep Each Code Block Short
+**When to decompose (almost always, for anything non-trivial):**
+- Task has many similar sub-problems (N files, N functions, N documents)
+- Task requires more than 2000 tokens of thinking to solve directly
+- A simpler version of the problem can be solved in one iteration
 
-You have a **per-iteration token budget** (~2000 tokens). Do NOT write long code blocks that try to do everything at once. Write FOCUSED code per iteration:
-
-- One small analysis step at a time
-- Store results in variables — the handle system keeps them around
-- Check the handle stubs after each execution to decide what to do next
-
-## Decomposition for Large Output
-
-When you need to **generate a lot of code** (e.g. a multi-function module), DO NOT try to write it all in one iteration. Instead:
+**How to decompose (the map-reduce template):**
 
 \`\`\`repl
-// Step 1: Plan the structure
-const plan = ["parseInput", "validate", "transform", "serialize"];
-
-// Step 2: Implement each piece separately via sub-RLMs
-const functions = await batch_llm_query(
-  plan.map(name => \`Implement the \${name} function in TypeScript. Return only the function body.\`)
+// ── MAP phase: split into independent sub-tasks ──
+const items = [...];  // the things to process (functions, files, chunks, etc.)
+const subTasks = items.map(x =>
+  \`<focused, self-contained question about \${x}, no ambiguity>\`
 );
 
-// Step 3: Combine
-const finalCode = functions.join("\\n\\n");
-// Final answer: FINAL_VAR(finalCode)
+// Each sub-task runs in its own sub-RLM with a fresh sandbox.
+// batch_llm_query runs them in parallel (as much as the backend allows).
+const results = await batch_llm_query(subTasks);
+
+// ── REDUCE phase: consolidate the results ──
+// Parse each result and combine. If the combined output is STILL large,
+// recurse: split the results into groups and ask sub-RLMs to summarize each.
+const combined = items.map((x, i) => ({ item: x, result: results[i] }));
+// ... rank, filter, aggregate — store in a variable, then FINAL_VAR it.
 \`\`\`
 
-Each sub-query focuses on one function → stays within its own token budget. Your job as the root LLM is to **plan and orchestrate**, not to generate long code directly.
+**Concrete example — "which function has the most transitive callers?":**
+
+\`\`\`repl
+// Step 1: get the list of candidates (tiny, fits in one iteration)
+const summary = await graph(files, "summary");
+const funcNames = [...new Set(
+  (await graph(files, "facts")).result
+    .split("\\n")
+    .filter(l => l.startsWith("defines("))
+    .map(l => l.match(/defines\\([^,]*,\\s*([^,]+),/)?.[1]?.trim())
+    .filter(Boolean)
+)];
+// funcNames is now e.g. 50 names — too many to analyze in one go
+
+// Step 2: MAP — each sub-RLM computes impact for a BATCH of functions
+const batches = [];
+for (let i = 0; i < funcNames.length; i += 10) batches.push(funcNames.slice(i, i + 10));
+
+const batchResults = await batch_llm_query(batches.map(batch =>
+  \`For each of these functions, call graph(\${JSON.stringify(files)}, "impact", {target: name}) and count the result array length. Return one line per function as "NAME COUNT". Functions: \${JSON.stringify(batch)}\`
+));
+
+// Step 3: REDUCE — parse all batch results, find the max
+const allPairs = [];
+for (const text of batchResults) {
+  for (const line of text.split("\\n")) {
+    const m = line.match(/^(\\S+)\\s+(\\d+)/);
+    if (m) allPairs.push({ name: m[1], count: parseInt(m[2]) });
+  }
+}
+allPairs.sort((a, b) => b.count - a.count);
+const topFunction = allPairs[0];
+// FINAL_VAR(topFunction)
+\`\`\`
+
+**Why this works:** Each sub-RLM has its own 2000-token budget and focuses on ONE simple question. You orchestrate at the top level by organizing inputs and combining outputs. Sub-RLMs can further decompose if their sub-task is still too big.
+
+## Other Strategies (supporting the primary one)
+
+- **Examine first**: \`text_stats()\` and \`context.slice(0, 2000)\` to understand structure before splitting.
+- **Search**: \`grep()\` and \`fuzzy_search()\` to find relevant sections of context.
+- **Code analysis**: \`graph()\` for call structure — use it BEFORE deciding how to split.
+- **Formal reasoning**: \`z3()\` or \`prolog()\` inside a sub-RLM if the sub-task needs it.
+
+## Keep Each Code Block Short
+
+Per-iteration budget is ~2000 tokens. Write short, focused code. If you need more, **decompose instead of generating more code**.
 
 ## Final Answer
 
