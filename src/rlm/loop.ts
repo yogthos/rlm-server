@@ -61,8 +61,9 @@ async function initHandler(ctx: RLMContext): Promise<RLMContext> {
   const handleStore = createHandleStore();
 
   // Track fan-out: how many sub-calls this context has dispatched.
-  // This is shared across calls to llmQueryBridge made from this ctx.
-  const spawnStats = { dispatched: 0, completed: 0 };
+  // Use existing ctx.spawnStats if already set (handlers preserve it),
+  // otherwise create new. The object is mutated by llmQueryBridge below.
+  const spawnStats = ctx.spawnStats ?? { dispatched: 0, completed: 0 };
 
   // Build sub-RLM bridge for llm_query
   const llmQueryBridge = async (prompt: string): Promise<string> => {
@@ -343,6 +344,46 @@ async function checkFinalHandler(ctx: RLMContext): Promise<RLMContext> {
     };
   }
 
+  // Decomposition nudge: if the ROOT has done 5+ iterations without
+  // dispatching a single sub-RLM, the model is clearly not using the
+  // recursion pattern. Force the issue with a directive.
+  if (
+    ctx.subRLMDepth === 0 &&
+    !ctx.decompositionNudged &&
+    ctx.spawnStats.dispatched === 0 &&
+    nextIteration >= 5
+  ) {
+    debug(
+      "tree",
+      "ROOT has iterated 5+ times without delegating — injecting decomposition directive",
+    );
+    const history = [
+      ...ctx.history,
+      {
+        role: "user" as const,
+        content: [
+          "STOP. You have iterated 5 times at the root without delegating any work.",
+          "The RLM pattern requires DECOMPOSITION. Do the following on your next turn:",
+          "",
+          "1. Identify the remaining sub-questions needed to answer the task.",
+          "2. Dispatch them all in ONE call to `batch_llm_query(subTasks)`.",
+          "3. When the results return, aggregate them and provide FINAL(answer).",
+          "",
+          "Do NOT write more analysis code directly at the root. Each sub-query",
+          "should be atomic (e.g. \"Compute graph impact for function X in files Y\").",
+          "Write only the minimal orchestration code to build the sub-task list",
+          "and combine the results.",
+        ].join("\n"),
+      },
+    ];
+    return {
+      ...ctx,
+      history,
+      iteration: nextIteration,
+      decompositionNudged: true,
+    };
+  }
+
   // Stuck in a loop — same error repeating. Force final with error context.
   if (ctx.repeatedErrorCount >= MAX_REPEATED_ERRORS) {
     debug(
@@ -525,6 +566,8 @@ export async function runRLMLoop(options: RunRLMOptions): Promise<RLMResult> {
     lastError: null,
     noCodeCount: 0,
     repeatedErrorCount: 0,
+    spawnStats: { dispatched: 0, completed: 0 },
+    decompositionNudged: false,
     trace: [],
   };
 

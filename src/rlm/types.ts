@@ -149,6 +149,10 @@ export interface RLMContext {
   noCodeCount: number;
   /** Number of consecutive iterations where the last error was the same. */
   repeatedErrorCount: number;
+  /** Sub-RLM spawn counter (shared mutable object set in initHandler). */
+  spawnStats: { dispatched: number; completed: number };
+  /** Whether we've already injected the "stop, decompose now" directive. */
+  decompositionNudged: boolean;
   trace: TraceEntry[];
 }
 

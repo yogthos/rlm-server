@@ -272,6 +272,95 @@ describe("runRLMLoop", () => {
     expect(sawSummary).toBe(true);
   });
 
+  it("nudges toward decomposition after 5 iterations without sub-RLMs", async () => {
+    let nudged = false;
+    let iterCount = 0;
+
+    const llm: LLMClient = {
+      async chat(messages: ChatMessage[]): Promise<LLMResponse> {
+        iterCount++;
+        // Did the server inject a nudge into the history?
+        if (
+          messages.some((m) =>
+            m.content.includes("You have iterated 5 times at the root"),
+          )
+        ) {
+          nudged = true;
+          return { content: "FINAL(noted, giving up)", finishReason: "stop" };
+        }
+        // Model never delegates, always writes direct code
+        return {
+          content: `\`\`\`repl\nconsole.log('step ${iterCount}');\n\`\`\``,
+          finishReason: "stop",
+        };
+      },
+      async listModels() {
+        return ["mock"];
+      },
+    };
+
+    await runRLMLoop({
+      prompt: "test",
+      llmClient: llm,
+      maxIterations: 15,
+    });
+
+    expect(nudged).toBe(true);
+  });
+
+  it("does not nudge when sub-RLMs have already been spawned", async () => {
+    let nudged = false;
+    let iterCount = 0;
+
+    const llm: LLMClient = {
+      async chat(messages: ChatMessage[]): Promise<LLMResponse> {
+        iterCount++;
+        if (
+          messages.some((m) =>
+            m.content.includes("You have iterated 5 times at the root"),
+          )
+        ) {
+          nudged = true;
+        }
+        // Also detect the sub-RLM init (its first message has "Context loaded:")
+        if (
+          messages.some((m) => m.content.startsWith("Context loaded:")) &&
+          iterCount > 1
+        ) {
+          return { content: "FINAL(sub-done)", finishReason: "stop" };
+        }
+
+        // On iter 1, parent calls llm_query (triggering a sub-RLM)
+        if (iterCount === 1) {
+          return {
+            content: `\`\`\`repl\nconst r = await llm_query("sub task");\nconsole.log(r);\n\`\`\``,
+            finishReason: "stop",
+          };
+        }
+        // Then many more iterations without further delegation
+        if (iterCount < 12) {
+          return {
+            content: `\`\`\`repl\nconsole.log('step ${iterCount}');\n\`\`\``,
+            finishReason: "stop",
+          };
+        }
+        return { content: "FINAL(done)", finishReason: "stop" };
+      },
+      async listModels() {
+        return ["mock"];
+      },
+    };
+
+    await runRLMLoop({
+      prompt: "test",
+      llmClient: llm,
+      maxIterations: 15,
+    });
+
+    // Sub-RLM was dispatched → no nudge
+    expect(nudged).toBe(false);
+  });
+
   it("persists variables across iterations", async () => {
     const llm = createMockLLM([
       // Turn 1: define variable
