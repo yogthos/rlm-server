@@ -178,6 +178,77 @@ describe("runRLMLoop", () => {
     expect(calls.length).toBe(3);
   });
 
+  it("aborts sub-RLMs when parent loop completes", async () => {
+    // The model spawns a sub-RLM. After parent's FINAL, the sub-RLM
+    // should see signal.aborted and bail out — proving the internal
+    // abort propagation works.
+    let subSawAbort = false;
+    let parentCalls = 0;
+
+    const llm: LLMClient = {
+      async chat(messages: ChatMessage[], options): Promise<LLMResponse> {
+        parentCalls++;
+        // Sub-RLM detection: gets "Context loaded:" metadata as first user msg
+        const isSubRLM = messages.some((m) =>
+          m.content.startsWith("Context loaded:") && m.content.includes("sub task"),
+        );
+
+        if (isSubRLM) {
+          // First sub-RLM call: pretend to be busy until aborted
+          if (options?.signal) {
+            try {
+              await new Promise((resolve, reject) => {
+                const t = setTimeout(resolve, 5000);
+                options.signal!.addEventListener(
+                  "abort",
+                  () => {
+                    clearTimeout(t);
+                    subSawAbort = true;
+                    reject(new Error("aborted by signal"));
+                  },
+                  { once: true },
+                );
+              });
+            } catch {
+              // expected — abort fired
+            }
+            return { content: "FINAL(sub-result)", finishReason: "stop" };
+          }
+          return { content: "FINAL(immediate)", finishReason: "stop" };
+        }
+
+        // Parent: spawn a sub-RLM (won't await), then immediately FINAL
+        if (parentCalls === 1) {
+          return {
+            content:
+              "```repl\n" +
+              // unawaited — kicks off but doesn't block
+              "llm_query('sub task in background');\n" +
+              "console.log('parent done');\n" +
+              "```",
+            finishReason: "stop",
+          };
+        }
+        return { content: "FINAL(parent done)", finishReason: "stop" };
+      },
+      async listModels() {
+        return ["mock"];
+      },
+    };
+
+    await runRLMLoop({
+      prompt: "test",
+      llmClient: llm,
+      maxIterations: 5,
+      maxSubRLMDepth: 2,
+    });
+
+    // Give microtask queue a chance to deliver the abort to pending sub
+    await new Promise((r) => setTimeout(r, 50));
+
+    expect(subSawAbort).toBe(true);
+  });
+
   it("falls back to single-shot LLM at max sub-RLM depth", async () => {
     const calls: string[] = [];
     const llm: LLMClient = {

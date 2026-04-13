@@ -286,6 +286,12 @@ export function createServer(config: ServerConfig): http.Server {
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err);
             emitChunk({ content: `Error: ${msg}` }, "stop");
+          } finally {
+            // Kill any orphan sub-work after the SSE stream ends
+            if (!abortController.signal.aborted) {
+              debug("server", `aborting any in-flight sub-work (stream) id=${chatId.slice(-8)}`);
+              abortController.abort();
+            }
           }
 
           res.write("data: [DONE]\n\n");
@@ -435,6 +441,15 @@ export function createServer(config: ServerConfig): http.Server {
               }),
             );
             res.end();
+          }
+        } finally {
+          // Always abort the controller after the response is finalized.
+          // This kills any orphan sub-RLMs the model may have spawned via
+          // unawaited batch_llm_query() calls. The signal propagates
+          // through ctx.signal in nested runRLMLoop calls.
+          if (!abortController.signal.aborted) {
+            debug("server", `aborting any in-flight sub-work id=${chatId.slice(-8)}`);
+            abortController.abort();
           }
         }
 

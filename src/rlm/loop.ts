@@ -79,13 +79,16 @@ async function initHandler(ctx: RLMContext): Promise<RLMContext> {
     if (ctx.subRLMDepth >= ctx.maxSubRLMDepth) {
       // At max depth, do a single-shot LLM call
       debug("tree", `${indent}  (single-shot at max depth)`);
-      const resp = await ctx.llmClient.chat([
-        {
-          role: "system",
-          content: "Answer the following query concisely. Provide only the answer as plain text.",
-        },
-        { role: "user", content: prompt },
-      ]);
+      const resp = await ctx.llmClient.chat(
+        [
+          {
+            role: "system",
+            content: "Answer the following query concisely. Provide only the answer as plain text.",
+          },
+          { role: "user", content: prompt },
+        ],
+        ctx.signal ? { signal: ctx.signal } : undefined,
+      );
       spawnStats.completed++;
       debug(
         "tree",
@@ -94,7 +97,10 @@ async function initHandler(ctx: RLMContext): Promise<RLMContext> {
       return resp.content;
     }
 
-    // Spawn a nested RLM loop
+    // Spawn a nested RLM loop. Pass the parent's signal through so
+    // when the parent (or the request itself) is aborted, all in-flight
+    // sub-RLMs see it and bail out — preventing orphan work after the
+    // root response has been delivered.
     const subResult = await runRLMLoop({
       prompt,
       llmClient: ctx.llmClient,
@@ -102,6 +108,7 @@ async function initHandler(ctx: RLMContext): Promise<RLMContext> {
       sandboxTimeoutMs: ctx.sandboxTimeoutMs,
       maxSubRLMDepth: ctx.maxSubRLMDepth,
       subRLMDepth: ctx.subRLMDepth + 1,
+      signal: ctx.signal,
     });
     spawnStats.completed++;
     debug(
@@ -637,8 +644,26 @@ export async function runRLMLoop(options: RunRLMOptions): Promise<RLMResult> {
     sandboxTimeoutMs = 30_000,
     maxSubRLMDepth = 3,
     subRLMDepth = 0,
-    signal,
+    signal: externalSignal,
   } = options;
+
+  // Internal abort controller that we ALWAYS abort when this loop ends.
+  // Sub-RLMs spawned during this loop see this signal via ctx.signal,
+  // so any in-flight sub-RLM work — including async work the model
+  // started without awaiting (unawaited batch_llm_query) — is cancelled
+  // when the parent finishes. The external signal (if provided) chains
+  // into this one so client disconnects also propagate.
+  const internalController = new AbortController();
+  if (externalSignal) {
+    if (externalSignal.aborted) {
+      internalController.abort();
+    } else {
+      externalSignal.addEventListener("abort", () => internalController.abort(), {
+        once: true,
+      });
+    }
+  }
+  const signal = internalController.signal;
 
   const initialCtx: RLMContext = {
     prompt,
@@ -669,16 +694,27 @@ export async function runRLMLoop(options: RunRLMOptions): Promise<RLMResult> {
   const spec = buildRLMSpec();
   const engine = new FSMEngine<RLMContext>();
 
-  const finalCtx = await engine.run(spec, initialCtx, {
-    onTransition: (from, to) => {
-      debug("rlm", `transition: ${from} → ${to}`);
-      options.onIteration?.(initialCtx.iteration, `${from} → ${to}`);
-    },
-  });
+  try {
+    const finalCtx = await engine.run(spec, initialCtx, {
+      onTransition: (from, to) => {
+        debug("rlm", `transition: ${from} → ${to}`);
+        options.onIteration?.(initialCtx.iteration, `${from} → ${to}`);
+      },
+    });
 
-  return {
-    answer: finalCtx.finalAnswer ?? "No answer produced.",
-    iterations: finalCtx.iteration,
-    trace: finalCtx.trace,
-  };
+    return {
+      answer: finalCtx.finalAnswer ?? "No answer produced.",
+      iterations: finalCtx.iteration,
+      trace: finalCtx.trace,
+    };
+  } finally {
+    // ALWAYS abort the internal controller. This kills any sub-RLMs
+    // the model started but didn't await (unawaited batch_llm_query
+    // is the common offender). The signal chain reaches them via
+    // ctx.signal → their internal controllers → their chat() calls.
+    if (!signal.aborted) {
+      debug("rlm", `runRLMLoop done at depth=${subRLMDepth}, aborting internal signal`);
+      internalController.abort();
+    }
+  }
 }
