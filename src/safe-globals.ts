@@ -4,7 +4,11 @@
  * Provides standard JS built-ins with:
  * - Frozen Object proxy (blocks prototype pollution via __proto__ keys)
  * - Constructor chain escape prevention
- * - eval() blocked
+ *
+ * eval is allowed — the VM context is already isolated, and the host
+ * controls what globals exist (no process, require, etc.). Blocking
+ * eval mostly just made it harder for LLM-generated code to parse
+ * stringified sub-RLM results.
  */
 
 /**
@@ -49,9 +53,6 @@ export function buildSafeGlobals(): Record<string, unknown> {
     isFinite: Number.isFinite,
     encodeURIComponent,
     decodeURIComponent,
-    eval: () => {
-      throw new Error("eval is not allowed in sandbox");
-    },
   };
 
   // Prevent constructor chain escape: this.constructor.constructor("return process")()

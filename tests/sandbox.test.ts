@@ -60,10 +60,14 @@ describe("createSandbox", () => {
     sandbox.dispose();
   });
 
-  it("blocks eval", async () => {
+  it("allows eval inside the sandbox VM", async () => {
+    // The VM context is already isolated (no process, require, etc.),
+    // so eval is safe to permit and useful for LLM-generated code that
+    // needs to parse dynamic strings from sub-RLM results.
     const sandbox = createSandbox("test");
     const result = await sandbox.execute('eval("1+1")');
-    expect(result.error).toContain("eval is not allowed");
+    expect(result.error).toBeUndefined();
+    expect(result.result).toBe(2);
     sandbox.dispose();
   });
 
