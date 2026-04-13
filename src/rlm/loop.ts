@@ -344,18 +344,26 @@ async function checkFinalHandler(ctx: RLMContext): Promise<RLMContext> {
     };
   }
 
-  // Decomposition nudge: if the ROOT has done 5+ iterations without
-  // dispatching a single sub-RLM, the model is clearly not using the
-  // recursion pattern. Force the issue with a directive.
+  // Decomposition nudge: only fires on real stagnation, not just iter
+  // count. Conditions:
+  //   - at root (sub-RLMs don't nudge)
+  //   - haven't already nudged
+  //   - no sub-RLMs dispatched yet
+  //   - 5+ iterations done
+  //   - root context has genuinely grown past a threshold (> 20KB)
+  //     — this is what distinguishes "model solving efficiently in 3
+  //     iterations" from "model struggling and accumulating work"
+  const rootChars = ctx.history.reduce((s, m) => s + m.content.length, 0);
   if (
     ctx.subRLMDepth === 0 &&
     !ctx.decompositionNudged &&
     ctx.spawnStats.dispatched === 0 &&
-    nextIteration >= 5
+    nextIteration >= 5 &&
+    rootChars > 20_000
   ) {
     debug(
       "tree",
-      "ROOT has iterated 5+ times without delegating — injecting decomposition directive",
+      `ROOT has iterated ${nextIteration} times without delegating and history is ${rootChars}ch — injecting decomposition directive`,
     );
     const history = [
       ...ctx.history,

@@ -272,25 +272,26 @@ describe("runRLMLoop", () => {
     expect(sawSummary).toBe(true);
   });
 
-  it("nudges toward decomposition after 5 iterations without sub-RLMs", async () => {
+  it("nudges toward decomposition when root bloats without sub-RLMs", async () => {
     let nudged = false;
     let iterCount = 0;
+    const BIG = "x".repeat(4000); // each response adds ~4KB to history
 
     const llm: LLMClient = {
       async chat(messages: ChatMessage[]): Promise<LLMResponse> {
         iterCount++;
-        // Did the server inject a nudge into the history?
         if (
           messages.some((m) =>
-            m.content.includes("You have iterated 5 times at the root"),
+            m.content.includes("You have iterated"),
           )
         ) {
           nudged = true;
           return { content: "FINAL(noted, giving up)", finishReason: "stop" };
         }
-        // Model never delegates, always writes direct code
+        // Model never delegates, writes LONG code each iter so root
+        // context bloats past the 20KB nudge threshold
         return {
-          content: `\`\`\`repl\nconsole.log('step ${iterCount}');\n\`\`\``,
+          content: `\`\`\`repl\n// ${BIG}\nconsole.log('i${iterCount}');\n\`\`\``,
           finishReason: "stop",
         };
       },
@@ -306,6 +307,41 @@ describe("runRLMLoop", () => {
     });
 
     expect(nudged).toBe(true);
+  });
+
+  it("does NOT nudge when root is solving efficiently", async () => {
+    // Short responses, few iterations → no nudge even at iter 5+
+    let nudged = false;
+    let iterCount = 0;
+
+    const llm: LLMClient = {
+      async chat(messages: ChatMessage[]): Promise<LLMResponse> {
+        iterCount++;
+        if (messages.some((m) => m.content.includes("You have iterated"))) {
+          nudged = true;
+        }
+        if (iterCount < 8) {
+          // Short code → minimal history growth
+          return {
+            content: "```repl\nconsole.log(1);\n```",
+            finishReason: "stop",
+          };
+        }
+        return { content: "FINAL(done)", finishReason: "stop" };
+      },
+      async listModels() {
+        return ["mock"];
+      },
+    };
+
+    await runRLMLoop({
+      prompt: "test",
+      llmClient: llm,
+      maxIterations: 15,
+    });
+
+    // 8 small iterations: history stays under 20KB → no nudge
+    expect(nudged).toBe(false);
   });
 
   it("does not nudge when sub-RLMs have already been spawned", async () => {
