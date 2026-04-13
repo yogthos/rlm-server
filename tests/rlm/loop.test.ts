@@ -360,9 +360,10 @@ describe("runRLMLoop", () => {
           return { content: "FINAL(noted, giving up)", finishReason: "stop" };
         }
         // Model never delegates, writes LONG code each iter so root
-        // context bloats past the 20KB nudge threshold
+        // context bloats past the 20KB nudge threshold. Vary BIG prefix
+        // to dodge the repeated-response detector.
         return {
-          content: `\`\`\`repl\n// ${BIG}\nconsole.log('i${iterCount}');\n\`\`\``,
+          content: `\`\`\`repl\n// iter${iterCount} ${BIG}\nconsole.log('i${iterCount}');\n\`\`\``,
           finishReason: "stop",
         };
       },
@@ -399,9 +400,10 @@ describe("runRLMLoop", () => {
           nudgeIter = iterCount;
           return { content: "FINAL(noted)", finishReason: "stop" };
         }
-        // Always write broken code → execute always sets lastError
+        // Always write broken code → execute always sets lastError.
+        // Vary the content to dodge the repeated-response detector.
         return {
-          content: "```repl\nundefinedReference();\n```",
+          content: `\`\`\`repl\nundefinedReference_${iterCount}();\n\`\`\``,
           finishReason: "stop",
         };
       },
@@ -488,6 +490,56 @@ describe("runRLMLoop", () => {
     });
 
     expect(rejected).toBe(false);
+  });
+
+  it("force-terminates when model produces identical responses", async () => {
+    let iterCount = 0;
+    const SAME_TEXT = "I am thinking about this problem and exploring ".repeat(20);
+
+    const llm: LLMClient = {
+      async chat(): Promise<LLMResponse> {
+        iterCount++;
+        return { content: SAME_TEXT, finishReason: "stop" };
+      },
+      async listModels() {
+        return ["mock"];
+      },
+    };
+
+    const result = await runRLMLoop({
+      prompt: "test",
+      llmClient: llm,
+      maxIterations: 30,
+    });
+
+    expect(result.iterations).toBeLessThan(10);
+    expect(result.answer).toContain("thinking about this problem");
+  });
+
+  it("force-terminates after total no-code accumulation", async () => {
+    let iterCount = 0;
+
+    const llm: LLMClient = {
+      async chat(): Promise<LLMResponse> {
+        iterCount++;
+        return {
+          content: `Reasoning attempt ${iterCount}: still thinking, no code yet.`,
+          finishReason: "stop",
+        };
+      },
+      async listModels() {
+        return ["mock"];
+      },
+    };
+
+    const result = await runRLMLoop({
+      prompt: "test",
+      llmClient: llm,
+      maxIterations: 30,
+    });
+
+    // MAX_TOTAL_NO_CODE = 6 → terminate around iter 6-8
+    expect(result.iterations).toBeLessThanOrEqual(10);
   });
 
   it("does NOT nudge when root is solving efficiently", async () => {

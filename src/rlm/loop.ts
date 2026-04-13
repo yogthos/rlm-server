@@ -36,6 +36,12 @@ import { shouldPlanFirst } from "./routing.js";
 const MAX_NO_CODE_RETRIES = 3;
 /** If the same error appears this many times in a row, force final answer. */
 const MAX_REPEATED_ERRORS = 3;
+/** Total no-code responses across the loop before we give up. */
+const MAX_TOTAL_NO_CODE = 6;
+/** Identical response prefixes in a row before we give up. */
+const MAX_REPEATED_RESPONSES = 2;
+/** Prefix length used for "same response" detection (chars). */
+const RESPONSE_FINGERPRINT_LEN = 200;
 
 /** Compaction thresholds. When history exceeds either, we summarize.
  *  If the model is decomposing properly, top-level context should stay
@@ -323,6 +329,19 @@ async function generateHandler(ctx: RLMContext): Promise<RLMContext> {
     };
   }
 
+  // Track repeated near-identical responses (degenerate hallucination loop).
+  // Compare the prefix of the model's output to the previous turn's output.
+  const fp = llmOutput.slice(0, RESPONSE_FINGERPRINT_LEN);
+  const prevFp = (ctx.lastLLMOutput ?? "").slice(0, RESPONSE_FINGERPRINT_LEN);
+  const sameAsPrev = fp.length > 0 && fp === prevFp;
+  const repeatedResponseCount = sameAsPrev ? ctx.repeatedResponseCount + 1 : 0;
+  if (sameAsPrev) {
+    debug(
+      "rlm",
+      `repeated response detected (${repeatedResponseCount + 1}x same prefix ${fp.length}ch)`,
+    );
+  }
+
   return {
     ...ctx,
     history,
@@ -331,6 +350,8 @@ async function generateHandler(ctx: RLMContext): Promise<RLMContext> {
     finalAnswer: extraction.finalAnswer,
     lastError: null,
     noCodeCount: extraction.code ? 0 : ctx.noCodeCount + 1,
+    totalNoCodeCount: extraction.code ? ctx.totalNoCodeCount : ctx.totalNoCodeCount + 1,
+    repeatedResponseCount,
   };
 }
 
@@ -421,6 +442,35 @@ async function checkFinalHandler(ctx: RLMContext): Promise<RLMContext> {
       ...ctx,
       iteration: nextIteration,
       finalAnswer: "Request aborted.",
+    };
+  }
+
+  // Degenerate response loop: model is repeating itself verbatim.
+  // Force termination using the last LLM output as the answer (best
+  // effort — at least the user gets something).
+  if (ctx.repeatedResponseCount >= MAX_REPEATED_RESPONSES) {
+    debug(
+      "rlm",
+      `forcing final after ${ctx.repeatedResponseCount + 1} identical responses`,
+    );
+    return {
+      ...ctx,
+      iteration: nextIteration,
+      finalAnswer: ctx.lastLLMOutput ?? "Model produced no usable answer.",
+    };
+  }
+
+  // Total no-code accumulation: model has had many chances to write
+  // code or FINAL but keeps producing prose. Force termination.
+  if (ctx.totalNoCodeCount >= MAX_TOTAL_NO_CODE) {
+    debug(
+      "rlm",
+      `forcing final after ${ctx.totalNoCodeCount} total no-code iterations`,
+    );
+    return {
+      ...ctx,
+      iteration: nextIteration,
+      finalAnswer: ctx.lastLLMOutput ?? "Model produced no FINAL answer.",
     };
   }
 
@@ -688,6 +738,8 @@ export async function runRLMLoop(options: RunRLMOptions): Promise<RLMResult> {
     decompositionNudged: false,
     requiresPlan: false,
     premateFinalRejections: 0,
+    totalNoCodeCount: 0,
+    repeatedResponseCount: 0,
     trace: [],
   };
 
