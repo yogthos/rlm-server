@@ -472,11 +472,12 @@ export function startServer(config: ServerConfig): http.Server {
 
   server.listen(config.port, config.host, () => {
     console.log(`RLM server listening on http://${config.host}:${config.port}`);
+    const provider = config.llm.provider ?? "(auto)";
+    console.log(`Provider: ${provider}`);
     if (config.llm.modelPath) {
-      console.log(`Inference: local (in-process via node-llama-cpp)`);
-      console.log(`Model: ${config.llm.modelPath}`);
-    } else {
-      console.log(`Inference: remote (${config.llm.baseUrl})`);
+      console.log(`Model: ${config.llm.modelPath} (local in-process)`);
+    } else if (config.llm.baseUrl) {
+      console.log(`Endpoint: ${config.llm.baseUrl}`);
       console.log(`Model: ${config.llm.model}`);
     }
     console.log(`Max iterations: ${config.maxIterations}`);

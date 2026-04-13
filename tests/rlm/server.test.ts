@@ -77,6 +77,7 @@ beforeAll(async () => {
     port: 0,
     host: "127.0.0.1",
     llm: {
+      provider: "ollama",
       baseUrl: `http://127.0.0.1:${mockOllamaPort}`,
       model: "test-model",
       temperature: 0.1,

@@ -35,9 +35,17 @@ export { z3Solve, Z3_IMPL, prepareSmtlib } from "./z3-bridge.js";
 export { prologQuery, PROLOG_IMPL } from "./prolog-bridge.js";
 export type { PrologOptions } from "./prolog-bridge.js";
 
-// LLM client
-export { createLLMClient } from "./llm-client.js";
-export { createLocalLLMClient, disposeLocalLLM } from "./local-llm.js";
+// LLM client + providers
+export {
+  createLLMClient,
+  createLocalProvider,
+  createOpenAIProvider,
+  createDeepSeekProvider,
+  createOllamaProvider,
+  disposeLocalProvider,
+  pickProvider,
+} from "./providers/index.js";
+export type { ProviderType } from "./types.js";
 
 // Config
 export { loadConfig } from "./config.js";

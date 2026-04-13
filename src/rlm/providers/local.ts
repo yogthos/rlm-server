@@ -27,13 +27,13 @@ import type {
   ChatMessage,
   LLMResponse,
   ChatOptions,
-} from "./types.js";
+} from "../types.js";
 import {
   convertToolsToFunctions,
   convertToolCallToOpenAI,
   type CapturedCall,
-} from "./tool-calls.js";
-import { debug } from "./debug.js";
+} from "../tool-calls.js";
+import { debug } from "../debug.js";
 
 // ─── Singleton model state ────────────────────────────────────────────
 
@@ -377,7 +377,7 @@ async function runInference(
 
 // ─── Public API ───────────────────────────────────────────────────────
 
-export function createLocalLLMClient(config: LLMConfig): LLMClient {
+export function createLocalProvider(config: LLMConfig): LLMClient {
   return {
     chat(
       messages: ChatMessage[],
@@ -406,7 +406,7 @@ export function convertMessagesForTesting(messages: ChatMessage[]) {
 }
 
 /** Dispose the loaded model and free resources. */
-export function disposeLocalLLM(): void {
+export function disposeLocalProvider(): void {
   activeSession = null;
   activeSystemPrompt = "";
   activeHistory = [];

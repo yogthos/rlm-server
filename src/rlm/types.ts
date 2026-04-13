@@ -4,12 +4,19 @@
 
 import type { Sandbox } from "../types.js";
 
+/** Provider type — picks the LLM backend implementation. */
+export type ProviderType = "local" | "openai" | "ollama" | "deepseek";
+
 /** Configuration for the LLM backend. */
 export interface LLMConfig {
+  /** Which provider to use. If omitted, inferred from modelPath/baseUrl. */
+  provider?: ProviderType;
   /** For local inference: path to GGUF file or HuggingFace URI (e.g. "hf:user/repo:Q4_K_M"). */
   modelPath?: string;
-  /** For remote inference: base URL of Ollama or OpenAI-compatible endpoint. */
+  /** For remote inference: base URL. Defaults vary per provider. */
   baseUrl?: string;
+  /** API key for cloud providers (or set via env var). */
+  apiKey?: string;
   /** Model name (used for remote backends and API responses). */
   model: string;
   maxTokens?: number;

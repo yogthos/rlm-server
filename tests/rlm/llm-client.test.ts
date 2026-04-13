@@ -65,6 +65,7 @@ afterAll(() => {
 describe("createLLMClient (Ollama remote)", () => {
   it("sends chat messages and parses response", async () => {
     const client = createLLMClient({
+      provider: "ollama",
       baseUrl: `http://127.0.0.1:${port}`,
       model: "gemma4:26b",
     });
@@ -82,6 +83,7 @@ describe("createLLMClient (Ollama remote)", () => {
 
   it("lists models", async () => {
     const client = createLLMClient({
+      provider: "ollama",
       baseUrl: `http://127.0.0.1:${port}`,
       model: "gemma4:26b",
     });
@@ -93,6 +95,7 @@ describe("createLLMClient (Ollama remote)", () => {
 
   it("handles connection errors gracefully in listModels", async () => {
     const client = createLLMClient({
+      provider: "ollama",
       baseUrl: "http://127.0.0.1:1",
       model: "test",
       timeoutMs: 2000,

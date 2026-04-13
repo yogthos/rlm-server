@@ -2,32 +2,76 @@
  * RLM server configuration.
  *
  * Reads from environment variables with sensible defaults.
- * Local inference (modelPath) is preferred over remote (baseUrl).
+ *
+ * Provider selection priority:
+ *   1. RLM_PROVIDER explicitly set ("local" | "openai" | "deepseek" | "ollama")
+ *   2. RLM_MODEL_PATH set → "local"
+ *   3. DEEPSEEK_API_KEY set → "deepseek"
+ *   4. OPENAI_API_KEY set → "openai"
+ *   5. Default: "ollama" (assume local Ollama)
  */
 
-import type { ServerConfig } from "./types.js";
+import type { ServerConfig, ProviderType } from "./types.js";
+
+function pickProvider(envProvider: string | undefined): ProviderType {
+  if (envProvider) {
+    if (["local", "openai", "deepseek", "ollama"].includes(envProvider)) {
+      return envProvider as ProviderType;
+    }
+  }
+  if (process.env.RLM_MODEL_PATH) return "local";
+  if (process.env.DEEPSEEK_API_KEY) return "deepseek";
+  if (process.env.OPENAI_API_KEY) return "openai";
+  return "ollama";
+}
+
+function defaultBaseUrl(provider: ProviderType): string | undefined {
+  switch (provider) {
+    case "local":
+      return undefined;
+    case "deepseek":
+      return "https://api.deepseek.com/v1";
+    case "openai":
+      return "https://api.openai.com/v1";
+    case "ollama":
+      return "http://localhost:11434";
+  }
+}
+
+function defaultModel(provider: ProviderType): string {
+  switch (provider) {
+    case "deepseek":
+      return "deepseek-chat";
+    case "openai":
+      return "gpt-4o-mini";
+    default:
+      return "gemma4";
+  }
+}
 
 export function loadConfig(overrides?: Partial<ServerConfig>): ServerConfig {
+  const provider =
+    overrides?.llm?.provider ?? pickProvider(process.env.RLM_PROVIDER);
+
   const modelPath =
     process.env.RLM_MODEL_PATH ?? overrides?.llm?.modelPath ?? undefined;
 
-  // Only use remote baseUrl if no local model path is configured
-  const baseUrl = modelPath
-    ? undefined
-    : process.env.OLLAMA_BASE_URL ??
-      overrides?.llm?.baseUrl ??
-      "http://localhost:11434";
+  const baseUrl =
+    process.env.RLM_BASE_URL ??
+    process.env.OLLAMA_BASE_URL ??
+    overrides?.llm?.baseUrl ??
+    defaultBaseUrl(provider);
 
   return {
     port: num(process.env.RLM_PORT) ?? overrides?.port ?? 3000,
     host: process.env.RLM_HOST ?? overrides?.host ?? "0.0.0.0",
     llm: {
+      provider,
       modelPath,
       baseUrl,
+      apiKey: overrides?.llm?.apiKey,
       model:
-        process.env.RLM_MODEL ??
-        overrides?.llm?.model ??
-        "gemma4",
+        process.env.RLM_MODEL ?? overrides?.llm?.model ?? defaultModel(provider),
       maxTokens:
         num(process.env.RLM_MAX_TOKENS) ??
         overrides?.llm?.maxTokens ??

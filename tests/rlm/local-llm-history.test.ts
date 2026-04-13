@@ -11,7 +11,7 @@ import type { ChatMessage } from "../../src/rlm/types.js";
 
 // Re-export the conversion logic for testing. We'll need to expose
 // convertHistory from local-llm.ts.
-import { convertMessagesForTesting } from "../../src/rlm/local-llm.js";
+import { convertMessagesForTesting } from "../../src/rlm/providers/local.js";
 
 describe("convertMessagesForTesting (tool message handling)", () => {
   it("extracts system prompt from first system message", () => {
