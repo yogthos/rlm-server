@@ -30,30 +30,17 @@ import { z3Solve, Z3_IMPL } from "./z3-bridge.js";
 import { prologQuery, PROLOG_IMPL } from "./prolog-bridge.js";
 import { createGraphBridge, GRAPH_IMPL } from "./graph-bridge.js";
 import { debug } from "./debug.js";
+import { compactHistory, shouldCompact } from "./history.js";
 
 const MAX_NO_CODE_RETRIES = 3;
 /** If the same error appears this many times in a row, force final answer. */
 const MAX_REPEATED_ERRORS = 3;
-/** Keep the last N assistant/user pairs in RLM history. The paper's
- *  approach: handles carry state across iterations, so recent turns
- *  are enough context. Everything older is redundant with the handles. */
-const KEEP_RECENT_PAIRS = 3;
 
-/**
- * Trim history aggressively — keep system prompt + initial user prompt
- * + last N turn pairs. The handle store carries state across iterations
- * so old assistant code/feedback is redundant.
- */
-function trimHistory(history: ChatMessage[]): ChatMessage[] {
-  // [system, user-initial, asst1, fb1, asst2, fb2, ...]
-  // Always keep first 2 (system + initial user prompt)
-  // Keep last KEEP_RECENT_PAIRS * 2 messages (N asst + N feedback)
-  const prefix = history.slice(0, 2);
-  const tail = history.slice(2);
-  const keepCount = KEEP_RECENT_PAIRS * 2;
-  if (tail.length <= keepCount) return history;
-  return [...prefix, ...tail.slice(-keepCount)];
-}
+/** Compaction thresholds. When history exceeds either, we summarize. */
+const COMPACT_MAX_MESSAGES = 10;
+const COMPACT_MAX_CHARS = 24_000;
+/** Always keep the last N messages verbatim even when compacting. */
+const COMPACT_KEEP_RECENT = 4;
 
 // ─── FSM State Handlers ───────────────────────────────────────────────
 
@@ -136,15 +123,44 @@ async function initHandler(ctx: RLMContext): Promise<RLMContext> {
 }
 
 async function generateHandler(ctx: RLMContext): Promise<RLMContext> {
-  const trimmed = trimHistory(ctx.history);
-  const totalHistoryChars = trimmed.reduce((s, m) => s + m.content.length, 0);
+  // Compact history if it has grown too large. This may trigger an
+  // extra LLM call to produce a summary, but saves tokens on subsequent
+  // iterations and keeps the active handle references visible.
+  let workingHistory = ctx.history;
+  if (
+    shouldCompact(workingHistory, {
+      maxMessages: COMPACT_MAX_MESSAGES,
+      maxChars: COMPACT_MAX_CHARS,
+    })
+  ) {
+    debug(
+      "rlm",
+      `compacting history (${workingHistory.length}msg, ${workingHistory.reduce((s, m) => s + m.content.length, 0)}ch)`,
+    );
+    const compactStart = Date.now();
+    workingHistory = await compactHistory(workingHistory, ctx.llmClient, {
+      maxMessages: COMPACT_MAX_MESSAGES,
+      maxChars: COMPACT_MAX_CHARS,
+      keepRecent: COMPACT_KEEP_RECENT,
+      signal: ctx.signal,
+    });
+    debug(
+      "rlm",
+      `compacted in ${Date.now() - compactStart}ms → ${workingHistory.length}msg`,
+    );
+  }
+
+  const totalHistoryChars = workingHistory.reduce(
+    (s, m) => s + m.content.length,
+    0,
+  );
   debug(
     "rlm",
-    `generate iter=${ctx.iteration} history=${trimmed.length}msg/${totalHistoryChars}ch`,
+    `generate iter=${ctx.iteration} history=${workingHistory.length}msg/${totalHistoryChars}ch`,
   );
   const chatStart = Date.now();
   const response = await ctx.llmClient.chat(
-    trimmed,
+    workingHistory,
     ctx.signal ? { signal: ctx.signal } : undefined,
   );
   const chatMs = Date.now() - chatStart;
