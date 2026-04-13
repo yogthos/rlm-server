@@ -282,7 +282,7 @@ describe("runRLMLoop", () => {
         iterCount++;
         if (
           messages.some((m) =>
-            m.content.includes("You have iterated"),
+            m.content.includes("Abandon your current approach"),
           )
         ) {
           nudged = true;
@@ -309,6 +309,47 @@ describe("runRLMLoop", () => {
     expect(nudged).toBe(true);
   });
 
+  it("nudges EARLY when model errors before iter 5", async () => {
+    // The model writes broken code that throws, so executeHandler sets
+    // lastError. After iter 3 with errors, the early trigger should fire.
+    let nudged = false;
+    let nudgeIter = -1;
+    let iterCount = 0;
+
+    const llm: LLMClient = {
+      async chat(messages: ChatMessage[]): Promise<LLMResponse> {
+        iterCount++;
+        if (
+          messages.some((m) =>
+            m.content.includes("Abandon your current approach"),
+          )
+        ) {
+          nudged = true;
+          nudgeIter = iterCount;
+          return { content: "FINAL(noted)", finishReason: "stop" };
+        }
+        // Always write broken code → execute always sets lastError
+        return {
+          content: "```repl\nundefinedReference();\n```",
+          finishReason: "stop",
+        };
+      },
+      async listModels() {
+        return ["mock"];
+      },
+    };
+
+    await runRLMLoop({
+      prompt: "test",
+      llmClient: llm,
+      maxIterations: 15,
+    });
+
+    expect(nudged).toBe(true);
+    // Should fire by iter 5 at latest (early condition triggers at 3+)
+    expect(nudgeIter).toBeLessThanOrEqual(5);
+  });
+
   it("does NOT nudge when root is solving efficiently", async () => {
     // Short responses, few iterations → no nudge even at iter 5+
     let nudged = false;
@@ -317,7 +358,7 @@ describe("runRLMLoop", () => {
     const llm: LLMClient = {
       async chat(messages: ChatMessage[]): Promise<LLMResponse> {
         iterCount++;
-        if (messages.some((m) => m.content.includes("You have iterated"))) {
+        if (messages.some((m) => m.content.includes("Abandon your current approach"))) {
           nudged = true;
         }
         if (iterCount < 8) {
@@ -353,7 +394,7 @@ describe("runRLMLoop", () => {
         iterCount++;
         if (
           messages.some((m) =>
-            m.content.includes("You have iterated 5 times at the root"),
+            m.content.includes("Abandon your current approach"),
           )
         ) {
           nudged = true;

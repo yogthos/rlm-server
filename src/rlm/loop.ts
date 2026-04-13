@@ -344,43 +344,55 @@ async function checkFinalHandler(ctx: RLMContext): Promise<RLMContext> {
     };
   }
 
-  // Decomposition nudge: only fires on real stagnation, not just iter
-  // count. Conditions:
-  //   - at root (sub-RLMs don't nudge)
-  //   - haven't already nudged
-  //   - no sub-RLMs dispatched yet
-  //   - 5+ iterations done
-  //   - root context has genuinely grown past a threshold (> 20KB)
-  //     — this is what distinguishes "model solving efficiently in 3
-  //     iterations" from "model struggling and accumulating work"
+  // Decomposition nudge with TWO triggers:
+  //   1. EARLY (struggling): iter ≥ 3 AND (recent error OR repeated errors)
+  //      — catches "model is broken" before it cascades into garbage
+  //   2. LATE (bloated): iter ≥ 5 AND history > 20KB
+  //      — catches "model is making progress but accumulating too much"
+  //
+  // Both gated by: root level, not already nudged, no sub-RLMs yet.
   const rootChars = ctx.history.reduce((s, m) => s + m.content.length, 0);
+  const strugglingEarly =
+    nextIteration >= 3 &&
+    (ctx.lastError !== null || ctx.repeatedErrorCount > 0);
+  const bloatedLate = nextIteration >= 5 && rootChars > 20_000;
+
   if (
     ctx.subRLMDepth === 0 &&
     !ctx.decompositionNudged &&
     ctx.spawnStats.dispatched === 0 &&
-    nextIteration >= 5 &&
-    rootChars > 20_000
+    (strugglingEarly || bloatedLate)
   ) {
-    debug(
-      "tree",
-      `ROOT has iterated ${nextIteration} times without delegating and history is ${rootChars}ch — injecting decomposition directive`,
-    );
+    const reason = strugglingEarly
+      ? `errors at iter ${nextIteration} (lastError=${!!ctx.lastError}, repeated=${ctx.repeatedErrorCount})`
+      : `bloated at iter ${nextIteration} (${rootChars}ch)`;
+    debug("tree", `ROOT nudge fired — ${reason}`);
     const history = [
       ...ctx.history,
       {
         role: "user" as const,
         content: [
-          "STOP. You have iterated 5 times at the root without delegating any work.",
-          "The RLM pattern requires DECOMPOSITION. Do the following on your next turn:",
+          "STOP. Abandon your current approach — it is not converging.",
           "",
-          "1. Identify the remaining sub-questions needed to answer the task.",
-          "2. Dispatch them all in ONE call to `batch_llm_query(subTasks)`.",
-          "3. When the results return, aggregate them and provide FINAL(answer).",
+          "You MUST decompose this task. Your next response must follow",
+          "this exact pattern, nothing else:",
           "",
-          "Do NOT write more analysis code directly at the root. Each sub-query",
-          "should be atomic (e.g. \"Compute graph impact for function X in files Y\").",
-          "Write only the minimal orchestration code to build the sub-task list",
-          "and combine the results.",
+          "Step 1 — write a SKELETON plan as JS comments. Each step is",
+          "3-5 words. NO prose. NO explanation.",
+          "Example skeleton:",
+          "  // 1. list all function names",
+          "  // 2. compute impact per function",
+          "  // 3. rank top 5",
+          "",
+          "Step 2 — turn each skeleton item into a self-contained sub-task",
+          "prompt and dispatch them ALL at once via batch_llm_query.",
+          "Each sub-task must be answerable independently with no shared state.",
+          "",
+          "Step 3 — when batch_llm_query returns, parse the results and",
+          "provide FINAL(answer).",
+          "",
+          "Write a SINGLE code block that does steps 1-2 in one go. Do NOT",
+          "write any more direct-analysis code at the root level.",
         ].join("\n"),
       },
     ];
