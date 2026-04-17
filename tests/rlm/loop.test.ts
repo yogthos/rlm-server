@@ -1,5 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { runRLMLoop } from "../../src/rlm/loop.js";
+import { Role } from "../../src/rlm/roles.js";
+import type { TaskEnvelope } from "../../src/rlm/envelopes.js";
 import type { LLMClient, ChatMessage, LLMResponse } from "../../src/rlm/types.js";
 
 /** Create a mock LLM client that returns preconfigured responses in sequence. */
@@ -628,6 +630,106 @@ describe("runRLMLoop", () => {
 
     // Sub-RLM was dispatched → no nudge
     expect(nudged).toBe(false);
+  });
+
+  it("passes roleBinding to the system prompt when provided", async () => {
+    let capturedSystem = "";
+    const llm: LLMClient = {
+      async chat(messages: ChatMessage[]): Promise<LLMResponse> {
+        if (!capturedSystem) {
+          const sys = messages.find((m) => m.role === "system");
+          if (sys) capturedSystem = sys.content;
+        }
+        return { content: "FINAL(done)", finishReason: "stop" };
+      },
+      async listModels() {
+        return ["mock"];
+      },
+    };
+
+    const envelope: TaskEnvelope = {
+      goal: "ship the guestbook",
+      parentContext: "full-stack TS app",
+      tests: { framework: "vitest", files: {} },
+      targetModule: "src/app.ts",
+      targetExports: ["createApp"],
+      depth: 0,
+      maxDepth: 3,
+      budgetHint: "hours",
+    };
+
+    await runRLMLoop({
+      prompt: "build guestbook",
+      llmClient: llm,
+      maxIterations: 3,
+      roleBinding: { role: Role.Architect, envelope },
+    });
+
+    expect(capturedSystem).toContain("## ROLE: ARCHITECT");
+    expect(capturedSystem).toContain("ship the guestbook");
+  });
+
+  it("suppresses plan-first directive when roleBinding is set (Architect plans on its own)", async () => {
+    let capturedUser = "";
+    const llm: LLMClient = {
+      async chat(messages: ChatMessage[]): Promise<LLMResponse> {
+        if (!capturedUser) {
+          const u = messages.find((m) => m.role === "user");
+          if (u) capturedUser = u.content;
+        }
+        return { content: "FINAL(done)", finishReason: "stop" };
+      },
+      async listModels() {
+        return ["mock"];
+      },
+    };
+
+    const envelope: TaskEnvelope = {
+      // Prompt that WOULD trigger shouldPlanFirst (has "for each", "callers")
+      goal: "analyze callers for each function in the module",
+      parentContext: "",
+      tests: { framework: "vitest", files: {} },
+      targetModule: "src/a.ts",
+      targetExports: ["main"],
+      depth: 0,
+      maxDepth: 3,
+      budgetHint: "hours",
+    };
+
+    await runRLMLoop({
+      prompt: "analyze callers for each function across the codebase",
+      llmClient: llm,
+      maxIterations: 3,
+      roleBinding: { role: Role.Architect, envelope },
+    });
+
+    // The user message should NOT contain the ReWOO plan-first template
+    // when a role is already guiding the model.
+    expect(capturedUser).not.toContain("PLAN PHASE");
+  });
+
+  it("omits role header when roleBinding is absent (backward compat)", async () => {
+    let capturedSystem = "";
+    const llm: LLMClient = {
+      async chat(messages: ChatMessage[]): Promise<LLMResponse> {
+        if (!capturedSystem) {
+          const sys = messages.find((m) => m.role === "system");
+          if (sys) capturedSystem = sys.content;
+        }
+        return { content: "FINAL(done)", finishReason: "stop" };
+      },
+      async listModels() {
+        return ["mock"];
+      },
+    };
+
+    await runRLMLoop({
+      prompt: "plain task",
+      llmClient: llm,
+      maxIterations: 3,
+    });
+
+    expect(capturedSystem).not.toContain("## ROLE:");
   });
 
   it("persists variables across iterations", async () => {

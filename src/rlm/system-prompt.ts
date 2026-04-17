@@ -7,6 +7,9 @@
  * - Z3 solver and Tau Prolog tool descriptions
  */
 
+import type { TaskEnvelope } from "./envelopes.js";
+import { buildRolePrompt, type Role } from "./roles.js";
+
 export interface PromptConfig {
   contextLength: number;
   contextLineCount: number;
@@ -15,7 +18,12 @@ export interface PromptConfig {
   subLLMCapacity?: number;
 }
 
-export function buildSystemPrompt(config: PromptConfig): string {
+export interface RoleBinding {
+  role: Role;
+  envelope: TaskEnvelope;
+}
+
+export function buildSystemPrompt(config: PromptConfig, roleBinding?: RoleBinding): string {
   const capacity = config.subLLMCapacity ?? 100_000;
   const isCode = config.contextType === "source code";
 
@@ -46,7 +54,11 @@ Available analyses: \`summary\`, \`callers\`, \`callees\`, \`impact\`, \`reachab
 `
     : "";
 
-  return `You are tasked with answering a query with associated context. You can access, transform, and analyze this context interactively in a JavaScript REPL environment that can recursively query sub-LLMs, run Z3 constraint solving, and execute Prolog logic programs. You are strongly encouraged to use these tools as much as possible. You will be queried iteratively until you provide a final answer.
+  const roleHeader = roleBinding
+    ? buildRolePrompt(roleBinding.role, roleBinding.envelope) + "\n\n"
+    : "";
+
+  return `${roleHeader}You are tasked with answering a query with associated context. You can access, transform, and analyze this context interactively in a JavaScript REPL environment that can recursively query sub-LLMs, run Z3 constraint solving, and execute Prolog logic programs. You are strongly encouraged to use these tools as much as possible. You will be queried iteratively until you provide a final answer.
 
 Your context is a ${config.contextType} with ${config.contextLength} total characters (${config.contextLineCount} lines).
 Preview: "${config.contextPreview}${config.contextLength > 200 ? "..." : ""}"${codeGuidance}

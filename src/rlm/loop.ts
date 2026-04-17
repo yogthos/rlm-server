@@ -26,6 +26,7 @@ import { createHandleStore } from "./handles.js";
 import { extractCode } from "./code-extractor.js";
 import { promptMetadata, stdoutMetadata, guessContentType } from "./metadata.js";
 import { buildSystemPrompt } from "./system-prompt.js";
+import type { RoleBinding } from "./system-prompt.js";
 import { z3Solve, Z3_IMPL } from "./z3-bridge.js";
 import { prologQuery, PROLOG_IMPL } from "./prolog-bridge.js";
 import { createGraphBridge, GRAPH_IMPL } from "./graph-bridge.js";
@@ -107,6 +108,12 @@ async function initHandler(ctx: RLMContext): Promise<RLMContext> {
     // when the parent (or the request itself) is aborted, all in-flight
     // sub-RLMs see it and bail out — preventing orphan work after the
     // root response has been delivered.
+    //
+    // Note: `roleBinding` is intentionally NOT propagated. Envelope-aware
+    // sub-dispatch lands in Phase B via a separate `dispatch_subtask` builtin
+    // that builds a child envelope with depth+1 and the next role. Plain
+    // `llm_query` stays role-less — it's for one-shot sub-queries, not
+    // hierarchical decomposition.
     const subResult = await runRLMLoop({
       prompt,
       llmClient: ctx.llmClient,
@@ -146,12 +153,15 @@ async function initHandler(ctx: RLMContext): Promise<RLMContext> {
   });
 
   const lines = ctx.prompt.split("\n");
-  const systemPrompt = buildSystemPrompt({
-    contextLength: ctx.prompt.length,
-    contextLineCount: lines.length,
-    contextPreview: ctx.prompt.slice(0, 200),
-    contextType: guessContentType(ctx.prompt),
-  });
+  const systemPrompt = buildSystemPrompt(
+    {
+      contextLength: ctx.prompt.length,
+      contextLineCount: lines.length,
+      contextPreview: ctx.prompt.slice(0, 200),
+      contextType: guessContentType(ctx.prompt),
+    },
+    ctx.roleBinding,
+  );
 
   const meta = promptMetadata(ctx.prompt);
 
@@ -160,8 +170,12 @@ async function initHandler(ctx: RLMContext): Promise<RLMContext> {
   // initial user message. This is the Plan-Then-Execute pattern from
   // ReWOO — front-load the decomposition decision so the model never
   // gets a chance to silently iterate at the root.
+  //
+  // Skip when a roleBinding is present: the hierarchical Architect/Dispatcher
+  // prompts already instruct the model to plan + decompose, and stacking the
+  // ReWOO template on top produces conflicting instructions.
   const requiresPlan =
-    ctx.subRLMDepth === 0 && shouldPlanFirst(ctx.prompt);
+    ctx.subRLMDepth === 0 && !ctx.roleBinding && shouldPlanFirst(ctx.prompt);
   let userContent = meta;
   if (requiresPlan) {
     debug("tree", "task requires planning — injecting plan-first directive");
@@ -678,6 +692,8 @@ export interface RunRLMOptions {
   onIteration?: (iteration: number, state: string) => void;
   /** Aborts the entire loop — current generation AND subsequent iterations. */
   signal?: AbortSignal;
+  /** Hierarchical agent mode — role header gets composed into the system prompt. */
+  roleBinding?: RoleBinding;
 }
 
 /**
@@ -695,6 +711,7 @@ export async function runRLMLoop(options: RunRLMOptions): Promise<RLMResult> {
     maxSubRLMDepth = 3,
     subRLMDepth = 0,
     signal: externalSignal,
+    roleBinding,
   } = options;
 
   // Internal abort controller that we ALWAYS abort when this loop ends.
@@ -724,6 +741,7 @@ export async function runRLMLoop(options: RunRLMOptions): Promise<RLMResult> {
     maxSubRLMDepth,
     subRLMDepth,
     signal,
+    roleBinding,
     sandbox: null,
     handleStore: createHandleStore(),
     history: [],

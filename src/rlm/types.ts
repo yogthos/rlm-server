@@ -143,6 +143,8 @@ export interface RLMContext {
   readonly maxSubRLMDepth: number;
   readonly subRLMDepth: number;
   readonly signal?: AbortSignal;
+  /** Optional hierarchical-agent role binding (role + task envelope). */
+  readonly roleBinding?: import("./system-prompt.js").RoleBinding;
 
   // Mutable state
   sandbox: Sandbox | null;

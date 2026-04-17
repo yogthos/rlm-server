@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { prologQuery, PROLOG_IMPL } from "../../src/rlm/prolog-bridge.js";
+import { prologQuery, prologBatchQuery, PROLOG_IMPL } from "../../src/rlm/prolog-bridge.js";
 
 describe("prologQuery", () => {
   it("solves a simple parent query", async () => {
@@ -63,6 +63,40 @@ describe("prologQuery", () => {
     const result = await prologQuery(program, "num(X).", { maxAnswers: 3 });
     expect(result.status).toBe("success");
     expect(result.answers!.length).toBe(3);
+  });
+});
+
+describe("prologBatchQuery", () => {
+  it("runs multiple goals against a single consulted program", async () => {
+    const program = `
+      fruit(apple). fruit(banana). fruit(cherry).
+      red(apple). red(cherry).
+      yellow(banana).
+    `;
+    const results = await prologBatchQuery(program, [
+      "fruit(X).",
+      "red(X).",
+      "yellow(X).",
+    ]);
+    expect(results).toHaveLength(3);
+    expect(results[0].status).toBe("success");
+    expect(results[0].answers!.length).toBe(3);
+    expect(results[1].answers!.map((a) => a.bindings.X)).toEqual(
+      expect.arrayContaining(["apple", "cherry"]),
+    );
+    expect(results[2].answers!.length).toBe(1);
+  });
+
+  it("returns one result per goal even on empty answer sets", async () => {
+    const results = await prologBatchQuery("color(red).", [
+      "color(X).",
+      "shape(X).",
+    ]);
+    expect(results).toHaveLength(2);
+    expect(results[0].answers!.length).toBe(1);
+    // Unknown predicate → still success status with zero answers (tau-prolog
+    // warning mode) OR error. Either way, the caller gets a result slot.
+    expect(results[1]).toBeDefined();
   });
 });
 

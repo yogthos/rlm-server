@@ -81,6 +81,49 @@ const DECOMPOSE_INDICATORS = [
   "across the", "summarize these", "compare these",
 ];
 
+/** Verbs that imply writing or modifying code. */
+const CODING_VERBS = [
+  "build ", "implement ", "write ", "create ", "add ", "refactor ",
+  "port ", "migrate ", "rewrite ", "scaffold ", "generate ", "fix ",
+];
+
+/**
+ * Heuristic: does this prompt describe a coding task the hierarchical
+ * agent system should consider decomposing?
+ */
+export function detectCodingTask(prompt: string): boolean {
+  const lower = " " + prompt.toLowerCase();
+  for (const v of CODING_VERBS) {
+    if (lower.includes(" " + v)) return true;
+  }
+  // Explicit path reference like "src/foo.ts" → coding task
+  if (/\b(src|tests?|lib)\/[\w.-]+\.(ts|tsx|js|jsx|py|go|rs|clj|cljs)\b/.test(prompt)) {
+    return true;
+  }
+  // Keyword hints
+  if (/\b(unit tests?|integration tests?|module|function|class|api endpoint)\b/i.test(prompt)) {
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Decide whether to route a request through the hierarchical-agent pipeline.
+ *
+ * Phase A default: OFF. Callers opt in with `override=true`. Once benchmarks
+ * justify it, the default can flip and we'll use the heuristic as the gate.
+ */
+export function shouldUseHierarchical(prompt: string, override?: boolean): boolean {
+  // Phase A: `prompt` is part of the signature so we can swap in a real
+  // heuristic (e.g. detectCodingTask(prompt)) once Phase B benchmarks show
+  // the hierarchical path wins. Until then, default is off — callers must
+  // opt in explicitly via `override=true`.
+  void prompt;
+  if (override === true) return true;
+  if (override === false) return false;
+  return false;
+}
+
 /**
  * Decide whether a task should be planned up-front (Plan-Then-Execute).
  * Used by the RLM loop to inject a planning directive in the initial

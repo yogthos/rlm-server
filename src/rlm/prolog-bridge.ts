@@ -308,6 +308,67 @@ export async function prologQuery(
 }
 
 /**
+ * Run multiple Prolog goals against the same consulted program.
+ * Consults once, then queries each goal in sequence — avoids the consult
+ * overhead of calling `prologQuery` N times with the same program.
+ *
+ * Returns one PrologResult per goal, in the same order.
+ */
+export async function prologBatchQuery(
+  program: string,
+  goals: string[],
+  options: Omit<PrologOptions, "trace"> = {},
+): Promise<PrologResult[]> {
+  const inferenceBudget = options.maxInferences ?? DEFAULT_MAX_INFERENCES;
+  const maxAns = options.maxAnswers ?? MAX_ANSWERS;
+  const session = pl.create(inferenceBudget);
+
+  try {
+    await consult(session, program);
+  } catch (e: unknown) {
+    const err = formatError(session, e);
+    return goals.map(() => ({ status: "error", error: err }));
+  }
+
+  const results: PrologResult[] = [];
+  for (const goal of goals) {
+    try {
+      await query(session, goal);
+    } catch (e: unknown) {
+      results.push({ status: "error", error: formatError(session, e) });
+      continue;
+    }
+
+    const answers: Array<{ bindings: Record<string, string>; formatted: string }> = [];
+    try {
+      for (let i = 0; i < maxAns; i++) {
+        const ans = await nextAnswer(session);
+        if (ans === null) break;
+        const bindings: Record<string, string> = {};
+        const links = (ans as any).links;
+        if (links) {
+          for (const [name, term] of Object.entries(links)) {
+            bindings[name] =
+              (term as any).toString?.() ?? (term as any).id ?? String(term);
+          }
+        }
+        const formatted = pl.format_answer(ans as any) ?? "";
+        answers.push({ bindings, formatted });
+      }
+      results.push({
+        status: "success",
+        answers,
+        exhausted: answers.length < maxAns,
+      });
+    } catch (e: unknown) {
+      results.push({ status: "error", error: formatError(session, e) });
+    }
+  }
+
+  return results;
+}
+
+/**
  * Injectable string for the sandbox VM.
  * Requires `__prologBridge` async function in the VM context.
  */

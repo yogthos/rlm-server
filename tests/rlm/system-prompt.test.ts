@@ -1,5 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { buildSystemPrompt } from "../../src/rlm/system-prompt.js";
+import { Role } from "../../src/rlm/roles.js";
+import type { TaskEnvelope } from "../../src/rlm/envelopes.js";
 
 describe("buildSystemPrompt", () => {
   const config = {
@@ -88,5 +90,56 @@ describe("buildSystemPrompt", () => {
     });
     expect(textPrompt).not.toContain("CODE ANALYSIS");
     expect(textPrompt).not.toContain("DO NOT WRITE YOUR OWN ANALYZER");
+  });
+
+  describe("role composition", () => {
+    const envelope: TaskEnvelope = {
+      goal: "implement auth",
+      parentContext: "web service",
+      tests: { framework: "vitest", files: {} },
+      targetModule: "src/auth.ts",
+      targetExports: ["login"],
+      depth: 0,
+      maxDepth: 3,
+      budgetHint: "hours",
+    };
+
+    it("omits role header when role not provided (backward compat)", () => {
+      const prompt = buildSystemPrompt(config);
+      expect(prompt).not.toContain("## ROLE:");
+    });
+
+    it("prepends architect header when role=Architect", () => {
+      const prompt = buildSystemPrompt(config, { role: Role.Architect, envelope });
+      expect(prompt).toContain("## ROLE: ARCHITECT");
+      expect(prompt).toContain("implement auth");
+      const roleIdx = prompt.indexOf("## ROLE:");
+      const replIdx = prompt.indexOf("## REPL Environment");
+      expect(roleIdx).toBeGreaterThanOrEqual(0);
+      expect(replIdx).toBeGreaterThan(roleIdx);
+    });
+
+    it("prepends dispatcher header when role=Dispatcher", () => {
+      const prompt = buildSystemPrompt(config, {
+        role: Role.Dispatcher,
+        envelope: { ...envelope, depth: 1 },
+      });
+      expect(prompt).toContain("## ROLE: DISPATCHER");
+    });
+
+    it("prepends implementer header when role=Implementer", () => {
+      const prompt = buildSystemPrompt(config, {
+        role: Role.Implementer,
+        envelope: { ...envelope, depth: 3 },
+      });
+      expect(prompt).toContain("## ROLE: IMPLEMENTER");
+    });
+
+    it("keeps shared tool body intact when role supplied", () => {
+      const prompt = buildSystemPrompt(config, { role: Role.Architect, envelope });
+      expect(prompt).toContain("llm_query");
+      expect(prompt).toContain("FINAL_VAR(");
+      expect(prompt).toContain("graph(");
+    });
   });
 });
