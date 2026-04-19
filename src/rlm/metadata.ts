@@ -74,12 +74,23 @@ function summarizeValue(value: unknown): string {
   return String(value);
 }
 
+/** Natural-language prompts that ask the model to PRODUCE code,
+ *  as opposed to "analyze this code" prompts. Starting-line verb is the
+ *  strongest signal — build/write/implement/etc. at the start of the
+ *  prompt means a creation task, and file-path mentions in the spec
+ *  ("a server.js file") must not flip the content type. */
+const BUILD_TASK_VERBS = /^(?:please\s+)?(?:build|write|create|implement|add|refactor|port|migrate|rewrite|scaffold|generate|make|produce|design|develop|compose|draft)\b/i;
+
 export function guessContentType(content: string): string {
   const trimmed = content.trimStart();
   if (trimmed.startsWith("{") || trimmed.startsWith("[")) return "JSON document";
   if (trimmed.startsWith("<!") || trimmed.startsWith("<html")) return "HTML document";
   if (trimmed.startsWith("<?xml")) return "XML document";
   if (trimmed.startsWith("#") || /^#{1,6}\s/m.test(trimmed)) return "Markdown document";
+  // Creation-style prompts are natural-language specs, not source code to
+  // analyze — route them as text so the system prompt omits the graph()
+  // code-analysis header that tells the model to inspect rather than build.
+  if (BUILD_TASK_VERBS.test(trimmed)) return "text document";
   if (isLikelyCode(trimmed)) return "source code";
   return "text document";
 }

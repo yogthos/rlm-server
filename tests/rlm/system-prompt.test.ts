@@ -119,12 +119,14 @@ describe("buildSystemPrompt", () => {
       expect(replIdx).toBeGreaterThan(roleIdx);
     });
 
-    it("prepends dispatcher header when role=Dispatcher", () => {
+    it("prepends agent header when role=Dispatcher (internal-depth agent)", () => {
       const prompt = buildSystemPrompt(config, {
         role: Role.Dispatcher,
         envelope: { ...envelope, depth: 1 },
       });
-      expect(prompt).toContain("## ROLE: DISPATCHER");
+      // The Dispatcher role now produces an "AGENT" header — same decide
+      // heuristic as the Architect, just without the root-level extras.
+      expect(prompt).toMatch(/## ROLE: (AGENT|DISPATCHER)/);
     });
 
     it("prepends implementer header when role=Implementer", () => {

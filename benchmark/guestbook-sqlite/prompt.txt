@@ -1,0 +1,17 @@
+Build a Node.js guestbook web application with these requirements:
+
+1. A single server.js file using Node.js built-in modules plus the `better-sqlite3` npm package for persistence
+2. Persist entries in a SQLite database file (guestbook.db)
+3. Schema: entries(id INTEGER PK, handle TEXT, message TEXT, created_at INTEGER)
+4. HTTP server on port 3001 with these routes:
+   - GET / — serves an HTML page with:
+     - A form with fields: handle, message, and a submit button
+     - Below the form, display all existing entries (newest first) by querying SQLite
+     - Each entry shows: handle, message, and ISO timestamp
+     - Basic CSS styling (clean, readable)
+   - POST /sign — accepts form submission, inserts row, redirects to /
+   - GET /api/entries — returns all entries as JSON
+5. Handle edge cases: empty handle/message (reject with 400), missing guestbook.db (create and migrate schema at startup)
+6. The HTML should be embedded in the JS file (no separate template files)
+
+Provide the complete server.js file ready to run with `node server.js` (assuming better-sqlite3 is installed).

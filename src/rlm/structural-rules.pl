@@ -49,6 +49,72 @@ unused_export(F) :-
     \+ calls(_, F),
     \+ entry_point(F).
 
+% ── Cross-file adjacency rules (project-graph checks) ──────────────────────
+%
+% These fire across ALL accumulated files in the project graph. They surface
+% code that is declared but has no relationship to the rest of the program —
+% a floating island, a call to a symbol nowhere defined, or a function with
+% no caller and no export.
+
+% A function that nobody calls and nobody exports — dead even without an
+% explicit entry-point list.
+orphan_function(F) :-
+    function(F, _, _),
+    \+ calls(_, F),
+    \+ exports(_, F).
+
+% A call to a symbol that is neither declared as a function/method in any
+% file, nor imported from any module. The callee is a phantom.
+unresolved_call(Caller, Callee) :-
+    calls(Caller, Callee),
+    \+ function(Callee, _, _),
+    \+ defines(_, Callee, _, _),
+    \+ imports(_, Callee, _).
+
+% A file is an "island" if (a) it has at least one declaration, and (b)
+% nothing in the project refers to anything inside it — no other file
+% imports it, no call edge reaches its functions. The caller of this rule
+% decides when to enforce it (first-file exemption).
+file_has_incoming(File) :-
+    exports(File, Name),
+    calls(_, Name).
+file_has_incoming(File) :-
+    imports(_, _, File).
+file_has_outgoing(File) :-
+    defines(File, Caller, _, _),
+    calls(Caller, _).
+file_has_outgoing(File) :-
+    imports(File, _, _).
+
+island_file(File) :-
+    defines(File, _, _, _),
+    \+ file_has_incoming(File),
+    \+ file_has_outgoing(File).
+
+% ── Arity mismatch ─────────────────────────────────────────────────────────
+%
+% Compare declared signature arity against the arity at each call site.
+% A mismatch means the caller and callee disagree on the number of
+% arguments — almost always a bug (the model wrote a dangling arg,
+% forgot one, or changed the signature without updating callers).
+%
+% A note on tolerance: optional parameters and rest parameters complicate
+% this — a 3-arg signature may accept 2 calls legitimately. Our extractor
+% counts formal parameters including optionals, so we treat an exact
+% mismatch as the signal. Callers can reify optional support later by
+% extracting an `optional_count` fact.
+
+% Arity mismatch fires only when:
+%   - the function does NOT have a rest parameter (rest → unbounded arity), and
+%   - the call arity is outside the legal range [required..total].
+% Total declared arity is reported as `Declared` for the error message.
+arity_mismatch(F, Declared, Used) :-
+    signature(F, _, Declared),
+    required_arity(F, Required),
+    call_arity(F, Used),
+    \+ has_rest_param(F),
+    (Used < Required ; Used > Declared).
+
 % ── Blocking vs advisory rollup ────────────────────────────────────────────
 %
 % blocking_violation/2 is what the enforcement pipeline gates on. Advisory
@@ -57,8 +123,12 @@ unused_export(F) :-
 blocking_violation(cycle, F)               :- call_cycle(F).
 blocking_violation(import_cycle, M)        :- import_cycle(M).
 blocking_violation(extreme_complexity, F)  :- cyclomatic(F, C), C > 15.
+blocking_violation(unresolved_call, Callee) :- unresolved_call(_, Callee).
+blocking_violation(arity_mismatch, F)      :- arity_mismatch(F, _, _).
 
 advisory_violation(dead_code, F)           :- dead_code(F).
+advisory_violation(orphan_function, F)     :- orphan_function(F).
+advisory_violation(island_file, F)         :- island_file(F).
 advisory_violation(length, F)              :- length_violation(F, _).
 advisory_violation(nesting, F)             :- nesting_violation(F, _).
 advisory_violation(unused_export, F)       :- unused_export(F).

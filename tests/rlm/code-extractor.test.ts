@@ -77,6 +77,14 @@ FINAL(The answer is 42)`;
     expect(result.finalAnswer).toBeNull();
   });
 
+  it("accepts FINAL_VAR with a $-prefixed handle name", () => {
+    // Model sometimes writes the handle syntax it sees in bindings:
+    // `FINAL_VAR($serverJs)`. Capture the bare name.
+    const response = "FINAL_VAR($serverJs)";
+    const result = extractCode(response);
+    expect(result.finalVar).toBe("serverJs");
+  });
+
   it("does not detect FINAL inside code blocks", () => {
     const response = `\`\`\`repl
 FINAL("inside code")
@@ -85,6 +93,44 @@ FINAL("inside code")
     const result = extractCode(response);
     expect(result.code).toBe('FINAL("inside code")');
     expect(result.finalAnswer).toBeNull();
+  });
+
+  describe("detectMisplacedDirective", () => {
+    it("returns null for ordinary code", async () => {
+      const { detectMisplacedDirective } = await import("../../src/rlm/code-extractor.js");
+      expect(detectMisplacedDirective("const x = 1; console.log(x);")).toBeNull();
+      expect(detectMisplacedDirective(null)).toBeNull();
+      expect(detectMisplacedDirective("")).toBeNull();
+    });
+
+    it("detects FINAL_VAR( inside code body", async () => {
+      const { detectMisplacedDirective } = await import("../../src/rlm/code-extractor.js");
+      const r = detectMisplacedDirective("const x = 1; FINAL_VAR(x)");
+      expect(r).not.toBeNull();
+      expect(r!.kind).toBe("FINAL_VAR");
+    });
+
+    it("detects FINAL( inside code body", async () => {
+      const { detectMisplacedDirective } = await import("../../src/rlm/code-extractor.js");
+      const r = detectMisplacedDirective("const x = 1; FINAL(answer)");
+      expect(r).not.toBeNull();
+      expect(r!.kind).toBe("FINAL");
+    });
+
+    it("detects FINAL_VAR with $-prefix", async () => {
+      const { detectMisplacedDirective } = await import("../../src/rlm/code-extractor.js");
+      expect(detectMisplacedDirective("FINAL_VAR($foo)")!.kind).toBe("FINAL_VAR");
+    });
+
+    it("is tolerant of whitespace and capitalization matches literal", async () => {
+      const { detectMisplacedDirective } = await import("../../src/rlm/code-extractor.js");
+      // Only exact-case FINAL / FINAL_VAR — our directive names are
+      // case-sensitive everywhere else.
+      expect(detectMisplacedDirective("final_var(x)")).toBeNull();
+      expect(detectMisplacedDirective("final(x)")).toBeNull();
+      // With inner whitespace still detected.
+      expect(detectMisplacedDirective("FINAL_VAR( x )")).not.toBeNull();
+    });
   });
 
   it("ignores non-matching code fences", () => {

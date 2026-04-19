@@ -2,3 +2,8 @@ node_modules/
 dist/
 models/
 arXiv-*/
+
+# Runtime artifacts from live runs
+log.txt
+guestbook.json
+integration_test_*.json

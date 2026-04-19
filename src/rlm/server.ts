@@ -15,6 +15,7 @@ import type { ServerConfig, ChatMessage, ChatOptions } from "./types.js";
 import { createLLMClient } from "./llm-client.js";
 import { runRLMLoop } from "./loop.js";
 import { routeRequest } from "./routing.js";
+import { maybeArchitectBinding } from "./architect-auto.js";
 import type { OpenAITool } from "./tool-calls.js";
 import { debug } from "./debug.js";
 
@@ -153,6 +154,7 @@ export function createServer(config: ServerConfig): http.Server {
           stream?: boolean;
           max_iterations?: number;
           rlm?: boolean;
+          hierarchical?: boolean;
           tools?: OpenAITool[];
           tool_choice?: ChatOptions["toolChoice"];
           response_format?: ChatOptions["responseFormat"];
@@ -268,6 +270,14 @@ export function createServer(config: ServerConfig): http.Server {
               }
             } else {
               // RLM: emit iteration progress as content chunks
+              const roleBinding = maybeArchitectBinding(
+                prompt,
+                request.hierarchical,
+                config.maxSubRLMDepth,
+              );
+              if (roleBinding) {
+                debug("server", `auto-enabled Architect role for coding task id=${chatId.slice(-8)}`);
+              }
               const result = await runRLMLoop({
                 prompt,
                 llmClient,
@@ -275,6 +285,7 @@ export function createServer(config: ServerConfig): http.Server {
                 sandboxTimeoutMs: config.sandboxTimeoutMs,
                 maxSubRLMDepth: config.maxSubRLMDepth,
                 signal: abortController.signal,
+                roleBinding,
                 onIteration: (iteration, state) => {
                   emitChunk({
                     content: `[iteration ${iteration}: ${state}]\n`,
@@ -369,6 +380,14 @@ export function createServer(config: ServerConfig): http.Server {
           } else {
             // Open the response and start the keepalive heartbeat
             startKeepalive();
+            const roleBinding = maybeArchitectBinding(
+              prompt,
+              request.hierarchical,
+              config.maxSubRLMDepth,
+            );
+            if (roleBinding) {
+              debug("server", `auto-enabled Architect role for coding task id=${chatId.slice(-8)}`);
+            }
             const result = await runRLMLoop({
               prompt,
               llmClient,
@@ -376,6 +395,7 @@ export function createServer(config: ServerConfig): http.Server {
               sandboxTimeoutMs: config.sandboxTimeoutMs,
               maxSubRLMDepth: config.maxSubRLMDepth,
               signal: abortController.signal,
+              roleBinding,
             });
             answer = result.answer;
           }

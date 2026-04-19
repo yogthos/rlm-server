@@ -10,8 +10,8 @@
  *   - default → "ollama" (assumes localhost:11434)
  *
  * Examples:
- *   # Local Gemma via GGUF
- *   RLM_MODEL_PATH=./models/gemma-q8.gguf npm start
+ *   # Local GGUF model
+ *   RLM_MODEL_PATH=./models/Qwen3.6-35B-A3B-Q8_0.gguf npm start
  *
  *   # DeepSeek API
  *   DEEPSEEK_API_KEY=sk-... npm start

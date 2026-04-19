@@ -31,6 +31,37 @@ const COMMON_TERMINATION = `
 When finished, return a \`ResultEnvelope\` as JSON inside FINAL_VAR(result). Do NOT return prose via FINAL(); the envelope is the contract with the parent.
 `.trim();
 
+/**
+ * The adaptive decide heuristic that every non-leaf agent applies every
+ * turn. Leaves (Implementers) skip this — they always implement.
+ */
+const DECIDE_HEURISTIC = `
+### Decide FIRST: IMPLEMENT or DISPATCH
+
+Before any code, decide which mode you're in for this task.
+
+**IMPLEMENT** yourself if ALL of these are true:
+  - The task fits in ≲100 LOC of a single module
+  - You know exactly what to write (no "let me research how X works")
+  - It's one coherent concern (one file / one function / one type)
+
+**DISPATCH** via \`design_dispatch(module, name)\` if ANY of these are true:
+  - Multi-file scope
+  - Multiple distinct concerns (types + pure-logic + I/O + wiring)
+  - ≥3 distinct spec items
+  - You are unsure how to start
+
+If IMPLEMENT: declare the function on the graph with \`design_function\`,
+attach tests with \`design_test\`, then fill the body directly with
+\`design_implement\` and close via \`design_finalize\`.
+
+If DISPATCH: declare every module/function/test on the DesignGraph first,
+validate with \`design_consistency()\`, then call \`design_dispatch\` for
+each function (in parallel via \`Promise.all\`). Implementers iterate
+\`test_run\` → \`design_implement\` in their own sandbox. Close with
+\`design_finalize({ typecheck: true })\` and return \`FINAL_FILES(report)\`.
+`.trim();
+
 function envelopeSummary(env: TaskEnvelope): string {
   const parts = [
     `Goal: ${env.goal}`,
@@ -50,16 +81,49 @@ function envelopeSummary(env: TaskEnvelope): string {
 }
 
 function architectPrompt(env: TaskEnvelope): string {
+  const goalLiteral = JSON.stringify(env.goal).replace(/\\/g, "\\\\");
   return `## ROLE: ARCHITECT (depth 0)
 
-You own the top level. Your job:
+The harness handles everything mechanically. Your entire first turn is
+one line of code.
 
-1. Author **acceptance tests** that define user-facing success for the whole task.
-2. Produce a **high-level decomposition** — 2–5 subtasks, each with its own target module, exports, and unit tests.
-3. Self-review the tests before locking.
-4. Dispatch children. Assemble their artifacts. Run acceptance tests.
+If the task is greenfield:
 
-You do NOT write implementation code yourself. Your output is tests + decomposition + orchestration.
+\`\`\`repl
+const report = await design_plan(${goalLiteral});
+\`\`\`
+
+If the task modifies existing code, load those files first:
+
+\`\`\`repl
+await design_load("src/<existing>.js");
+const report = await design_plan(${goalLiteral});
+\`\`\`
+
+\`design_plan\` runs a RECURSIVE multi-turn pipeline:
+1. Fresh turn, narrowly scoped: list the top-level functions needed.
+2. For each function: write a rich description + INTEGRATION tests —
+   tests that exercise how this function contributes to the assembly.
+3. Dispatch each function. The dispatched agent decides:
+   - **IMPLEMENT** directly (writes a short body + unit-level assertions), OR
+   - **DECOMPOSE** into children (becomes a mini-Architect for its own
+     subtree; the harness recursively plans + dispatches the children,
+     then comes back to assemble them into this function's body).
+4. Each subtree is a self-contained assembly. Children become green
+   first; parents are written as glue code calling \`ctx.fns.<child>(ctx, …)\`.
+5. Finalize — vitest + tsc — returns a BuildReport.
+
+**Do not declare \`design_module\`, \`design_function\`, \`design_test\`, or
+call \`design_build\`/\`design_dispatch\` by hand.** The pipeline owns those
+— you only get to correct course if it comes back with \`ok: false\`.
+
+After \`design_plan\` returns:
+
+- \`report.ok\` true → \`FINAL_FILES(report)\`.
+- \`report.phase === "plan"\` → call \`design_plan(...)\` again with a clearer task description.
+- \`report.phase === "consistency"\` → the generated design has a broken import/export; fix with \`design_import\` or re-plan and call \`design_build()\`.
+- \`report.phase === "dispatch"\` → inspect \`report.failed[i].testOutput\`; add or rewrite tests via \`design_test\`, then \`design_build()\` (green functions are remembered, not re-dispatched).
+- \`report.phase === "finalize"\` → \`report.finalize.testOutput\` or \`.typecheckOutput\` carry the failure; patch and call \`design_build()\`.
 
 ${envelopeSummary(env)}
 
@@ -69,18 +133,16 @@ ${COMMON_TERMINATION}`;
 function dispatcherPrompt(env: TaskEnvelope): string {
   const nearLeaf = env.depth >= env.maxDepth - 1;
   const leafWarning = nearLeaf
-    ? `\n**You are one level above maxDepth — any children you dispatch will be forced Implementers (leaf) and cannot decompose further.** Split only if each subtask is directly implementable.`
+    ? `\n**You are one level above maxDepth — any children you dispatch will be forced Implementers (leaf) and cannot decompose further.** Dispatch only if each subtask is directly implementable.`
     : "";
 
-  return `## ROLE: DISPATCHER (depth ${env.depth} of ${env.maxDepth})
+  return `## ROLE: AGENT (depth ${env.depth} of ${env.maxDepth})
 
-You received a task with tests already authored by your parent. Your job:
+You received a task with tests already authored by your parent. The tests
+are a **locked contract** — whatever you produce (directly or via children)
+must satisfy them.${leafWarning}
 
-1. Decide **split vs. implement** for this task.
-2. If **split**: decompose into 2–5 subtasks. For each child, author unit tests, pick a targetModule and targetExports, dispatch. Then assemble and run integration tests.
-3. If **implement**: degrade to Implementer behavior for this turn — write code at targetModule that satisfies the incoming tests.
-
-The incoming tests are a **locked contract** — your implementation (or your children's) must satisfy them.${leafWarning}
+${DECIDE_HEURISTIC}
 
 ${envelopeSummary(env)}
 
@@ -90,9 +152,17 @@ ${COMMON_TERMINATION}`;
 function implementerPrompt(env: TaskEnvelope): string {
   return `## ROLE: IMPLEMENTER (leaf, depth ${env.depth})
 
-You received a task with tests. Your single job: **write code at targetModule that passes those tests.** No sub-dispatch. Do not decompose. Do not author new tests.
+You received a task with tests. Your single job: **write a function body that passes those tests.** No sub-dispatch. Do not decompose. Do not author new tests. Do not re-declare signatures — the graph already has them.
 
-If you cannot satisfy the tests, return a ResultEnvelope with status "failed" and a full trace of what you tried. The parent decides what to do.
+### Your tool loop
+
+1. Draft a candidate body as a JS string (statements only, no wrapping \`function\` declaration).
+2. Call \`test_run(module, name, body)\` — it materializes the graph with your body substituted, runs vitest, and returns \`{ok, passed, failed, output}\`.
+3. If \`ok\` is false, read the output, revise the body, and call \`test_run\` again. Repeat until green.
+4. When green, call \`design_implement(module, name, body)\` to persist the body in the shared DesignGraph.
+5. Return \`FINAL_VAR(body)\`.
+
+If you exhaust a reasonable number of attempts (≈5) without going green, return a ResultEnvelope with status "failed" and the last test output. The parent decides what to do next.
 
 ${envelopeSummary(env)}
 

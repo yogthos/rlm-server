@@ -21,6 +21,15 @@ const MAX_PREVIEW_ITEMS = 3;
  *   z3("(declare-const...") → z3_declare_const
  */
 export function commandToSlug(code: string): string {
+  // Prefer the assigned variable name when the code is a declaration.
+  // That matches the model's intuition: after `const serverSource = ...`,
+  // the model will naturally write `FINAL_VAR(serverSource)` and expects
+  // it to resolve. Falls through to the existing patterns otherwise.
+  const assignMatch = code.match(/^\s*(?:const|let|var)\s+(\w+)\s*=/);
+  if (assignMatch) {
+    return assignMatch[1].toLowerCase();
+  }
+
   // Try to match property access: obj.method(...) — check before plain function call
   const propMatch = code.match(/(\w+)\.(\w+)\s*\(/);
   if (propMatch) {
@@ -158,7 +167,12 @@ export function createHandleStore(maxHandles = 200): HandleStore {
       if (name === "RESULTS" && resultsHandle) {
         return handles.get(resultsHandle)?.data;
       }
-      return handles.get(name)?.data;
+      // Slug generation normalizes variable names to lowercase (so `serverJs`
+      // is stored at `$serverjs`). Fall back to the normalized key so the
+      // model's camelCase / uppercase input still resolves.
+      const direct = handles.get(name);
+      if (direct) return direct.data;
+      return handles.get(name.toLowerCase())?.data;
     },
 
     getResults(): Handle | undefined {

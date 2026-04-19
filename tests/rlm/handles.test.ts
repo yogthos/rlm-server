@@ -35,6 +35,22 @@ describe("commandToSlug", () => {
   it("lowercases everything", () => {
     expect(commandToSlug('grep("ERROR_CODE")')).toBe("grep_error_code");
   });
+
+  it("slugs by the assigned variable name for const/let/var declarations", () => {
+    // The model's intuition is "I named it X, so FINAL_VAR(X)". Match that.
+    expect(commandToSlug('const serverSource = "http.createServer()";')).toBe("serversource");
+    expect(commandToSlug("let answer = 42;")).toBe("answer");
+    expect(commandToSlug("var finalCode = someExpr();")).toBe("finalcode");
+  });
+
+  it("assignment slug wins over the right-hand-side function-call slug", () => {
+    // `const result = grep("foo")` should slug as `result`, not `grep_foo`.
+    expect(commandToSlug('const result = grep("foo");')).toBe("result");
+  });
+
+  it("ignores leading whitespace before the keyword", () => {
+    expect(commandToSlug("   const  myVar = 1;")).toBe("myvar");
+  });
 });
 
 describe("createStub", () => {
@@ -145,6 +161,23 @@ describe("createHandleStore", () => {
   it("buildContext returns empty string when no handles", () => {
     const store = createHandleStore();
     expect(store.buildContext()).toBe("");
+  });
+
+  it("resolves a name regardless of case (store normalizes to lowercase)", () => {
+    // Slug generator lowercases — the model writing FINAL_VAR(serverJs)
+    // after a `const serverJs = …` must still resolve to the handle
+    // stored at $serverjs.
+    const store = createHandleStore();
+    // Simulate the handle store's behavior on a camelCase variable: the
+    // actual slug path for `const serverJs` produces `$serverjs`.
+    const h = store.set("the content", "const serverJs = '...';");
+    expect(h.name).toBe(h.name.toLowerCase());
+    // Direct and case-variants must all work.
+    expect(store.resolve(h.name)).toBe("the content");
+    expect(store.resolve(h.name.toUpperCase())).toBe("the content");
+    // Mixed case spelling of the stored name (e.g. "$ServerJs") resolves.
+    const mixed = h.name.replace(/s/g, "S");
+    expect(store.resolve(mixed)).toBe("the content");
   });
 
   it("clear removes everything", () => {

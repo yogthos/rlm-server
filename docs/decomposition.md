@@ -1,6 +1,6 @@
 # Decomposition Findings: Q8 + RLM on Code Analysis
 
-How well does a small local model use the recursive RLM mechanism for non-trivial code analysis tasks? We tested with Gemma 4 26B-A4B (Q8_0) on Apple M1 Max.
+How well does a small local model use the recursive RLM mechanism for non-trivial code analysis tasks? We tested with a 26B-parameter dense Q8_0 GGUF on Apple M1 Max.
 
 ## The Test Task
 

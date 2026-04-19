@@ -29,7 +29,7 @@ function createMockServer(): Promise<{ server: http.Server; port: number }> {
           res.end(
             JSON.stringify({
               models: [
-                { name: "gemma4:26b" },
+                { name: "qwen3.6:35b" },
                 { name: "llama3:8b" },
               ],
             }),
@@ -67,7 +67,7 @@ describe("createLLMClient (Ollama remote)", () => {
     const client = createLLMClient({
       provider: "ollama",
       baseUrl: `http://127.0.0.1:${port}`,
-      model: "gemma4:26b",
+      model: "qwen3.6:35b",
     });
 
     const response = await client.chat([
@@ -85,11 +85,11 @@ describe("createLLMClient (Ollama remote)", () => {
     const client = createLLMClient({
       provider: "ollama",
       baseUrl: `http://127.0.0.1:${port}`,
-      model: "gemma4:26b",
+      model: "qwen3.6:35b",
     });
 
     const models = await client.listModels();
-    expect(models).toContain("gemma4:26b");
+    expect(models).toContain("qwen3.6:35b");
     expect(models).toContain("llama3:8b");
   });
 

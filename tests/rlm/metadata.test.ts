@@ -150,4 +150,29 @@ describe("guessContentType", () => {
       "text document",
     );
   });
+
+  it("classifies build-task prompts as text documents, not source code", () => {
+    // Prompts that ASK for code to be written — a file reference in the
+    // spec ("a single server.js file", "src/app.ts") must not misroute
+    // the system prompt into code-analysis mode.
+    expect(
+      guessContentType(
+        "Build a Node.js guestbook web application. Produce a server.js file using better-sqlite3.",
+      ),
+    ).toBe("text document");
+    expect(
+      guessContentType("Write a Python module at src/utils.py that parses JSON."),
+    ).toBe("text document");
+    expect(
+      guessContentType("Implement a fibonacci(n) function in TypeScript. Return a BigInt."),
+    ).toBe("text document");
+  });
+
+  it("still classifies an actual code block as source code", () => {
+    expect(
+      guessContentType(
+        "function parse(x) { return JSON.parse(x); }\nconst y = parse('{}');",
+      ),
+    ).toBe("source code");
+  });
 });

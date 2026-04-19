@@ -16,10 +16,12 @@
 import {
   getLlama,
   LlamaChatSession,
+  resolveChatWrapper,
   type Llama,
   type LlamaModel,
   type LlamaContext,
   type LlamaContextSequence,
+  type ChatWrapper,
 } from "node-llama-cpp";
 import type {
   LLMConfig,
@@ -47,6 +49,22 @@ let loadedModelPath: string | null = null;
 let activeSession: LlamaChatSession | null = null;
 let activeSystemPrompt: string = "";
 let activeHistory: ChatHistoryItem[] = [];
+let activePreserveThinking: boolean | null = null;
+
+/**
+ * Build a chat wrapper with Qwen's `keepOnlyLastThought` inverted per the
+ * `preserveThinking` flag. When preserveThinking is ON, the model's prior
+ * reasoning stays in the context so it can reference it — improves agent
+ * consistency and KV-cache reuse. Non-Qwen models ignore the setting
+ * (resolveChatWrapper selects whatever wrapper fits the model).
+ */
+function buildChatWrapper(model: LlamaModel, preserveThinking: boolean): ChatWrapper {
+  return resolveChatWrapper(model, {
+    customWrapperSettings: {
+      qwen: { keepOnlyLastThought: !preserveThinking },
+    },
+  });
+}
 
 async function ensureModel(config: LLMConfig): Promise<{
   model: LlamaModel;
@@ -59,7 +77,12 @@ async function ensureModel(config: LLMConfig): Promise<{
     return { model: loadedModel, context: modelContext, sequence: modelSequence };
   }
 
-  if (activeSession) { activeSession = null; activeSystemPrompt = ""; activeHistory = []; }
+  if (activeSession) {
+    activeSession = null;
+    activeSystemPrompt = "";
+    activeHistory = [];
+    activePreserveThinking = null;
+  }
   if (modelSequence) { modelSequence.dispose(); modelSequence = null; }
   if (modelContext) { await modelContext.dispose(); modelContext = null; }
   if (loadedModel) { await loadedModel.dispose(); loadedModel = null; }
@@ -262,11 +285,17 @@ async function runInference(
   onChunk?: (token: string) => void,
   options?: ChatOptions,
 ): Promise<LLMResponse> {
-  const { context, sequence } = await ensureModel(config);
+  const { model, context, sequence } = await ensureModel(config);
   const { systemPrompt, priorHistory, lastUserMessage } =
     convertHistory(messages);
 
-  const reuse = canReuseSession(systemPrompt, priorHistory);
+  const preserveThinking = config.preserveThinking ?? true;
+  // If the preserveThinking flag differs from the active session, the
+  // chat wrapper would format context differently — we must rebuild.
+  const thinkingChanged =
+    activePreserveThinking !== null && activePreserveThinking !== preserveThinking;
+
+  const reuse = !thinkingChanged && canReuseSession(systemPrompt, priorHistory);
 
   if (!reuse) {
     // Fresh session: clear KV cache and rebuild
@@ -277,9 +306,11 @@ async function runInference(
 
     activeSession = new LlamaChatSession({
       contextSequence: sequence,
+      chatWrapper: buildChatWrapper(model, preserveThinking),
       systemPrompt: systemPrompt || undefined,
     });
     activeSystemPrompt = systemPrompt;
+    activePreserveThinking = preserveThinking;
 
     const fullHistory: ChatHistoryItem[] = [
       ...(systemPrompt
@@ -332,7 +363,7 @@ async function runInference(
   const promptOptions: Record<string, unknown> = {
     temperature: config.temperature ?? 0.7,
     topP: config.topP ?? 0.9,
-    maxTokens: config.maxTokens ?? 2048,
+    maxTokens: config.maxTokens ?? 4096,
     onTextChunk: (chunk: string) => {
       tokenCount++;
       onChunk?.(chunk);

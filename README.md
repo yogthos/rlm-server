@@ -10,10 +10,10 @@ Based on the [RLM paper](https://arxiv.org/abs/2512.24601). For tasks that need 
 npm install
 
 # Local inference — model downloads from HuggingFace automatically on first run
-RLM_MODEL_PATH="hf:unsloth/gemma-4-26B-A4B-it-GGUF:Q8_0" npm start
+RLM_MODEL_PATH="hf:unsloth/Qwen3.6-35B-A3B-GGUF:Q8_0" npm start
 
 # Or point to an already-downloaded GGUF file
-RLM_MODEL_PATH=./models/gemma-4-q8.gguf npm start
+RLM_MODEL_PATH=./models/Qwen3.6-35B-A3B-Q8_0.gguf npm start
 ```
 
 Query as OpenAI:
@@ -147,7 +147,7 @@ All via environment variables:
 |---|---|---|
 | `RLM_MODEL_PATH` | — | GGUF path or HuggingFace URI (local inference) |
 | `OLLAMA_BASE_URL` | — | Remote LLM endpoint (fallback if no local model path) |
-| `RLM_MODEL` | `gemma4` | Model name reported to clients |
+| `RLM_MODEL` | `local-model` | Model name reported to clients |
 | `RLM_PORT` | `3000` | Server port |
 | `RLM_HOST` | `0.0.0.0` | Bind host |
 | `RLM_MAX_ITERATIONS` | `30` | Max RLM iterations per request |
@@ -155,9 +155,45 @@ All via environment variables:
 | `RLM_MAX_TOKENS` | `4096` | Default max generation tokens |
 | `RLM_CONTEXT_WINDOW` | `131072` | Context window size (tokens) |
 | `RLM_GPU_LAYERS` | auto | GPU layers to offload (-1=all, 0=CPU) |
-| `RLM_SANDBOX_TIMEOUT` | `30000` | Sandbox execution timeout (ms) |
+| `RLM_SANDBOX_TIMEOUT` | `600000` | Sandbox execution timeout (ms). On local inference `batch_llm_query` serializes through one sequence, so this must cover the whole fan-out. |
 | `RLM_MAX_HANDLES` | `200` | Max handles before LRU eviction |
 | `RLM_MAX_SUB_DEPTH` | `3` | Max sub-RLM recursion depth |
+| `RLM_PRESERVE_THINKING` | `true` | Keep the model's chain-of-thought across turns (Qwen 3.x). See below. |
+
+### `preserve_thinking` (Qwen 3.x)
+
+Qwen 3.x models emit `<think>…</think>` reasoning spans. By default,
+node-llama-cpp's `QwenChatWrapper` strips all but the last one before
+re-serializing the context on each turn — which invalidates the KV
+cache and throws away context the model needs in agent flows.
+
+Setting `RLM_PRESERVE_THINKING=true` (the default here) tells the
+wrapper to keep every prior thought in the context. In agent /
+tool-calling workflows this:
+
+- lets the model reference its own prior reasoning instead of
+  re-deriving it from scratch each turn,
+- improves KV-cache reuse (history is stable, not reformatted), and
+- reduces redundant token generation.
+
+To verify it's active, run the two-turn test in
+`benchmark/preserve-thinking/run.sh`: it asks the model for two
+20-digit numbers, shows only one on turn 1, then asks for the
+second on turn 2. With preserve-thinking ON the model remembers
+and returns the second number; with it OFF the model has no memory
+of having generated two and tells you so.
+
+```bash
+# expected ✅
+./benchmark/preserve-thinking/run.sh
+
+# baseline (compare to see the regression)
+RLM_PRESERVE_THINKING=false ./start.sh
+./benchmark/preserve-thinking/run.sh
+```
+
+Non-Qwen models ignore this flag — the wrapper that `resolveChatWrapper`
+picks for them doesn't expose a `keepOnlyLastThought` option.
 
 ## Programmatic Usage
 
@@ -165,8 +201,8 @@ All via environment variables:
 import { runRLMLoop, createLLMClient } from "rlm-sandbox/rlm";
 
 const client = createLLMClient({
-  modelPath: "hf:unsloth/gemma-4-26B-A4B-it-GGUF:Q8_0",
-  model: "gemma4",
+  modelPath: "hf:unsloth/Qwen3.6-35B-A3B-GGUF:Q8_0",
+  model: "local-model",
 });
 
 const result = await runRLMLoop({

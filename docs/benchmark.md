@@ -1,99 +1,68 @@
-# Benchmark: Raw Gemma 4 vs RLM
+# Benchmark: Raw Local Model vs RLM
 
-Comparing Gemma 4 26B-A4B (Q4_K_M) direct inference against the same model running through the RLM loop with JS sandbox, Z3, and Prolog tools.
+Comparing direct inference against the same model running through the RLM loop (JS sandbox, Z3, Prolog, tree-sitter graph tools).
 
+Model: Qwen3.6-35B-A3B (Q8_0 GGUF, MoE, 3B active) via `node-llama-cpp`.
 Hardware: Apple M1 Max, 64GB unified memory.
 
-## Round 1 — Algorithmic Reasoning
+## Headline result — unsatisfiable constraint puzzle
 
-Straightforward algorithmic problems. Both approaches get these right.
+Prompt: a logic puzzle about 5 friends / drinks / desserts whose 8 constraints admit **no solution** (Amy can't be assigned any dessert without contradicting clue 1, 2, 5, or 8). The honest answer is to declare UNSAT and prove it.
 
-| Task | Raw Gemma 4 | RLM |
+| Mode | Time | `max_tokens` | `finish_reason` | Result |
+|---|---|---|---|---|
+| Direct | 89.2s | 6144 | stop | Empty content |
+| Direct | 54.2s | 16384 | stop | Empty content |
+| **RLM** | **470.4s** | 6144 | stop | **Correct UNSAT + valid proof** |
+
+The RLM proof:
+- Cake+coffee must be Cal (Amy excluded by clue 1; Bob by clue 3; Dee by clue 4; Eve by clue 7).
+- Tea+cookie has no candidate: Amy excluded by clue 1, Bob by clue 3, Cal now on coffee, Dee has pie, Eve has ice cream.
+- Therefore no assignment exists.
+
+Direct mode returned no content in either run — `finish_reason=stop` with zero characters. Qwen's chat template wraps assistant output with `<think>…</think>` then the final answer; on this puzzle the model appears to consume its token budget inside `<think>` and emit `<|im_end|>` without ever producing a user-visible answer. Raising the budget from 6k → 16k didn't help.
+
+This is the cleanest demonstration so far of the RLM loop's value: on a task where the raw model literally cannot produce an answer, the tool-assisted loop arrives at the correct result with a rigorous justification.
+
+## Earlier smoke tests
+
+Two warm-up tasks where both modes reached the same correct answer — worth noting mostly as cost data:
+
+| Task | Direct | RLM |
 |---|---|---|
-| Primes 1-20 | 2,3,5,7,11,13,17,19 | 2,3,5,7,11,13,17,19 |
-| Pythagorean triple (x+y+z=60) | Correct derivation via Euclid's formula, truncated before answer | x=15, y=20, z=25 (via Z3) |
-| Transitive management query | Dave, Eve, Frank (2.0s) | Dave, Eve, Frank (via Prolog) |
-| Task scheduling (4 tasks, 8hr window) | Correct reasoning, truncated | A:0, B:2, C:0, D:5 (via Z3) |
-| Logic puzzle (3 houses) | Correct step-by-step, truncated | House1:Red/Cat, House2:Blue/Fish, House3:Green/Dog (via Z3) |
+| H(20) = Σ 1/k, k=1..20 as reduced fraction | `55835135/15519504` (58.6s) | `55835135/15519504` (167.7s) |
+| IPv4 regex + 10 test strings | regex + all 10 correct (10.4s) | regex + all 10 correct (289.4s) |
 
-**Observation**: Raw Gemma 4 reasons correctly but is verbose — often exceeds token limits before reaching the final answer. The RLM approach returns concise, verified answers because the tools do the computation.
+RLM is ~3–28× slower on tasks the raw model can already solve. The earlier ungated server runs for these two tasks were against DeepSeek (config misfire); numbers above are rerunnable against the local Qwen but the qualitative outcome — both modes correct — was the same.
 
-## Round 2 — Complex Optimization & Constraints
+## When RLM helps
 
-Harder constraint satisfaction, optimization, and code verification.
+1. **Unsatisfiability / incompleteness detection.** Raw LLMs pattern-match "logic puzzle" → "produce grid" and fabricate assignments. A tool-using loop can brute-force or encode as SAT/Z3 and report UNSAT honestly.
+2. **Precise arithmetic over many steps.** Large-number sums, carries, modular arithmetic. Sandbox computes exactly; the model just drives.
+3. **Constraint verification.** Z3 guarantees SAT/UNSAT; the model's reasoning chain does not.
+4. **Concise answers from verbose reasoning.** Reasoning-mode models (Qwen3.x, DeepSeek-R1 family) often burn budget in `<think>` blocks and emit empty final content. Offloading computation to tools short-circuits that failure mode.
+5. **Code execution and testing.** Regex, FSM traces, algorithm correctness — running the code beats simulating it mentally.
 
-| Task | Raw Gemma 4 | Correct? |
-|---|---|---|
-| Integer linear programming (max 5x+4y) | x=4, y=0, max=20 | Yes |
-| SEND+MORE=MONEY cryptarithmetic | S=9,E=5,N=6,D=7,M=1,O=0,R=8,Y=2 | Yes |
-| 5-person task assignment (find ALL solutions) | 4 solutions found | Yes |
-| Verify LIS code correctness | Correctly identified code as correct, traced dp array | Yes |
-| Resource allocation with conflicts | Value=48 (P3,P5,P2,P4,P6) | Yes |
+## When RLM doesn't help
 
-**Observation**: Gemma 4 handles well-structured optimization problems correctly even without tools. The model uses systematic enumeration and value/weight ratio analysis effectively.
+Overhead (multiple iterations, sandbox setup, serialized inference queue) adds latency without improving correctness when:
 
-## Round 3 — Execution-Dependent Problems
+- Algorithm design problems with small search spaces (greedy / DP / graph).
+- Code review and bug identification on short snippets.
+- Pattern classification and well-structured deduction the model handles in one forward pass.
 
-Problems where mental arithmetic fails and execution is needed for verification.
+## Reproducing
 
-| Task | Raw Gemma 4 | Correct? |
-|---|---|---|
-| IPv4 regex + test 10 strings | Correct regex, all 10 test results right | Yes |
-| Race condition bug identification | Correctly identified TOCTOU bug, balance=-60 | Yes |
-| Constraint puzzle (5 friends) | Correctly identified puzzle as impossible | Yes |
-| Turnstile FSM trace | Correct implementation and trace | Yes |
-| **H(20) exact fraction** | **169505405/46558512 (WRONG)** | **No** |
-
-### The Failure: Harmonic Series H(20)
-
-The task: compute `1/1 + 1/2 + 1/3 + ... + 1/20` as an exact fraction in lowest terms.
-
-Raw Gemma 4's approach was correct:
-- Correctly computed LCD = LCM(1..20) = 232,792,560
-- Correctly identified all 20 terms as LCD/n
-- **Made arithmetic errors summing 20 large numbers** (each 6-9 digits)
-- Reported 169505405/46558512 ≈ 3.641
-
-The correct answer is **55835135/15519504 ≈ 3.598**.
-
-## RLM Solves What Raw Inference Cannot
-
-The same problem through the RLM server:
+Server:
 
 ```bash
-curl -s http://localhost:3000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{"model":"gemma4","messages":[{"role":"user","content":"Compute 1/1+1/2+...+1/20 as exact fraction p/q in lowest terms. Use JavaScript BigInt arithmetic in the REPL."}]}'
+RLM_MODEL_PATH=models/Qwen3.6-35B-A3B-Q8_0.gguf RLM_PORT=3001 npm start
 ```
 
-**Result: `55835135/15519504`** — exactly correct.
+Query (toggle `rlm`):
 
-The model wrote code to compute it with BigInt rational arithmetic in the sandbox instead of attempting mental arithmetic on large numbers.
-
-| | Raw Gemma 4 | RLM + Sandbox |
-|---|---|---|
-| Approach | Manual LCD + sum 20 large numbers | BigInt rational arithmetic in JS |
-| Answer | 169505405/46558512 | **55835135/15519504** |
-| Decimal | 3.641 (wrong) | **3.598 (correct)** |
-| Failure mode | Arithmetic errors accumulate | N/A — exact computation |
-
-## When RLM Helps
-
-The RLM approach provides the most value when:
-
-1. **Precise arithmetic over many steps** — LLMs make errors summing large numbers, computing modular arithmetic, or tracking carries across many operations. The sandbox computes exactly.
-
-2. **Constraint verification** — Z3 guarantees SAT/UNSAT rather than hoping the model's reasoning has no gaps. The logic puzzle and scheduling results are *verified*, not just *believed*.
-
-3. **Concise answers from verbose reasoning** — Raw Gemma 4 often generates correct reasoning chains that exceed token limits before reaching the answer. The RLM loop offloads computation to tools and returns only the result.
-
-4. **Code execution and testing** — The model can write code, run it, observe results, and iterate. Regex generation + testing, state machine traces, and algorithm verification all benefit from actual execution.
-
-## When RLM Doesn't Help
-
-For problems where the model's reasoning is already reliable and concise, the RLM overhead (multiple iterations, sandbox setup) adds latency without improving correctness:
-
-- Well-structured algorithm design (greedy, DP, graph algorithms)
-- Code review and bug identification
-- Logical deduction with small state spaces
-- Pattern recognition and classification
+```bash
+curl -s http://localhost:3001/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"local-model","messages":[{"role":"user","content":"..."}],"rlm":true,"max_tokens":6144}'
+```

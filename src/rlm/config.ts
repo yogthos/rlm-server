@@ -45,7 +45,7 @@ function defaultModel(provider: ProviderType): string {
     case "openai":
       return "gpt-4o-mini";
     default:
-      return "gemma4";
+      return "local-model";
   }
 }
 
@@ -75,7 +75,7 @@ export function loadConfig(overrides?: Partial<ServerConfig>): ServerConfig {
       maxTokens:
         num(process.env.RLM_MAX_TOKENS) ??
         overrides?.llm?.maxTokens ??
-        2048,
+        4096,
       temperature:
         num(process.env.RLM_TEMPERATURE) ??
         overrides?.llm?.temperature ??
@@ -92,6 +92,12 @@ export function loadConfig(overrides?: Partial<ServerConfig>): ServerConfig {
         num(process.env.RLM_GPU_LAYERS) ??
         overrides?.llm?.gpuLayers ??
         undefined,
+      // Default ON — for agent workflows the model benefits from seeing
+      // its own prior reasoning and KV-cache reuse improves.
+      preserveThinking:
+        bool(process.env.RLM_PRESERVE_THINKING) ??
+        overrides?.llm?.preserveThinking ??
+        true,
     },
     maxIterations:
       num(process.env.RLM_MAX_ITERATIONS) ??
@@ -100,7 +106,14 @@ export function loadConfig(overrides?: Partial<ServerConfig>): ServerConfig {
     sandboxTimeoutMs:
       num(process.env.RLM_SANDBOX_TIMEOUT) ??
       overrides?.sandboxTimeoutMs ??
-      120_000,
+      // 2 hours. The sandbox hosts `design_plan` / `design_build`, which
+      // drive a multi-turn LLM pipeline — phase 1 + N phase 2 turns + N
+      // dispatch attempts + finalize. On local inference each turn is
+      // 30–180s, so a 12-function build easily runs 45+ minutes. Prior
+      // 10-minute cap killed runs mid phase 2 with work lost. Bridges
+      // carry their own per-operation timeouts (test-runner 60s,
+      // finalize 120s); this is the outer safety net only.
+      7_200_000,
     maxHandles:
       num(process.env.RLM_MAX_HANDLES) ??
       overrides?.maxHandles ??
@@ -116,4 +129,12 @@ function num(value: string | undefined): number | undefined {
   if (value === undefined) return undefined;
   const n = Number(value);
   return Number.isNaN(n) ? undefined : n;
+}
+
+function bool(value: string | undefined): boolean | undefined {
+  if (value === undefined) return undefined;
+  const v = value.toLowerCase().trim();
+  if (v === "1" || v === "true" || v === "yes" || v === "on") return true;
+  if (v === "0" || v === "false" || v === "no" || v === "off") return false;
+  return undefined;
 }

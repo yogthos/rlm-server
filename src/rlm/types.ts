@@ -27,6 +27,14 @@ export interface LLMConfig {
   contextWindow?: number;
   /** GPU layers to offload (-1 = all, 0 = CPU only). Local inference only. */
   gpuLayers?: number;
+  /**
+   * Preserve the model's chain-of-thought across turns (Qwen 3.x models).
+   * When true, past reasoning is kept in the context so the model can
+   * reference it — improves agent/tool-calling consistency and KV-cache
+   * reuse. Maps to `QwenChatWrapper.keepOnlyLastThought = !preserveThinking`
+   * in node-llama-cpp. Default: true.
+   */
+  preserveThinking?: boolean;
 }
 
 /** A single chat message in OpenAI format. */
@@ -170,6 +178,55 @@ export interface RLMContext {
   requiresPlan: boolean;
   /** How many times we've rejected a premature FINAL() (cap at 1). */
   premateFinalRejections: number;
+  /** Parsed spec items from the user prompt (M1 spec-checklist). */
+  specItems: import("./spec-checklist.js").SpecItem[];
+  /** How many times we've rejected a FINAL() for unsatisfied spec items. */
+  specRejections: number;
+  /** How many times we've rejected an Architect FINAL() before any dispatch. */
+  architectDispatchRejections: number;
+  /** How many structural-repair cycles the root has run (capped). */
+  repairAttempts: number;
+  /** Whether we've already nudged the model about FINAL/FINAL_VAR placement. */
+  directiveMisplacementNudged: boolean;
+  /** Per-template fire counters for response-format checks. */
+  formatNudges: Record<string, number>;
+  /**
+   * When FINAL_VAR resolution falls through to sandbox execution (the
+   * variable wasn't a known handle but might be a sandbox global), this
+   * flag tells executeHandler to promote the execute result directly to
+   * `finalAnswer` instead of just storing a handle and looping.
+   */
+  pendingFinalVar: boolean;
+  /**
+   * Set alongside `pendingFinalVar` when the original directive was
+   * FINAL_FILES — the execute result should be rendered as a multi-file
+   * payload (via renderFileSet) instead of bare JSON.
+   */
+  pendingFinalFiles: boolean;
+  /**
+   * How many times we've rejected a FINAL(x) where x was a bare
+   * identifier matching a stored handle (common FINAL-vs-FINAL_VAR
+   * confusion). Capped at 1 rejection to avoid ping-pong.
+   */
+  finalLiteralRejections: number;
+  /** Append-only action ledger (M2) — one entry per FSM transition. */
+  ledger: import("./action-ledger.js").Ledger;
+  /**
+   * Failure-signature memory (M3) — recurring error → fix hint. Mutable
+   * store so the same instance can be shared across the recursive tree;
+   * every sub-RLM's recordings are visible to the root on bubble-up,
+   * and a sub-RLM sees patterns its siblings already registered.
+   */
+  failureMemory: import("./failure-memory.js").FailureMemoryStore;
+  /** Accumulating code produced across the run (G3). */
+  projectGraph: import("./project-graph.js").ProjectGraph;
+  /**
+   * In-memory canonical DesignGraph for the hierarchical workflow.
+   * Architect builds it (modules, signatures, imports, tests); children
+   * attach implementations. Shared across the recursion — a single
+   * instance serves every depth.
+   */
+  designGraph: import("./design-graph.js").DesignGraph;
   trace: TraceEntry[];
 }
 

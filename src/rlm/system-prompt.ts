@@ -167,7 +167,46 @@ const result = await graph(files, "dead-code", { entryPoints: ["main"] })
 const facts = await graph(files, "facts")
 \`\`\`
 **When working with code, always start with \`graph()\` for structural analysis.** It uses tree-sitter parsing and O(V+E) graph algorithms — much more reliable than regex for understanding code structure.
+${roleBinding ? `
 
+### DesignGraph (hierarchical coding tasks)
+
+The DesignGraph is the shared in-memory model of the project you are
+building. Files exist only as a serialization target for test runs —
+all decisions happen against the graph.
+
+\`\`\`js
+// Declare the shape (Architect)
+design_module("src/db.ts");
+design_function("src/db.ts", "connect", { params: [{ name: "path", type: "string" }], returnType: "Database" }, "opens sqlite");
+design_import("src/db.ts", "Database", "better-sqlite3");
+design_test("src/db.ts", "connect", { name: "opens file", code: "expect(connect(':memory:')).toBeDefined();" });
+
+// Validate before dispatching
+const r = design_consistency();   // { ok, violations, advisories }
+
+// Snapshot the current graph
+const snap = design_query();      // { modules, functions }
+
+// Load existing source into the graph (for "modify feature X" tasks).
+// Parses the file and registers each export as a function with its
+// current body + signature. Implementers will see the existing body.
+await design_load("src/server.js");
+
+// Mechanical build: consistency + topo-ordered dispatch + finalize.
+// The harness extracts each Implementer's body, runs tests, saves on
+// green, and retries on red. You never call test_run or
+// design_implement yourself — those are internal to the harness.
+const report = await design_build();
+// → { ok, phase, consistency, dispatched, failed, finalize, files }
+
+// Escape hatches for special cases (rarely needed when using design_build):
+//   design_dispatch(mod, name) — run one function's Implementer in isolation
+//   design_finalize(options)   — re-finalize after manual patches
+//   design_implement(mod, name, body) — save a body you wrote yourself
+//   test_run(mod, name, body)  — run one function's tests against a candidate
+\`\`\`
+` : ""}
 ## Code Format
 
 When you want to execute JavaScript code, wrap it in triple backticks with 'repl':
@@ -258,9 +297,44 @@ Per-iteration budget is ~2000 tokens. Write short, focused code. If you need mor
 
 ## Final Answer
 
-When done, provide your answer using one of these (OUTSIDE code blocks):
-1. FINAL(your answer here) — for direct text answers
-2. FINAL_VAR(variableName) — to return a REPL variable as your output
+When done, provide your answer using one of these, **OUTSIDE any code block**, on its own line:
+
+  FINAL(the literal text of your answer)
+  FINAL_VAR(variableName)
+  FINAL_FILES(variableName)
+
+### FINAL vs FINAL_VAR vs FINAL_FILES — they are NOT interchangeable
+
+\`FINAL(x)\` takes its argument as **literal text** — the exact string \`x\` becomes the response.
+
+\`FINAL_VAR(x)\` looks up **the variable named \`x\`** (first in the handle store, then in the sandbox scope) and returns its VALUE.
+
+**If the answer you want is the value of a variable, you MUST use FINAL_VAR.**
+
+Examples:
+
+  \`\`\`repl
+  const serverSource = \`const http = require('http'); ...\`;
+  \`\`\`
+  FINAL_VAR(serverSource)         ✓ returns the multi-line source code
+  FINAL(serverSource)             ✗ returns the 12-character string "serverSource"
+
+  FINAL(The answer is 42)         ✓ returns the literal text "The answer is 42"
+  FINAL_VAR(The answer is 42)     ✗ not a valid variable name, will fail
+
+\`FINAL_FILES(x)\` is for multi-file project outputs. \`x\` must resolve to a
+\`Record<string, string>\` (path → source) or a \`FinalizeReport\` whose
+\`.files\` field has that shape. The runtime renders it as a labeled
+multi-file payload the caller can split on:
+
+  --- file: src/a.ts ---
+  <content of src/a.ts>
+
+  --- file: tests/a.test.ts ---
+  <content of tests/a.test.ts>
+
+Use \`FINAL_FILES\` after \`design_finalize({ typecheck: true })\` returns
+\`ok: true\` — pass the whole report and the runtime unwraps \`.files\`.
 
 Think step by step. Plan, then execute immediately — do not just describe what you will do. Remember to explicitly answer the original query in your final answer.`;
 }

@@ -47,6 +47,45 @@ export function shouldCompact(
   return total > options.maxChars;
 }
 
+export type SummaryCheck = { ok: true } | { ok: false; reason: string };
+
+/**
+ * Check that a summary is usable before we commit to it.
+ *   - Must be non-empty (after trimming).
+ *   - Must be SHORTER than what it replaces (otherwise compaction is
+ *     net-negative).
+ *   - Must preserve every active handle reference the model cares about
+ *     — dropping `$handle_name` mentions silently loses working state.
+ */
+export function validateSummary(
+  summary: string,
+  middle: ChatMessage[],
+  activeHandles: Set<string>,
+): SummaryCheck {
+  const trimmed = summary.trim();
+  if (trimmed.length === 0) {
+    return { ok: false, reason: "summary was empty or blank" };
+  }
+  const middleChars = middle.reduce((s, m) => s + m.content.length, 0);
+  if (trimmed.length >= middleChars) {
+    return {
+      ok: false,
+      reason: `summary (${trimmed.length}ch) is not shorter than what it replaces (${middleChars}ch)`,
+    };
+  }
+  const missing: string[] = [];
+  for (const h of activeHandles) {
+    if (!trimmed.includes(h)) missing.push(h);
+  }
+  if (missing.length > 0) {
+    return {
+      ok: false,
+      reason: `summary dropped active handle references: ${missing.join(", ")}`,
+    };
+  }
+  return { ok: true };
+}
+
 /** Build the prompt that asks the LLM to summarize old turns. */
 export function buildSummaryPrompt(
   turnsToSummarize: ChatMessage[],
@@ -103,15 +142,47 @@ export async function compactHistory(
 
   const summaryPrompt = buildSummaryPrompt(middle, activeRefs);
 
-  let summaryText: string;
-  try {
-    const resp = await llm.chat(
-      [{ role: "user", content: summaryPrompt }],
-      options.signal ? { signal: options.signal } : undefined,
-    );
-    summaryText = resp.content.trim();
-  } catch {
-    // If summarization fails (timeout, abort, etc.), fall back to drop
+  // Two attempts: initial summary, then one retry with a corrective nudge
+  // if the first response was unusable (empty, too long, dropped handles).
+  // On double-failure we fall back to the drop path.
+  const chatOptions = options.signal ? { signal: options.signal } : undefined;
+  let summaryText: string | null = null;
+  const conversation: ChatMessage[] = [{ role: "user", content: summaryPrompt }];
+
+  for (let attempt = 1; attempt <= 2; attempt++) {
+    let resp;
+    try {
+      resp = await llm.chat(conversation, chatOptions);
+    } catch {
+      // Network/abort failure — fall back immediately.
+      return [...prefix, ...recent];
+    }
+    const candidate = resp.content.trim();
+    const check = validateSummary(candidate, middle, activeRefs);
+    if (check.ok) {
+      summaryText = candidate;
+      break;
+    }
+    if (attempt === 2) break;
+    // Retry: add assistant turn + corrective user nudge.
+    conversation.push({ role: "assistant", content: resp.content });
+    conversation.push({
+      role: "user",
+      content: [
+        `That summary is not usable: ${check.reason}.`,
+        "",
+        "Try again. Produce a summary that is:",
+        "  - non-empty",
+        "  - strictly shorter than the source",
+        `  - preserves every handle reference above (${[...activeRefs].join(", ") || "(none)"})`,
+        "",
+        "Output ONLY the new summary text, nothing else.",
+      ].join("\n"),
+    });
+  }
+
+  if (summaryText === null) {
+    // Both attempts failed validation — drop the middle.
     return [...prefix, ...recent];
   }
 

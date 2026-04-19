@@ -32,16 +32,55 @@ describe("selectRole", () => {
 });
 
 describe("buildRolePrompt", () => {
-  it("Architect prompt mentions decomposition and acceptance tests", () => {
+  it("Architect prompt routes everything through design_plan", () => {
     const p = buildRolePrompt(Role.Architect, { ...baseEnvelope, depth: 0 });
     expect(p.toLowerCase()).toContain("architect");
-    expect(p.toLowerCase()).toMatch(/acceptance|high-level|decompos/);
+    // The one-liner is the contract — design_plan must appear literally
+    // so the model knows the single entry point.
+    expect(p).toContain("design_plan");
   });
 
-  it("Dispatcher prompt explains split-vs-implement", () => {
+  it("Architect prompt tells the model NOT to call graph primitives by hand", () => {
+    const p = buildRolePrompt(Role.Architect, { ...baseEnvelope, depth: 0 });
+    // Without this, the model falls back to manual design_module /
+    // design_function / design_build and skips the test-writing phase.
+    expect(p.toLowerCase()).toMatch(/do not declare|do not call|by hand/);
+  });
+
+  it("Architect prompt documents the design_plan phase outcomes", () => {
+    const p = buildRolePrompt(Role.Architect, { ...baseEnvelope, depth: 0 });
+    expect(p).toContain("FINAL_FILES");
+    expect(p).toContain("phase");
+    expect(p).toMatch(/plan|dispatch|finalize/);
+  });
+
+  it("Dispatcher prompt carries the same decide heuristic", () => {
     const p = buildRolePrompt(Role.Dispatcher, baseEnvelope);
-    expect(p.toLowerCase()).toContain("dispatcher");
-    expect(p.toLowerCase()).toMatch(/split|implement|decompose/);
+    const lower = p.toLowerCase();
+    expect(lower).toMatch(/implement\b.*\bor\b.*dispatch|dispatch\b.*\bor\b.*implement|decide/);
+    expect(lower).toMatch(/multi-file|multiple concerns|distinct spec|unsure/);
+  });
+
+  it("Architect prompt does not hardcode project-specific terminology", () => {
+    // Use a neutral envelope so we're measuring the static scaffolding only.
+    const neutral = {
+      ...baseEnvelope,
+      goal: "neutral task",
+      parentContext: "none",
+      depth: 0,
+    };
+    const p = buildRolePrompt(Role.Architect, neutral);
+    const lower = p.toLowerCase();
+    // Guardrail: no leakage of our guestbook benchmark into the generic prompt.
+    expect(lower).not.toContain("guestbook");
+    expect(lower).not.toContain("sqlite");
+    expect(lower).not.toContain("http server");
+  });
+
+  it("Dispatcher role produces an AGENT-mode prompt with split-vs-implement guidance", () => {
+    const p = buildRolePrompt(Role.Dispatcher, baseEnvelope);
+    expect(p.toLowerCase()).toMatch(/agent|dispatcher/);
+    expect(p.toLowerCase()).toMatch(/split|implement|decompose|dispatch/);
   });
 
   it("Implementer prompt forbids sub-dispatch", () => {
