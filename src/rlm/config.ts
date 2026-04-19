@@ -122,6 +122,10 @@ export function loadConfig(overrides?: Partial<ServerConfig>): ServerConfig {
       num(process.env.RLM_MAX_SUB_DEPTH) ??
       overrides?.maxSubRLMDepth ??
       3,
+    maxReviewCycles:
+      num(process.env.RLM_MAX_REVIEW_CYCLES) ??
+      overrides?.maxReviewCycles ??
+      2,
   };
 }
 

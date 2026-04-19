@@ -271,6 +271,7 @@ function buildBridgeHelpers(ctx: RLMContext) {
       createDesignDispatchBridge(gg, chat, {
         projectDir: pd,
         decompose,
+        maxReviewCycles: ctx.maxReviewCycles,
       }).dispatch(mod, nm);
     const subFinalize = (
       gg: RLMContext["designGraph"],
@@ -299,6 +300,7 @@ function buildBridgeHelpers(ctx: RLMContext) {
     createDesignDispatchBridge(graph, chat, {
       projectDir,
       decompose,
+      maxReviewCycles: ctx.maxReviewCycles,
     }).dispatch(module, name);
   const finalize = (
     graph: RLMContext["designGraph"],
@@ -1617,6 +1619,8 @@ export interface RunRLMOptions {
   sandboxTimeoutMs?: number;
   maxSubRLMDepth?: number;
   subRLMDepth?: number;
+  /** Max Architect-review cycles per dispatched function. 0 disables. */
+  maxReviewCycles?: number;
   onIteration?: (iteration: number, state: string) => void;
   /** Aborts the entire loop — current generation AND subsequent iterations. */
   signal?: AbortSignal;
@@ -1659,6 +1663,7 @@ export async function runRLMLoop(options: RunRLMOptions): Promise<RLMResult> {
     sandboxTimeoutMs = 600_000,
     maxSubRLMDepth = 3,
     subRLMDepth = 0,
+    maxReviewCycles = 2,
     signal: externalSignal,
     roleBinding,
     projectGraph,
@@ -1692,6 +1697,7 @@ export async function runRLMLoop(options: RunRLMOptions): Promise<RLMResult> {
     sandboxTimeoutMs,
     maxSubRLMDepth,
     subRLMDepth,
+    maxReviewCycles,
     signal,
     roleBinding,
     sandbox: null,

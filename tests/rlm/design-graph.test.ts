@@ -230,6 +230,124 @@ describe("DesignGraph — consistency validator (proc-ts)", () => {
   });
 });
 
+describe("DesignGraph — architect-rejected status", () => {
+  it("accepts 'architect-rejected' as a valid setTestStatus value", () => {
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "foo", sig([]));
+    g.setTestStatus("src/a.ts", "foo", "architect-rejected", "output");
+    expect(g.getFunction("src/a.ts", "foo")!.status).toBe("architect-rejected");
+  });
+});
+
+describe("DesignGraph — isAsync auto-derivation", () => {
+  it("addFunction forces isAsync=true when returnType starts with Promise<", () => {
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "foo", {
+      params: [],
+      returnType: "Promise<string>",
+      isAsync: false, // LLM slipped
+    });
+    expect(g.getFunction("src/a.ts", "foo")!.signature.isAsync).toBe(true);
+  });
+
+  it("addFunction preserves isAsync=false for non-Promise returnType", () => {
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "foo", {
+      params: [],
+      returnType: "string",
+      isAsync: false,
+    });
+    expect(g.getFunction("src/a.ts", "foo")!.signature.isAsync).toBe(false);
+  });
+
+  it("addFunction wraps returnType in Promise<...> when isAsync=true but returnType isn't a Promise", () => {
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "foo", {
+      params: [],
+      returnType: "string",
+      isAsync: true,
+    });
+    const fn = g.getFunction("src/a.ts", "foo")!;
+    expect(fn.signature.returnType).toBe("Promise<string>");
+    expect(fn.signature.isAsync).toBe(true);
+  });
+
+  it("addFunction leaves Promise<T> alone when isAsync=true", () => {
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "foo", {
+      params: [],
+      returnType: "Promise<number>",
+      isAsync: true,
+    });
+    expect(g.getFunction("src/a.ts", "foo")!.signature.returnType).toBe(
+      "Promise<number>",
+    );
+  });
+
+  it("addFunctionChild forces isAsync=true when returnType is Promise<T>", () => {
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "parent", { params: [], returnType: "void" });
+    g.addFunctionChild(
+      "parent",
+      "src/a.ts",
+      "child",
+      { params: [], returnType: "Promise<void>", isAsync: false },
+    );
+    expect(g.getFunction("src/a.ts", "child")!.signature.isAsync).toBe(true);
+  });
+});
+
+describe("DesignGraph — spec (architect contract)", () => {
+  it("new functions start with spec: null", () => {
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "foo", sig([]), "");
+    expect(g.getFunction("src/a.ts", "foo")!.spec).toBeNull();
+  });
+
+  it("setSpec attaches an Architect-authored contract", () => {
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "parseBody", sig([]), "");
+    g.setSpec("src/a.ts", "parseBody", {
+      purpose: "parse form-urlencoded body",
+      inputs: [
+        { name: "req", type: "IncomingMessage", description: "raw request" },
+      ],
+      output: {
+        type: "Record<string, string>",
+        description: "key-value map",
+      },
+      sideEffects: [],
+      dependencies: [],
+      edgeCases: ["empty body → {}", "malformed pairs → skip"],
+      examples: [{ input: "a=1&b=2", output: '{"a":"1","b":"2"}' }],
+    });
+    const fn = g.getFunction("src/a.ts", "parseBody")!;
+    expect(fn.spec).not.toBeNull();
+    expect(fn.spec!.purpose).toContain("parse");
+    expect(fn.spec!.edgeCases).toHaveLength(2);
+  });
+
+  it("snapshot deep-copies the spec", () => {
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "foo", sig([]), "");
+    g.setSpec("src/a.ts", "foo", {
+      purpose: "x",
+      inputs: [],
+      output: { type: "void", description: "" },
+      sideEffects: [],
+      dependencies: [],
+      edgeCases: [],
+      examples: [],
+    });
+    const snap = g.snapshot();
+    expect(snap.functions["src/a.ts#foo"].spec).not.toBeNull();
+    expect(snap.functions["src/a.ts#foo"].spec!.purpose).toBe("x");
+    // Mutating the stored spec doesn't leak.
+    g.getFunction("src/a.ts", "foo")!.spec!.purpose = "mutated";
+    expect(snap.functions["src/a.ts#foo"].spec!.purpose).toBe("x");
+  });
+});
+
 describe("DesignGraph — integration-test layer", () => {
   it("addIntegrationTest attaches to a function's integrationTests (not tests)", () => {
     const g = createDesignGraph();
@@ -242,6 +360,29 @@ describe("DesignGraph — integration-test layer", () => {
     expect(fn.tests).toHaveLength(0);
     expect(fn.integrationTests).toHaveLength(1);
     expect(fn.integrationTests[0].name).toBe("i1");
+  });
+
+  it("replaceTests replaces the entire unit-test list in one call", () => {
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "foo", sig([]), "");
+    g.addTest("src/a.ts", "foo", { name: "old", code: "x" });
+    g.replaceTests("src/a.ts", "foo", [
+      { name: "new1", code: "a" },
+      { name: "new2", code: "b" },
+    ]);
+    const fn = g.getFunction("src/a.ts", "foo")!;
+    expect(fn.tests.map((t) => t.name)).toEqual(["new1", "new2"]);
+  });
+
+  it("replaceIntegrationTests replaces the integration-test list", () => {
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "foo", sig([]), "");
+    g.addIntegrationTest("src/a.ts", "foo", { name: "old", code: "x" });
+    g.replaceIntegrationTests("src/a.ts", "foo", [
+      { name: "ni", code: "z" },
+    ]);
+    const fn = g.getFunction("src/a.ts", "foo")!;
+    expect(fn.integrationTests.map((t) => t.name)).toEqual(["ni"]);
   });
 
   it("addProjectTest + listProjectTests", () => {

@@ -1,21 +1,20 @@
 /**
  * Multi-turn planner for a user task.
  *
- * The Architect's original "write a single big repl block that builds
- * the whole graph" interaction was brittle — LLMs handle one
- * well-scoped instruction per turn much better. `designPlan` drives a
- * deterministic pipeline where each turn asks for ONE thing with a
- * fixed JSON shape, the harness accumulates state in the DesignGraph,
- * then defers to `designBuild` for the mechanical dispatch + finalize.
+ * The Architect writes a function list and a per-function SPEC — the
+ * contract the Implementer will satisfy. Tests are NOT written here:
+ * the Implementer derives both unit and integration tests from the
+ * spec so that the agent closest to the code owns its test contract.
  *
  * Turns:
  *   1. "List the functions needed." → [{module, name, signature, description}]
- *   2. Per function: "Write the tests." → [{name, code}]
- *   3. designBuild runs.
+ *   2. Per function: "Fill the spec template." → FunctionSpec
+ *   3. designBuild runs; each dispatched Implementer writes tests + body.
  */
 
 import type {
   DesignGraph,
+  FunctionSpec,
   Signature,
   TestSpec,
 } from "./design-graph.js";
@@ -55,16 +54,42 @@ export function extractJson(response: string): unknown {
   }
 }
 
-export function parseFunctionList(raw: unknown): PlannedFunction[] {
+/**
+ * Parse the LLM's function list.
+ *
+ * `moduleOverride` — when set, the caller owns the module path (e.g.
+ * decompose sub-plans inherit the parent's module). The LLM's `module`
+ * field is ignored; missing is fine. Otherwise the top-level path
+ * requires `module` on every entry.
+ */
+/** Hard cap on the number of children a decompose sub-plan can produce.
+ *  The prompt asks for 2–5; this is the ceiling we enforce mechanically. */
+export const MAX_DECOMPOSE_CHILDREN = 7;
+
+export function parseFunctionList(
+  raw: unknown,
+  moduleOverride?: string,
+): PlannedFunction[] {
   if (!Array.isArray(raw)) {
     throw new Error("function list must be a JSON array");
+  }
+  if (moduleOverride !== undefined && raw.length > MAX_DECOMPOSE_CHILDREN) {
+    throw new Error(
+      `decompose produced ${raw.length} children — cap is ${MAX_DECOMPOSE_CHILDREN}. Return fewer, more focused children.`,
+    );
   }
   return raw.map((item, i) => {
     if (!item || typeof item !== "object") {
       throw new Error(`entry ${i} is not an object`);
     }
     const r = item as Record<string, unknown>;
-    if (typeof r.module !== "string") throw new Error(`entry ${i} missing "module"`);
+    const module =
+      moduleOverride ??
+      (typeof r.module === "string"
+        ? r.module
+        : (() => {
+            throw new Error(`entry ${i} missing "module"`);
+          })());
     if (typeof r.name !== "string") throw new Error(`entry ${i} missing "name"`);
     if (!r.signature || typeof r.signature !== "object") {
       throw new Error(`entry ${i} missing "signature"`);
@@ -75,7 +100,7 @@ export function parseFunctionList(raw: unknown): PlannedFunction[] {
       throw new Error(`entry ${i} signature.returnType must be string`);
     }
     return {
-      module: r.module,
+      module,
       name: r.name,
       signature: sig,
       description: typeof r.description === "string" ? r.description : "",
@@ -94,39 +119,83 @@ export function parseTestList(raw: unknown): TestSpec[] {
   });
 }
 
-export interface FunctionSpec {
-  description: string;
-  tests: TestSpec[];
-}
-
-export function parseFunctionSpec(raw: unknown): FunctionSpec {
+/**
+ * Parse the Architect's structured spec for one function.
+ *
+ * Signature-driven: the LLM authors ONLY descriptions for inputs and
+ * output — `name` and `type` are copied from the function's signature.
+ * This removes an entire class of drift bugs (LLM's phase-2 types
+ * disagreeing with phase-1 signature).
+ *
+ * Expected LLM shape:
+ *   inputs: string[]  // one description per signature.params entry, aligned by index
+ *   output: string    // description of the return value
+ */
+export function parseFunctionSpec(
+  raw: unknown,
+  signature: Signature,
+): FunctionSpec {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
-    throw new Error("function spec must be a JSON object");
+    throw new Error("spec must be a JSON object");
   }
   const r = raw as Record<string, unknown>;
-  if (typeof r.description !== "string" || r.description.trim().length === 0) {
-    throw new Error("spec missing non-empty \"description\"");
-  }
-  return {
-    description: r.description,
-    tests: parseTestList(r.tests),
-  };
-}
-
-/** Parse an integration-test array (same shape as unit tests). */
-export function parseIntegrationTestList(raw: unknown): TestSpec[] {
-  if (!Array.isArray(raw)) {
-    throw new Error("integration test list must be a JSON array");
-  }
-  return raw.map((item, i) => {
-    if (!item || typeof item !== "object") {
-      throw new Error(`test ${i} not an object`);
+  const requireStr = (k: string): string => {
+    if (typeof r[k] !== "string" || (r[k] as string).trim().length === 0) {
+      throw new Error(`spec missing non-empty "${k}"`);
     }
-    const r = item as Record<string, unknown>;
-    if (typeof r.name !== "string") throw new Error(`test ${i} missing "name"`);
-    if (typeof r.code !== "string") throw new Error(`test ${i} missing "code"`);
-    return { name: r.name, code: r.code };
+    return r[k] as string;
+  };
+  const requireStrArray = (k: string): string[] => {
+    if (!Array.isArray(r[k])) throw new Error(`spec "${k}" must be an array`);
+    return (r[k] as unknown[]).map((v, i) => {
+      if (typeof v !== "string") throw new Error(`spec ${k}[${i}] must be string`);
+      return v;
+    });
+  };
+  if (!Array.isArray(r.inputs)) {
+    throw new Error('spec "inputs" must be an array of description strings');
+  }
+  const rawInputs = r.inputs as unknown[];
+  if (rawInputs.length !== signature.params.length) {
+    throw new Error(
+      `spec "inputs" must have ${signature.params.length} entries (one per signature param), got ${rawInputs.length}`,
+    );
+  }
+  const inputs = signature.params.map((p, i) => {
+    const desc = rawInputs[i];
+    return {
+      name: p.name,
+      type: p.type,
+      description: typeof desc === "string" ? desc : "",
+    };
   });
+  if (typeof r.output !== "string" || r.output.trim().length === 0) {
+    throw new Error(
+      'spec missing non-empty string "output" (return-value description)',
+    );
+  }
+  const examples = Array.isArray(r.examples) ? r.examples : [];
+  return {
+    purpose: requireStr("purpose"),
+    inputs,
+    output: {
+      type: signature.returnType,
+      description: r.output,
+    },
+    sideEffects: requireStrArray("sideEffects"),
+    dependencies: requireStrArray("dependencies"),
+    edgeCases: requireStrArray("edgeCases"),
+    examples: examples.map((v, i) => {
+      if (!v || typeof v !== "object" || Array.isArray(v)) {
+        throw new Error(`spec examples[${i}] must be an object`);
+      }
+      const vi = v as Record<string, unknown>;
+      return {
+        input: typeof vi.input === "string" ? vi.input : String(vi.input ?? ""),
+        output: typeof vi.output === "string" ? vi.output : String(vi.output ?? ""),
+      };
+    }),
+  };
 }
 
 function buildPhase1Prompt(
@@ -160,26 +229,30 @@ function buildPhase1Prompt(
       task,
       "",
       `Parent function you are decomposing:`,
+      `  module: ${parent.module}`,
       `  name: ${parent.name}`,
       `  signature: ${parent.signature.isAsync ? "async " : ""}function ${parent.name}(${paramList}): ${parent.signature.returnType}`,
       `  purpose: ${parent.description}`,
       ...existingBlock,
       "",
       `Return ONLY a fenced JSON block listing the NEW children. Each child:`,
-      "  - module: string (file path — reuse the parent's module)",
       "  - name: string (function name, camelCase, globally unique,",
       "    NOT already in the existing-functions list above)",
       "  - signature: { params: [{name, type}], returnType, isAsync? }",
       "  - description: string (one-line purpose within the assembly)",
       "",
-      "**IMPORTANT**: the `params` array must NOT include `ctx: Ctx` —",
-      "the harness injects it automatically as the first parameter.",
-      "Only list BUSINESS params (e.g. `req`, `entries`, `path`).",
+      "**IMPORTANT**:",
+      "- Do NOT emit a `module` field. The harness places every child in",
+      `  the parent's module (${parent.module}) automatically — any module`,
+      "  string you supply is discarded.",
+      "- The `params` array must NOT include `ctx: Ctx` — the harness",
+      "  injects it automatically as the first parameter. Only list",
+      "  BUSINESS params (e.g. `req`, `entries`, `path`).",
       "",
       "The children should compose cleanly: the parent's body will call",
-      "each child via `ctx.fns.<child>(ctx, ...)`. Write 2–5 children",
-      "focused on distinct concerns. Do NOT include the parent itself.",
-      "No prose outside the JSON block.",
+      `each child via \`ctx.fns.<child>(ctx, ...)\`. Write 2–5 children`,
+      `focused on distinct concerns (hard cap: ${MAX_DECOMPOSE_CHILDREN}).`,
+      "Do NOT include the parent itself. No prose outside the JSON block.",
     ].join("\n");
   }
   return [
@@ -221,8 +294,6 @@ function buildPhase2Prompt(
   fn: PlannedFunction,
   siblings: PlannedFunction[],
 ): string {
-  // Render the proc-ts signature — `ctx: Ctx` injected first — so the
-  // LLM writing tests sees the real calling shape.
   const userParams = fn.signature.params
     .map((p) => `${p.name}: ${p.type}`)
     .join(", ");
@@ -233,8 +304,11 @@ function buildPhase2Prompt(
     .map((s) => `  - ${s.name}: ${s.description}`)
     .join("\n");
   return [
-    `For the following function, write (a) a detailed description and`,
-    `(b) INTEGRATION tests that exercise its role in the assembly.`,
+    `Fill in the SPEC for the following function. You are the ARCHITECT.`,
+    `You are NOT writing tests — the Implementer who later builds this`,
+    `function will derive both unit AND integration tests from your spec.`,
+    `Your job is the contract: purpose, inputs, outputs, side effects,`,
+    `dependencies, edge cases, and concrete examples.`,
     "",
     `Parent task (the whole application):`,
     task,
@@ -244,161 +318,41 @@ function buildPhase2Prompt(
     `Initial description: ${fn.description}`,
     "",
     siblingList
-      ? `Other functions in the project (siblings/roots you'll assemble with):\n${siblingList}`
+      ? `Other functions in the project (this function MAY call any of these via ctx.fns; list them under "dependencies" if it does):\n${siblingList}`
       : "No sibling functions.",
     "",
-    "TEST LEVEL — think integration, not unit:",
-    "- These tests describe how this function CONTRIBUTES to the overall",
-    "  application's behavior. Exercise observable outcomes of the assembly.",
-    "- Do NOT test trivial internal details. Someone else (the Implementer,",
-    "  or a sub-Architect decomposing this function further) will handle the",
-    "  unit-level invariants.",
-    "- If this function calls siblings, the tests can stub siblings or let",
-    "  them run — whichever better captures the contract this function owes",
-    "  its caller.",
+    `Return ONLY a fenced JSON block with EXACTLY this shape. Every field`,
+    `is required; arrays can be empty but must be present.`,
     "",
-    "PROC-TS test conventions (IMPORTANT — the harness scaffolds each test file for you):",
-    `- The function is imported and available by bare name as a default export.`,
-    `- A local \`let ctx\` with every sibling wired into \`ctx.fns\` is in scope.`,
-    `- Each \`it(...)\` callback is ALREADY async — you can freely use \`await\``,
-    `  inside the test code without declaring anything.`,
-    `- \`fs\`, \`path\`, and \`http\` are imported as namespaces (\`import * as fs from "node:fs"\`).`,
-    `  Use them as-is (e.g. \`fs.promises.readFile(...)\`). Any other Node module`,
-    `  can be dynamic-imported: \`const mod = await import("node:foo")\`.`,
-    "",
-    "CALLING CONVENTION:",
-    `- Always pass ctx first: \`${fn.name}(ctx, ...args)\`.`,
-    `- Siblings: \`ctx.fns.other(ctx, ...)\`.`,
-    "",
-    "STUBBING SIBLINGS — use sparingly:",
-    "  - If this function will later be DECOMPOSED into children, the",
-    "    tests must NOT stub those children — the whole point of the",
-    "    integration test is to exercise the real assembly. Let the",
-    "    wired `ctx.fns.<child>` run as-is.",
-    "  - Stub only when:",
-    "    (a) the sibling is an I/O primitive (fs/http/db) and the test",
-    "        cares about inputs it receives, or",
-    "    (b) this test is isolating a narrow concern that doesn't",
-    "        need the full assembly.",
-    "  - Stub shape: plain arrow closures matching the signature (ctx first):",
-    "",
-    "    ```ts",
-    "    ctx.fns.writeLog = async (_ctx, msg) => { /* record or ignore */ };",
-    "    ```",
-    "",
-    "  Do NOT assume mock frameworks like Sinon — write plain closures",
-    "  that record into local variables when you need to assert on calls.",
-    "",
-    "DO NOT use imports, mock libraries, or assume a test runner beyond vitest's",
-    "`describe`/`it`/`expect`.",
-    "",
-    "Return ONLY a fenced JSON block with this shape:",
     "```json",
     "{",
-    '  "description": "Paragraph(s) explaining purpose, inputs, outputs, edge cases, side effects, and which sibling fns it calls.",',
-    '  "tests": [',
-    `    {"name": "short test name", "code": "const result = ${fn.signature.isAsync ? "await " : ""}${fn.name}(ctx${fn.signature.params.length > 0 ? ", /* args */" : ""}); expect(result).toBe(/* … */);"}`,
+    '  "purpose": "One paragraph: what this function does and why it exists in the assembly.",',
+    `  "inputs": [${fn.signature.params
+      .map((p) => `"<description of ${p.name}: ${p.type}>"`)
+      .join(", ")}],`,
+    '  "output": "what is returned, shape, meaning",',
+    '  "sideEffects": ["describe each observable side effect — file I/O, HTTP, state mutation, throws on X"],',
+    '  "dependencies": ["<sibling function names this one calls via ctx.fns — empty if pure>"],',
+    '  "edgeCases": ["enumerate boundary / error / invariant cases the Implementer MUST cover with tests"],',
+    '  "examples": [',
+    '    {"input": "human-readable input description", "output": "human-readable expected output"}',
     "  ]",
     "}",
     "```",
     "",
-    "Write 2–5 focused tests. Each `code` is a plain JS/TS statement list;",
-    "`await` is allowed; `ctx` is in scope. No prose outside the JSON block.",
-  ].join("\n");
-}
-
-function buildProjectIntegrationPrompt(
-  task: string,
-  fns: PlannedFunction[],
-): string {
-  const roots = fns
-    .map(
-      (f) =>
-        `  - ${f.name}(ctx${f.signature.params.length > 0 ? ", " + f.signature.params.map((p) => `${p.name}: ${p.type}`).join(", ") : ""}): ${f.signature.returnType} — ${f.description}`,
-    )
-    .join("\n");
-  return [
-    `Write PROJECT-LEVEL INTEGRATION TESTS for the application below.`,
-    "",
-    `Application goal:`,
-    task,
-    "",
-    `The project exports the following functions — all will be wired`,
-    `into \`ctx.fns\` and available for your tests. Do NOT stub any of`,
-    `them; call them as real implementations. Tests run AFTER every`,
-    `function is unit-tested green:`,
-    roots,
-    "",
-    `Return ONLY a fenced JSON block — an array of tests:`,
-    "```json",
-    "[",
-    '  {"name": "user can sign the guestbook", "code": "…await statements…"},',
-    '  {"name": "api returns stored entries", "code": "…"}',
-    "]",
-    "```",
-    "",
-    `Each test is an async function body. You can use:`,
-    `  - Any wired function via \`ctx.fns.<name>(ctx, …)\` — no stubbing.`,
-    `  - \`fs\`, \`path\`, \`http\` namespaces (already imported).`,
-    `  - Dynamic \`await import("node:…")\` for other modules.`,
-    "",
-    `Write 2–5 end-to-end flows that an external observer of the app`,
-    `would care about. Think user journeys, not function details.`,
-    "",
-    `These are PROJECT-LEVEL integration tests — distinct from (and`,
-    `complementary to) the per-function unit tests you wrote in phase 2`,
-    `and any per-branch integration tests. Focus on whole-app outcomes.`,
-    `No prose outside the JSON block.`,
-  ].join("\n");
-}
-
-function buildBranchIntegrationPrompt(
-  parent: PlannedFunction,
-  children: PlannedFunction[],
-): string {
-  const paramList =
-    parent.signature.params.length > 0
-      ? "ctx: Ctx, " +
-        parent.signature.params
-          .map((p) => `${p.name}: ${p.type}`)
-          .join(", ")
-      : "ctx: Ctx";
-  const childList = children
-    .map(
-      (c) =>
-        `  - ${c.name}(ctx${c.signature.params.length > 0 ? ", " + c.signature.params.map((p) => `${p.name}: ${p.type}`).join(", ") : ""}): ${c.signature.returnType} — ${c.description}`,
-    )
-    .join("\n");
-  return [
-    `Write INTEGRATION TESTS for the assembly of the function below.`,
-    "",
-    `Parent function (the assembly): ${parent.name}`,
-    `Signature: ${parent.signature.isAsync ? "async " : ""}function ${parent.name}(${paramList}): ${parent.signature.returnType}`,
-    `Purpose: ${parent.description}`,
-    "",
-    `Children that compose into ${parent.name}'s body (ALL real, no stubbing):`,
-    childList,
-    "",
-    `Tests run AFTER the parent's body is written with real wired`,
-    `children. Exercise the assembly — do not stub children.`,
-    "",
-    `Return ONLY a fenced JSON block:`,
-    "```json",
-    "[",
-    `  {"name": "orchestrates parse+validate+write", "code": "…await ${parent.name}(ctx, …)…"}`,
-    "]",
-    "```",
-    "",
-    `Write 2–5 tests. Each test is an async body. Call ${parent.name}`,
-    `directly and assert on its observable outcome. Do NOT reach into`,
-    `children via \`ctx.fns.<child>\` directly — the goal is to verify`,
-    `the assembly works end-to-end via the parent's interface. Use`,
-    `\`fs\`/\`path\`/\`http\` namespaces if needed.`,
-    "",
-    `These are BRANCH-LEVEL integration tests for this assembly only —`,
-    `distinct from per-function unit tests (written elsewhere) and from`,
-    `project-wide integration tests (written at the top level).`,
-    `No prose outside JSON.`,
+    `Guidelines:`,
+    `- \`inputs\` is an array of DESCRIPTION STRINGS — one per signature`,
+    `  parameter, in order. The harness pulls \`name\` and \`type\` from the`,
+    `  signature; do NOT repeat them. Length must be exactly`,
+    `  ${fn.signature.params.length}.`,
+    `- \`output\` is a single DESCRIPTION STRING. The \`type\` is already`,
+    `  known from the signature; do NOT repeat it.`,
+    `- Be concrete. "handles errors" is useless; "throws TypeError when path is not string"`,
+    `  is testable.`,
+    `- List every sibling this function will call in "dependencies" — the Implementer`,
+    `  uses this to decide whether to write integration tests. Unknown names are dropped.`,
+    `- Write 2–6 edge cases and 1–4 examples.`,
+    `- No prose outside the JSON block.`,
   ].join("\n");
 }
 
@@ -504,10 +458,11 @@ export async function designPlan(
     const existingNames = parentFn
       ? graph.listFunctions().map((f) => f.name)
       : [];
+    const moduleOverride = parentFn?.module;
     const phase1 = await withJsonRetry(
       options.chat,
       buildPhase1Prompt(task, parentSummary, existingNames),
-      parseFunctionList,
+      (raw) => parseFunctionList(raw, moduleOverride),
       maxRetries,
       "phase1-functions",
     );
@@ -550,70 +505,134 @@ export async function designPlan(
             "plan",
           );
         }
-      } catch {
-        // Already present — skip silently (addTest still works below).
+      } catch (e) {
+        // Only silent-skip exact-duplicate (same module+name) — that's
+        // a legitimate resume. Everything else (cross-module name
+        // collision, invalid identifier, reserved name, missing parent)
+        // is a real planning error and must surface.
+        const msg = e instanceof Error ? e.message : String(e);
+        if (/^duplicate function:/.test(msg)) {
+          continue;
+        }
+        debug(
+          "plan",
+          `phase 1 add failed for ${fn.module}#${fn.name}: ${msg}`,
+        );
+        debug(
+          "progress",
+          `plan: phase 1 FAILED adding ${fn.module}#${fn.name} — ${msg}`,
+        );
+        return {
+          ok: false,
+          phase: "plan",
+          consistency: {
+            ok: false,
+            violations: [],
+            advisories: graph.consistency().advisories,
+          },
+          dispatched: [],
+          failed: [],
+          finalize: null,
+          files: {},
+        };
       }
     }
     plannedNames = phase1;
   }
 
-  // ── Phase 2: description + tests per function (per-fn skip on resume) ──
-  let testsTotal = 0;
+  // ── Phase 2: Architect fills the SPEC for each function ────────
+  // The spec becomes the Implementer's contract. Tests are written
+  // later, by the Implementer, during dispatch.
+  let specsAttached = 0;
+  const failedSpecs: string[] = [];
   for (let i = 0; i < plannedNames.length; i++) {
     const fn = plannedNames[i];
     const key = `${fn.module}#${fn.name}`;
     const stored = graph.getFunction(fn.module, fn.name);
-    if (stored && stored.tests.length > 0) {
-      // Resume: tests already attached from a previous run. Skip the
-      // LLM call and count the tests toward the safety gate.
-      debug(
-        "plan",
-        `phase 2 SKIPPED (resume) ${key} — ${stored.tests.length} tests already attached`,
-      );
+    if (stored && stored.spec !== null) {
+      debug("plan", `phase 2 SKIPPED (resume) ${key} — spec already attached`);
       debug(
         "progress",
-        `plan: phase 2 ${i + 1}/${plannedNames.length} skipped ${key} (${stored.tests.length} tests)`,
+        `plan: phase 2 ${i + 1}/${plannedNames.length} skipped ${key} (spec already attached)`,
       );
-      testsTotal += stored.tests.length;
+      specsAttached++;
       continue;
     }
     debug("progress", `plan: phase 2 ${i + 1}/${plannedNames.length} — ${key}`);
+    // Use the graph's normalized signature (isAsync/Promise reconciled
+    // at ingest) rather than the raw phase-1 claim, so both the prompt
+    // display AND the spec parser see the canonical shape.
+    const normalizedFn: PlannedFunction = stored
+      ? {
+          module: stored.module,
+          name: stored.name,
+          signature: stored.signature,
+          description: stored.description,
+        }
+      : fn;
+    // Sibling list: EVERY function in the graph (except the target).
+    // During decompose this includes top-level roots + the parent, not
+    // just co-children — critical so the LLM can list top-level deps.
+    const siblingsForPrompt: PlannedFunction[] = graph
+      .listFunctions()
+      .filter((f) => f.name !== normalizedFn.name)
+      .map((f) => ({
+        module: f.module,
+        name: f.name,
+        signature: f.signature,
+        description: f.description,
+      }));
     const phase2 = await withJsonRetry(
       options.chat,
-      buildPhase2Prompt(task, fn, plannedNames),
-      parseFunctionSpec,
+      buildPhase2Prompt(task, normalizedFn, siblingsForPrompt),
+      (raw) => parseFunctionSpec(raw, normalizedFn.signature),
       maxRetries,
       `phase2-spec[${key}]`,
     );
     if ("error" in phase2) {
+      debug("plan", `phase 2 failed for ${key}: ${phase2.error}`);
+      debug(
+        "progress",
+        `plan: phase 2 ${i + 1}/${plannedNames.length} FAILED ${key} — proceeding without spec`,
+      );
+      failedSpecs.push(key);
+      continue;
+    }
+    // Filter spec.dependencies against the graph — the LLM sometimes
+    // hallucinates sibling names. Unknown entries would pollute the
+    // Implementer prompt ("depends on foo") for a sibling that isn't
+    // wired into ctx.fns, producing a runtime TypeError at test time.
+    const knownNames = new Set(graph.listFunctions().map((f) => f.name));
+    const unknownDeps = phase2.dependencies.filter((d) => !knownNames.has(d));
+    if (unknownDeps.length > 0) {
       debug(
         "plan",
-        `phase 2 failed for ${key}: ${phase2.error}; proceeding without tests/description`,
+        `phase 2 ${key} — dropping unknown deps: ${unknownDeps.join(", ")}`,
       );
-      debug("progress", `plan: phase 2 ${i + 1}/${plannedNames.length} FAILED ${key}`);
-      continue;
+      debug(
+        "progress",
+        `plan: phase 2 ${key} — dropped unknown deps: ${unknownDeps.join(", ")}`,
+      );
+      phase2.dependencies = phase2.dependencies.filter((d) => knownNames.has(d));
     }
     debug(
       "plan",
-      `phase 2 ${key} → description=${phase2.description.length}ch tests=${phase2.tests.length}`,
+      `phase 2 ${key} → purpose=${phase2.purpose.length}ch deps=${phase2.dependencies.length} edges=${phase2.edgeCases.length}`,
     );
     debug(
       "progress",
-      `plan: phase 2 ${i + 1}/${plannedNames.length} ok ${key} — ${phase2.tests.length} tests`,
+      `plan: phase 2 ${i + 1}/${plannedNames.length} ok ${key} — ${phase2.dependencies.length} deps, ${phase2.edgeCases.length} edge cases`,
     );
-    graph.setDescription(fn.module, fn.name, phase2.description);
-    for (const t of phase2.tests) {
-      graph.addTest(fn.module, fn.name, t);
-      testsTotal++;
-    }
+    graph.setSpec(fn.module, fn.name, phase2);
+    specsAttached++;
   }
 
-  // Safety net 1: if phase 2 failed across the board, don't hand a
-  // toothless graph to dispatch (where 0/0 would auto-pass every body).
-  if (testsTotal === 0) {
+  // Safety net: every planned function must have a spec. The
+  // Implementer refuses to build without one.
+  if (specsAttached === 0) {
     debug(
       "progress",
-      `plan: FAILED — no tests produced across ${plannedNames.length} functions`,
+      `plan: FAILED — no specs produced across ${plannedNames.length} functions`,
     );
     return {
       ok: false,
@@ -627,143 +646,16 @@ export async function designPlan(
       failed: [],
       finalize: null,
       files: {},
+      failedSpecs,
     };
   }
 
-  // Safety net 2: mixed state — some fns got tests, some didn't.
-  // A fn without tests AND without a pre-loaded body would get
-  // dispatched with allowUntested + hasTests=false, yielding 0/0 =
-  // auto-pass — producing unverified code. Abort loud instead.
-  const untested: string[] = [];
-  for (const fn of plannedNames) {
-    const stored = graph.getFunction(fn.module, fn.name);
-    if (!stored) continue;
-    if (stored.tests.length === 0 && stored.implementation === null) {
-      untested.push(`${fn.module}#${fn.name}`);
-    }
-  }
-  if (untested.length > 0) {
-    debug(
-      "progress",
-      `plan: FAILED — ${untested.length} functions without tests: ${untested.join(", ")}`,
-    );
-    return {
-      ok: false,
-      phase: "plan",
-      consistency: {
-        ok: false,
-        violations: [],
-        advisories: graph.consistency().advisories,
-      },
-      dispatched: [],
-      failed: [],
-      finalize: null,
-      files: {},
-    };
-  }
-
-  // ── Phase 2b: integration tests ─────────────────────────────────
-  // For a subtree plan: ask for integration tests that exercise the
-  // parent assembly through its real wired children. Attach to parent.
-  // For a top-level plan: ask for PROJECT integration tests exercising
-  // the whole app. Attach to graph.projectTests.
-  // Skip entirely on resume when the target already has integration
-  // tests — re-running would duplicate them.
-  if (parentName) {
-    const existing = parentFn!.integrationTests?.length ?? 0;
-    if (existing > 0) {
-      debug(
-        "plan",
-        `phase 2b SKIPPED (resume) — ${parentName} already has ${existing} integration tests`,
-      );
-      debug(
-        "progress",
-        `plan: phase 2b skipped (resume) for ${parentName} — ${existing} integration tests`,
-      );
-    } else {
-      debug("progress", `plan: phase 2b — branch integration tests for ${parentName}`);
-      const branchSpec = await withJsonRetry(
-        options.chat,
-        buildBranchIntegrationPrompt(
-          {
-            module: parentFn!.module,
-            name: parentFn!.name,
-            signature: parentFn!.signature,
-            description: parentFn!.description,
-          },
-          plannedNames,
-        ),
-        parseIntegrationTestList,
-        maxRetries,
-        `phase2b-integration[${parentName}]`,
-      );
-      if ("error" in branchSpec) {
-        debug(
-          "plan",
-          `phase 2b failed for ${parentName}: ${branchSpec.error}; proceeding without integration tests`,
-        );
-        debug(
-          "progress",
-          `plan: phase 2b FAILED for ${parentName} — continuing without integration tests`,
-        );
-      } else {
-        debug(
-          "plan",
-          `phase 2b ${parentName} → ${branchSpec.length} integration tests`,
-        );
-        debug(
-          "progress",
-          `plan: phase 2b ok for ${parentName} — ${branchSpec.length} integration tests`,
-        );
-        for (const t of branchSpec) {
-          graph.addIntegrationTest(parentFn!.module, parentFn!.name, t);
-        }
-      }
-    }
-  } else {
-    const existing = graph.listProjectTests().length;
-    if (existing > 0) {
-      debug(
-        "plan",
-        `phase 2b SKIPPED (resume) — project already has ${existing} integration tests`,
-      );
-      debug(
-        "progress",
-        `plan: phase 2b skipped (resume) for project — ${existing} integration tests`,
-      );
-    } else {
-      debug("progress", `plan: phase 2b — project integration tests`);
-      const projectSpec = await withJsonRetry(
-        options.chat,
-        buildProjectIntegrationPrompt(task, plannedNames),
-        parseIntegrationTestList,
-        maxRetries,
-        "phase2b-integration[project]",
-      );
-      if ("error" in projectSpec) {
-        debug(
-          "plan",
-          `phase 2b failed for project: ${projectSpec.error}; proceeding without integration tests`,
-        );
-        debug(
-          "progress",
-          `plan: phase 2b FAILED for project — continuing without integration tests`,
-        );
-      } else {
-        debug(
-          "plan",
-          `phase 2b project → ${projectSpec.length} integration tests`,
-        );
-        debug(
-          "progress",
-          `plan: phase 2b ok for project — ${projectSpec.length} integration tests`,
-        );
-        for (const t of projectSpec) {
-          graph.addProjectTest(t);
-        }
-      }
-    }
-  }
+  // ── Phase 2b removed ─────────────────────────────────────────────
+  // Integration-test writing moved out of the Architect. Each
+  // Implementer writes both unit AND integration tests for its own
+  // function (informed by the spec and by the list of siblings its
+  // spec declares as dependencies). Project-level tests are no longer
+  // emitted by the planner.
 
   // ── Phase 3: mechanical build (skipped for sub-tree plans) ──────
   if (parentName) {
@@ -772,11 +664,11 @@ export async function designPlan(
     // success report so the caller knows the subtree is ready.
     debug(
       "plan",
-      `phase 3 skipped — subtree plan under ${parentName} complete (${testsTotal} tests, ${plannedNames.length} children)`,
+      `phase 3 skipped — subtree plan under ${parentName} complete (${specsAttached} specs, ${plannedNames.length} children)`,
     );
     debug(
       "progress",
-      `plan: subtree under ${parentName} planned — ${testsTotal} tests, ${plannedNames.length} children`,
+      `plan: subtree under ${parentName} planned — ${specsAttached} specs, ${plannedNames.length} children`,
     );
     return {
       ok: true,
@@ -786,20 +678,25 @@ export async function designPlan(
       failed: [],
       finalize: null,
       files: {},
+      failedSpecs,
     };
   }
 
   debug(
     "plan",
-    `handing off to designBuild (${testsTotal} tests across ${plannedNames.length} functions)`,
+    `handing off to designBuild (${specsAttached} specs across ${plannedNames.length} functions, ${failedSpecs.length} specless)`,
   );
   debug(
     "progress",
-    `plan: handoff to build — ${testsTotal} tests, ${plannedNames.length} functions`,
+    `plan: handoff to build — ${specsAttached} specs, ${plannedNames.length} functions, ${failedSpecs.length} specless`,
   );
-  return designBuild(graph, {
+  const buildReport = await designBuild(graph, {
     dispatch: options.dispatch,
     finalize: options.finalize,
     allowUntested: true,
   });
+  if (failedSpecs.length > 0) {
+    buildReport.failedSpecs = failedSpecs;
+  }
+  return buildReport;
 }

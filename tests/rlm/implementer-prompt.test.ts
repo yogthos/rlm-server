@@ -103,11 +103,36 @@ describe("buildImplementerPrompt", () => {
     expect(p).toContain("function foo(ctx: Ctx): void");
   });
 
-  it("handles functions with no tests (notes the gap)", async () => {
+  it("asks the Implementer to emit unit-tests when none exist yet", async () => {
     const g = createDesignGraph();
     g.addFunction("src/a.ts", "foo", { params: [], returnType: "void" });
     const p = await buildImplementerPrompt(g, "src/a.ts", "foo");
-    expect(p).toMatch(/no tests/i);
+    expect(p).toContain("```unit-tests");
+  });
+
+  it("tells leaves (no children) that integration tests must be an empty array", async () => {
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "foo", { params: [], returnType: "void" });
+    const p = await buildImplementerPrompt(g, "src/a.ts", "foo");
+    // Leaves don't assemble anything — their integration fence must be `[]`.
+    // Storing leaf integration tests is a lie: renderIntegrationTestFile
+    // drops them for children-less functions.
+    expect(p).toMatch(/integration-tests[\s\S]{0,120}empty/i);
+    expect(p).not.toMatch(/OPTIONAL for leaves/);
+  });
+
+  it("tells branches (with children) that integration tests are REQUIRED", async () => {
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "parent", { params: [], returnType: "void" });
+    g.addFunctionChild(
+      "parent",
+      "src/a.ts",
+      "child",
+      { params: [], returnType: "void" },
+      "child",
+    );
+    const p = await buildImplementerPrompt(g, "src/a.ts", "parent");
+    expect(p).toContain("REQUIRED");
   });
 
   it("renders async functions with the async keyword", async () => {

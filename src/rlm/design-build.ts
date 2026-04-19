@@ -29,6 +29,10 @@ export interface BuildReport {
   /** When `ok: true` this is the same as `finalize.files` — surfaced here
    *  so FINAL_FILES(report) unwraps it without further drilling. */
   files: Record<string, string>;
+  /** Functions the Architect could not spec during planning (phase 2
+   *  retries exhausted). Build still proceeds but these functions are
+   *  implemented without a contract, so flag them here. */
+  failedSpecs?: string[];
 }
 
 export interface BuildOptions {

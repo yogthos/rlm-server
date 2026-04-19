@@ -32,7 +32,10 @@ export type FunctionStatus =
   | "implementing"
   | "implemented"
   | "tests-green"
-  | "tests-red";
+  | "tests-red"
+  /** Tests passed but the Architect rejected the implementation against
+   *  the spec. Distinguishes a spec-mismatch failure from a test failure. */
+  | "architect-rejected";
 
 /**
  * How a function entered the graph — disambiguates "design_plan wrote
@@ -42,13 +45,42 @@ export type FunctionStatus =
  */
 export type FunctionOrigin = "plan" | "load" | "manual";
 
+/**
+ * Architect-authored specification the Implementer fills in. The
+ * Architect owns the *contract* (what the function does, its inputs,
+ * outputs, side effects, invariants). The Implementer owns the
+ * implementation AND the tests that verify the contract.
+ */
+export interface FunctionSpec {
+  /** One-paragraph statement of what this function exists to do. */
+  purpose: string;
+  /** Declared input parameters (excluding ctx, which is injected). */
+  inputs: Array<{ name: string; type: string; description: string }>;
+  /** Return value. */
+  output: { type: string; description: string };
+  /** Observable side effects (file I/O, HTTP, state mutation). */
+  sideEffects: string[];
+  /** Sibling functions this one calls via ctx.fns.<name>. */
+  dependencies: string[];
+  /** Edge cases / invariants / error conditions the Implementer must
+   *  cover with tests. */
+  edgeCases: string[];
+  /** Concrete input → output pairs the Implementer can encode as tests. */
+  examples: Array<{ input: string; output: string }>;
+}
+
 export interface FunctionNode {
   module: string;
   name: string;
   signature: Signature;
   description: string;
+  /** Architect-written spec the Implementer uses as its contract.
+   *  Null before phase 2 runs; present afterward. The Implementer
+   *  writes tests + body derived from this spec. */
+  spec: FunctionSpec | null;
   /** Unit tests — exercise THIS function in isolation, stubbing any
-   *  sibling dependencies. Run during leaf dispatch. */
+   *  sibling dependencies. Authored by the Implementer (not the
+   *  Architect) based on the spec. Run during leaf dispatch. */
   tests: TestSpec[];
   /** Integration tests — exercise the assembly THROUGH this function.
    *  Populated when a function has children (or later, via a re-plan).
@@ -129,9 +161,19 @@ export interface DesignGraph {
   topoSortFunctions(): FunctionNode[];
   addImport(toModule: string, symbol: string, fromModule: string): void;
   addTest(module: string, name: string, test: TestSpec): void;
+  /** Bulk-replace the function's unit tests. Used by the Implementer's
+   *  test-patch path so callers don't mutate `fn.tests` directly. */
+  replaceTests(module: string, name: string, tests: TestSpec[]): void;
   /** Attach an integration test to a function (exercises the assembly
    *  through this function once its children are wired). */
   addIntegrationTest(module: string, name: string, test: TestSpec): void;
+  /** Bulk-replace the function's integration tests. Mirror of
+   *  `replaceTests` for the integration list. */
+  replaceIntegrationTests(
+    module: string,
+    name: string,
+    tests: TestSpec[],
+  ): void;
   /** Attach an integration test to the whole project (no specific
    *  function — exercises the top-level assembly). */
   addProjectTest(test: TestSpec): void;
@@ -140,6 +182,8 @@ export interface DesignGraph {
   /** Replace the function's description (for progressive enrichment
    *  during planning — phase 1 gets a one-liner, phase 2 elaborates). */
   setDescription(module: string, name: string, description: string): void;
+  /** Attach the Architect's spec (contract) to a function. */
+  setSpec(module: string, name: string, spec: FunctionSpec): void;
   setImplementation(module: string, name: string, source: string): void;
   setTestStatus(
     module: string,
@@ -464,6 +508,23 @@ export function createDesignGraph(): DesignGraph {
         params: signature.params.slice(1),
       };
     }
+    // Normalize `isAsync` ↔ `returnType` consistency. The LLM can slip
+    // in two directions:
+    //   - isAsync=false + returnType=Promise<T>  → force isAsync=true
+    //     (otherwise the body can't `await` — syntax error)
+    //   - isAsync=true  + returnType=T (non-Promise) → wrap as Promise<T>
+    //     (otherwise `async function f(): T` is a TS error)
+    // Both renderings produce uncompilable files, so we reconcile at ingest.
+    const rtTrim = signature.returnType.trim();
+    const isPromise = /^Promise</.test(rtTrim);
+    if (!signature.isAsync && isPromise) {
+      signature = { ...signature, isAsync: true };
+    } else if (signature.isAsync && !isPromise && rtTrim.length > 0) {
+      signature = {
+        ...signature,
+        returnType: `Promise<${rtTrim}>`,
+      };
+    }
     if (!/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(name)) {
       throw new Error(
         `invalid function name: ${JSON.stringify(name)} — must be a TypeScript identifier`,
@@ -496,6 +557,7 @@ export function createDesignGraph(): DesignGraph {
       name,
       signature,
       description,
+      spec: null,
       tests: [],
       integrationTests: [],
       implementation: null,
@@ -592,9 +654,21 @@ export function createDesignGraph(): DesignGraph {
       fn.tests.push(test);
     },
 
+    replaceTests(module, name, tests) {
+      const fn = requireFunction(module, name);
+      fn.tests.length = 0;
+      fn.tests.push(...tests);
+    },
+
     addIntegrationTest(module, name, test) {
       const fn = requireFunction(module, name);
       fn.integrationTests.push(test);
+    },
+
+    replaceIntegrationTests(module, name, tests) {
+      const fn = requireFunction(module, name);
+      fn.integrationTests.length = 0;
+      fn.integrationTests.push(...tests);
     },
 
     addProjectTest(test) {
@@ -608,6 +682,11 @@ export function createDesignGraph(): DesignGraph {
     setDescription(module, name, description) {
       const fn = requireFunction(module, name);
       fn.description = description;
+    },
+
+    setSpec(module, name, spec) {
+      const fn = requireFunction(module, name);
+      fn.spec = spec;
     },
 
     setImplementation(module, name, source) {
@@ -711,6 +790,17 @@ export function createDesignGraph(): DesignGraph {
           signature: { ...v.signature, params: v.signature.params.map((p) => ({ ...p })) },
           tests: v.tests.map((t) => ({ ...t })),
           integrationTests: v.integrationTests.map((t) => ({ ...t })),
+          spec: v.spec
+            ? {
+                purpose: v.spec.purpose,
+                inputs: v.spec.inputs.map((i) => ({ ...i })),
+                output: { ...v.spec.output },
+                sideEffects: [...v.spec.sideEffects],
+                dependencies: [...v.spec.dependencies],
+                edgeCases: [...v.spec.edgeCases],
+                examples: v.spec.examples.map((e) => ({ ...e })),
+              }
+            : null,
         };
       }
       return {

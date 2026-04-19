@@ -2,13 +2,19 @@
  * Build the focused brief an Implementer agent sees for a single function.
  * Pure function over the DesignGraph — no I/O, no file reads. Decision
  * making happens against the graph; files exist only for test execution.
+ *
+ * Contract shift (SPEC-driven): the Architect writes a structured SPEC
+ * on fn.spec. The Implementer now owns BOTH the tests and the body.
+ * On the first attempt tests are authored from the spec; on retries
+ * the Implementer can revise them.
  */
 
 import type {
   DesignGraph,
-  FunctionNode,
+  FunctionSpec,
   ParamSpec,
   Signature,
+  TestSpec,
 } from "./design-graph.js";
 import { computeRelevantFunctions } from "./prompt-scope.js";
 
@@ -32,11 +38,40 @@ function renderSignature(name: string, sig: Signature): string {
   return `export default ${async}function ${name}(${paramList}): ${sig.returnType}`;
 }
 
-
-function renderTests(fn: FunctionNode): string {
-  if (fn.tests.length === 0) return "(no tests declared for this function yet)";
+function renderSpec(spec: FunctionSpec): string {
   const lines: string[] = [];
-  for (const t of fn.tests) {
+  lines.push(`Purpose: ${spec.purpose}`);
+  if (spec.inputs.length > 0) {
+    lines.push("Inputs:");
+    for (const i of spec.inputs) {
+      lines.push(`  - ${i.name}: ${i.type} — ${i.description}`);
+    }
+  }
+  lines.push(`Output: ${spec.output.type} — ${spec.output.description}`);
+  if (spec.sideEffects.length > 0) {
+    lines.push("Side effects:");
+    for (const s of spec.sideEffects) lines.push(`  - ${s}`);
+  }
+  if (spec.dependencies.length > 0) {
+    lines.push("Depends on (call via ctx.fns):");
+    for (const d of spec.dependencies) lines.push(`  - ${d}`);
+  }
+  if (spec.edgeCases.length > 0) {
+    lines.push("Edge cases (MUST be covered by tests):");
+    for (const e of spec.edgeCases) lines.push(`  - ${e}`);
+  }
+  if (spec.examples.length > 0) {
+    lines.push("Examples:");
+    for (const ex of spec.examples) {
+      lines.push(`  - input: ${ex.input} → output: ${ex.output}`);
+    }
+  }
+  return lines.join("\n");
+}
+
+function renderTestList(tests: TestSpec[]): string {
+  const lines: string[] = [];
+  for (const t of tests) {
     lines.push(`- ${t.name}`);
     for (const row of t.code.split("\n")) {
       lines.push(`    ${row}`);
@@ -50,6 +85,17 @@ export interface ImplementerFeedback {
   maxAttempts: number;
   previousBody: string;
   testOutput: string;
+  /** When present, the previous attempt's tests PASSED but the
+   *  Architect rejected the body against the spec. Rendered under a
+   *  distinct section so the Implementer doesn't misread it as a
+   *  flaky-test signal. */
+  architectFeedback?: string;
+  /** When present, the previous attempt FAILED static analysis (tree-
+   *  sitter body check) BEFORE tests ran — e.g. top-level imports or
+   *  calls to undeclared siblings. Rendered under its own section so
+   *  the Implementer knows this is a structural proc-ts violation,
+   *  not a test failure. */
+  analyzerFeedback?: string;
 }
 
 export async function buildImplementerPrompt(
@@ -68,10 +114,12 @@ export async function buildImplementerPrompt(
   // the full list on Prolog error.
   const relevant = await computeRelevantFunctions(graph, fn.name);
   const descriptionBlock = fn.description
-    ? ["", "Purpose (read carefully before writing code):", fn.description].join(
-        "\n",
-      )
+    ? ["", "Short description:", fn.description].join("\n")
     : "";
+
+  const specBlock: string[] = fn.spec
+    ? ["", "SPEC (from the Architect — your contract):", renderSpec(fn.spec)]
+    : ["", "(no spec attached — derive tests from the description and signature)"];
 
   const existingBlock: string[] = [];
   if (fn.implementation !== null) {
@@ -82,9 +130,8 @@ export async function buildImplementerPrompt(
       fn.implementation,
       "```",
       "",
-      "Your task is to MODIFY this body so the declared tests pass.",
-      "Preserve any behavior not contradicted by the tests. Prefer the",
-      "smallest change that satisfies the contract.",
+      "Your task is to MODIFY this body so the tests you emit pass.",
+      "Preserve behavior not contradicted by the spec.",
     );
   }
 
@@ -109,9 +156,6 @@ export async function buildImplementerPrompt(
   // ANY of them, not just its formal children. List them as "other
   // available" so the LLM sees the full ctx.fns surface.
   const childSet = new Set(fn.children);
-  // Non-child relevant functions: signature-only. Descriptions are
-  // dropped here because they repeat information the LLM doesn't need
-  // to write THIS function — knowing how to CALL each one is enough.
   const otherAvailable = relevant
     .filter((f) => f.name !== fn.name && !childSet.has(f.name))
     .map((f) => {
@@ -121,11 +165,32 @@ export async function buildImplementerPrompt(
       return `  - ctx.fns.${f.name}(ctx${params.length > 0 ? ", " + params : ""}): ${f.signature.returnType}`;
     })
     .join("\n");
+
+  // Tests already in the graph — on first attempt this is empty, on
+  // retry it shows what the Implementer emitted last time so they can
+  // iterate instead of rewriting from scratch.
+  const hasExistingUnit = fn.tests.length > 0;
+  const hasExistingIntegration = fn.integrationTests.length > 0;
+  const existingTestsBlock: string[] = [];
+  if (hasExistingUnit || hasExistingIntegration) {
+    existingTestsBlock.push("", "Tests currently on this function (you wrote these last round — revise as needed):");
+    if (hasExistingUnit) {
+      existingTestsBlock.push("Unit:", renderTestList(fn.tests));
+    }
+    if (hasExistingIntegration) {
+      existingTestsBlock.push("Integration:", renderTestList(fn.integrationTests));
+    }
+  }
+
+  const integrationNeeded = hasChildren;
+
   const lines = [
     `You are the Implementer of \`${fn.name}\` in the proc-ts project.`,
+    "You own BOTH the body AND the tests for this function.",
     "",
     `Signature: ${renderSignature(fn.name, fn.signature)}`,
     descriptionBlock,
+    ...specBlock,
     "",
     ...(hasChildren
       ? [
@@ -166,37 +231,61 @@ export async function buildImplementerPrompt(
           "",
         ]
       : []),
-    "Tests this function must pass:",
-    renderTests(fn),
+    ...existingTestsBlock,
     ...existingBlock,
     "",
-    "Task:",
-    `- Return the body of \`${fn.name}\` — statements only, no surrounding`,
-    "  `function` declaration and no signature line — inside a single",
-    "  fenced block tagged ```ts.",
-    "- Do not narrate, do not call test_run, do not call design_implement.",
-    "  The harness runs the tests and saves the body on your behalf.",
-    "- If the tests fail, you will be called again with the failure output.",
+    "Task — emit THREE fenced blocks in your response:",
     "",
-    "**Tests CAN have bugs.** If a test is wrong (e.g. expects a sync",
-    "return from an async API, uses a wrong matcher, hard-codes a race),",
-    "you can fix it. In a SECOND fenced block tagged ```tests, emit a",
-    "JSON array of replacement tests for THIS function only:",
+    "1. ```ts — the function body (statements only, no signature, no",
+    `   surrounding \`function\` declaration). This is what \`${fn.name}\``,
+    "   does when called.",
     "",
-    "```tests",
+    "2. ```unit-tests — JSON array of tests that exercise THIS function",
+    "   in isolation. Each entry is `{\"name\": \"...\", \"code\": \"...\"}`.",
+    "   The test `code` runs inside a vitest `it(...)` body — you can",
+    `   call the function under test as \`${fn.name}(ctx, ...)\` (it is`,
+    "   imported for you). Cover every edge case from the spec and at",
+    "   least one example. Unit tests should NOT depend on siblings —",
+    "   stub `ctx.fns.<name>` if needed.",
+    "",
+    integrationNeeded
+      ? "3. ```integration-tests — REQUIRED. JSON array, same shape."
+      : "3. ```integration-tests — MUST be an empty array `[]` for this function.",
+    integrationNeeded
+      ? "   Integration tests run with real siblings wired via `ctx.fns`."
+      : "   This function has no children to assemble, so integration tests",
+    integrationNeeded
+      ? "   Because this function assembles children, you MUST include at"
+      : "   would not run (the harness only materializes integration test",
+    integrationNeeded
+      ? "   least one integration test that exercises the full wire-up."
+      : "   files for branches). Emit `[]` and put behavior coverage in unit tests.",
+    "",
+    "Fence shape:",
+    "```ts",
+    "// body statements",
+    "```",
+    "```unit-tests",
     "[",
-    '  {"name": "<same name as an existing test to override>", "code": "<new test body>"},',
-    '  {"name": "<a brand new test name>", "code": "<new test body>"}',
+    '  {"name": "...", "code": "..."}',
+    "]",
+    "```",
+    "```integration-tests",
+    "[",
+    '  {"name": "...", "code": "..."}',
     "]",
     "```",
     "",
-    "Rules for modifying tests:",
-    "- Only modify this function's OWN tests. Siblings and project-level",
-    "  tests are out of scope.",
-    "- Patches must preserve the function's observable contract. If the",
-    "  original test was asserting behavior X and the right API is async,",
-    "  fix the ASSERTION to be async-correct — don't weaken the contract.",
-    "- If you don't need to modify tests, omit the ```tests block.",
+    "Rules:",
+    "- Do not narrate, do not call test_run, do not call design_implement.",
+    "  The harness runs the tests and saves the body on your behalf.",
+    "- If the tests fail, you will be called again with the failure output.",
+    "  You can revise BOTH the body and the tests on each retry — whichever",
+    "  you believe is wrong. Emitting a `unit-tests` or `integration-tests`",
+    "  block on retry patches the stored tests (same-name overwrites,",
+    "  new-name appends). Omit the block to keep existing tests unchanged.",
+    "- Tests are YOURS. Siblings' tests and project-level tests are out",
+    "  of scope for you.",
   ];
 
   if (feedback) {
@@ -208,14 +297,41 @@ export async function buildImplementerPrompt(
       "```",
       feedback.previousBody,
       "```",
-      "",
-      "That body failed the tests. Output:",
-      "```",
-      feedback.testOutput.slice(-2000),
-      "```",
-      "",
-      "Revise the body and return a fresh attempt in a single fenced block.",
     );
+    if (feedback.analyzerFeedback) {
+      lines.push(
+        "",
+        "Static-analysis violation (tests were NOT run — the body failed",
+        "a structural proc-ts check):",
+        "```",
+        feedback.analyzerFeedback.slice(-2000),
+        "```",
+        "",
+        "Fix the listed violation(s) and resubmit. This is a structural",
+        "check, not a test failure.",
+      );
+    } else if (feedback.architectFeedback) {
+      lines.push(
+        "",
+        "Architect review feedback (tests PASSED — the Architect rejected",
+        "the body against the SPEC; this is NOT a test failure):",
+        "```",
+        feedback.architectFeedback.slice(-2000),
+        "```",
+        "",
+        "Revise the body (and/or tests) to address the Architect's concerns.",
+      );
+    } else {
+      lines.push(
+        "",
+        "Test output:",
+        "```",
+        feedback.testOutput.slice(-2000),
+        "```",
+        "",
+        "Revise whatever is wrong — the body, the tests, or both.",
+      );
+    }
   }
 
   return lines.join("\n");

@@ -150,6 +150,8 @@ export interface RLMContext {
   readonly sandboxTimeoutMs: number;
   readonly maxSubRLMDepth: number;
   readonly subRLMDepth: number;
+  /** Max Architect-review cycles per dispatched function (from config). */
+  readonly maxReviewCycles: number;
   readonly signal?: AbortSignal;
   /** Optional hierarchical-agent role binding (role + task envelope). */
   readonly roleBinding?: import("./system-prompt.js").RoleBinding;
@@ -246,4 +248,7 @@ export interface ServerConfig {
   sandboxTimeoutMs: number;
   maxHandles: number;
   maxSubRLMDepth: number;
+  /** Max Architect-review cycles per dispatched function. 0 disables
+   *  review. Defaults to 2. */
+  maxReviewCycles: number;
 }

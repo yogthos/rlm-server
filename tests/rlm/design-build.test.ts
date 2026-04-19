@@ -237,9 +237,16 @@ describe("designBuild", () => {
       { params: [], returnType: "void" },
       "x",
     );
-    g.addTest("src/a.ts", "tooDeep", {
-      name: "t",
-      code: "expect(1).toBe(1);",
+    // A spec gates the IMPLEMENT-vs-DECOMPOSE decision; without it
+    // dispatch skips straight to body generation.
+    g.setSpec("src/a.ts", "tooDeep", {
+      purpose: "x",
+      inputs: [],
+      output: { type: "void", description: "" },
+      sideEffects: [],
+      dependencies: [],
+      edgeCases: [],
+      examples: [],
     });
 
     const bridge = createDesignDispatchBridge(

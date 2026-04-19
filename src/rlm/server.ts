@@ -284,6 +284,7 @@ export function createServer(config: ServerConfig): http.Server {
                 maxIterations,
                 sandboxTimeoutMs: config.sandboxTimeoutMs,
                 maxSubRLMDepth: config.maxSubRLMDepth,
+                maxReviewCycles: config.maxReviewCycles,
                 signal: abortController.signal,
                 roleBinding,
                 onIteration: (iteration, state) => {
@@ -394,6 +395,7 @@ export function createServer(config: ServerConfig): http.Server {
               maxIterations,
               sandboxTimeoutMs: config.sandboxTimeoutMs,
               maxSubRLMDepth: config.maxSubRLMDepth,
+              maxReviewCycles: config.maxReviewCycles,
               signal: abortController.signal,
               roleBinding,
             });

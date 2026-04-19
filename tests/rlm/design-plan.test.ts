@@ -57,27 +57,100 @@ describe("parseTestList", () => {
   });
 });
 
-describe("parseFunctionSpec", () => {
-  it("accepts a description + tests object", () => {
-    const spec = parseFunctionSpec({
-      description: "Adds two numbers.",
-      tests: [{ name: "t", code: "expect(1).toBe(1);" }],
+describe("parseFunctionSpec (signature-driven)", () => {
+  // New shape: LLM authors ONLY descriptions. name/type come from the
+  // stored signature, so the LLM can't drift from phase 1's commitment.
+  const twoArgSig = {
+    params: [
+      { name: "a", type: "number" },
+      { name: "b", type: "number" },
+    ],
+    returnType: "number",
+  };
+  const validRawSpec = {
+    purpose: "Add two numbers.",
+    inputs: ["lhs", "rhs"], // descriptions only, aligned to signature.params
+    output: "sum of the two numbers", // description only
+    sideEffects: [],
+    dependencies: [],
+    edgeCases: ["a + 0 === a"],
+    examples: [{ input: "a=1,b=2", output: "3" }],
+  };
+
+  it("synthesizes inputs[].name/type from the signature and keeps descriptions", () => {
+    const spec = parseFunctionSpec(validRawSpec, twoArgSig);
+    expect(spec.inputs).toEqual([
+      { name: "a", type: "number", description: "lhs" },
+      { name: "b", type: "number", description: "rhs" },
+    ]);
+  });
+
+  it("synthesizes output.type from signature.returnType", () => {
+    const spec = parseFunctionSpec(validRawSpec, twoArgSig);
+    expect(spec.output).toEqual({
+      type: "number",
+      description: "sum of the two numbers",
     });
-    expect(spec.description).toBe("Adds two numbers.");
-    expect(spec.tests).toHaveLength(1);
   });
-  it("rejects empty description", () => {
+
+  it("rejects inputs array with wrong length vs signature.params", () => {
     expect(() =>
-      parseFunctionSpec({ description: "  ", tests: [] }),
-    ).toThrow();
+      parseFunctionSpec({ ...validRawSpec, inputs: ["only-one"] }, twoArgSig),
+    ).toThrow(/inputs/);
   });
-  it("rejects missing tests array", () => {
-    expect(() => parseFunctionSpec({ description: "x" })).toThrow();
+
+  it("accepts empty inputs when signature has no params", () => {
+    const noArgSig = { params: [], returnType: "void" };
+    const spec = parseFunctionSpec(
+      {
+        purpose: "does nothing",
+        inputs: [],
+        output: "nothing",
+        sideEffects: [],
+        dependencies: [],
+        edgeCases: [],
+        examples: [],
+      },
+      noArgSig,
+    );
+    expect(spec.inputs).toEqual([]);
+  });
+
+  it("rejects missing purpose", () => {
+    const { purpose: _p, ...rest } = validRawSpec;
+    expect(() => parseFunctionSpec(rest, twoArgSig)).toThrow(/purpose/);
+  });
+
+  it("rejects missing output", () => {
+    const { output: _o, ...rest } = validRawSpec;
+    expect(() => parseFunctionSpec(rest, twoArgSig)).toThrow(/output/);
+  });
+
+  it("rejects empty output string", () => {
+    expect(() =>
+      parseFunctionSpec({ ...validRawSpec, output: "" }, twoArgSig),
+    ).toThrow(/output/);
+    expect(() =>
+      parseFunctionSpec({ ...validRawSpec, output: "   " }, twoArgSig),
+    ).toThrow(/output/);
   });
 });
 
+// New spec shape (signature-driven): LLM supplies only descriptions.
+// Works for any signature because phase-1 fixtures use `params: []`.
+const specJson = JSON.stringify({
+  purpose: "x",
+  inputs: [],
+  output: "nothing",
+  sideEffects: [],
+  dependencies: [],
+  edgeCases: [],
+  examples: [],
+});
+const specResp = `\`\`\`json\n${specJson}\n\`\`\``;
+
 describe("designPlan", () => {
-  it("runs phase 1 (list functions) and phase 2 (per-fn tests), then build", async () => {
+  it("phase 1 lists functions; phase 2 attaches specs; build runs", async () => {
     const g = createDesignGraph();
     const chatCalls: string[] = [];
     const chat = async (prompt: string) => {
@@ -87,48 +160,33 @@ describe("designPlan", () => {
           "```json\n" +
           JSON.stringify([
             {
-              module: "src/math.ts",
-              name: "add",
-              signature: {
-                params: [
-                  { name: "a", type: "number" },
-                  { name: "b", type: "number" },
-                ],
-                returnType: "number",
-              },
-              description: "adds two numbers",
+              module: "src/a.ts",
+              name: "foo",
+              signature: { params: [], returnType: "void" },
+              description: "does stuff",
             },
           ]) +
           "\n```"
         );
       }
-      if (prompt.startsWith("Write PROJECT-LEVEL INTEGRATION TESTS")) {
-        // Phase 2b — project integration tests (array).
-        return (
-          '```json\n[{"name":"e2e","code":"expect(add(ctx,1,1)).toBe(2);"}]\n```'
-        );
-      }
-      // Phase 2 — description + tests for one function.
-      return (
-        '```json\n{"description":"Adds two numbers.","tests":[{"name":"adds","code":"expect(add(2,3)).toBe(5);"}]}\n```'
-      );
+      return specResp; // phase 2 spec
     };
-    const report = await designPlan(g, "build a math module", {
+    const report = await designPlan(g, "task", {
       chat,
       dispatch: async (_g, mod, name) => ({
         module: mod,
         name,
         status: "tests-green",
-        implementation: "return a + b;",
+        implementation: "// ok",
         attempts: 1,
         testOutput: "",
       }),
       finalize: async () => ({
         ok: true,
-        files: { "src/math.ts": "ok" },
+        files: { "foo.ts": "ok" },
         unimplemented: [],
         consistency: { ok: true, violations: [], advisories: [] },
-        testsPassed: 1,
+        testsPassed: 0,
         testsFailed: 0,
         testOutput: "",
         typecheckOk: true,
@@ -137,36 +195,27 @@ describe("designPlan", () => {
     });
     expect(report.ok).toBe(true);
     expect(report.phase).toBe("done");
-    // Function is in the graph with its test + enriched description.
-    const fn = g.getFunction("src/math.ts", "add");
-    expect(fn).toBeDefined();
-    expect(fn!.tests).toHaveLength(1);
-    expect(fn!.description).toBe("Adds two numbers.");
-    // Three LLM calls: phase 1, phase 2 (per-fn), phase 2b (project integration).
-    expect(chatCalls).toHaveLength(3);
-    expect(g.listProjectTests()).toHaveLength(1);
+    const fn = g.getFunction("src/a.ts", "foo")!;
+    expect(fn.spec).not.toBeNull();
+    // Two chat calls: phase 1 + phase 2 per fn. No phase 2b anymore.
+    expect(chatCalls).toHaveLength(2);
   });
 
-  it("retries phase 1 once on bad JSON before giving up", async () => {
+  it("resume — skips phase 1 when plan-origin fns exist", async () => {
     const g = createDesignGraph();
-    let call = 0;
-    const chat = async () => {
-      call++;
-      if (call === 1) return "not a JSON array at all";
-      return (
-        "```json\n" +
-        JSON.stringify([
-          {
-            module: "src/a.ts",
-            name: "foo",
-            signature: { params: [], returnType: "void" },
-            description: "x",
-          },
-        ]) +
-        "\n```"
-      );
+    g.addFunction(
+      "src/a.ts",
+      "foo",
+      { params: [], returnType: "void" },
+      "",
+      "plan",
+    );
+    const chatCalls: string[] = [];
+    const chat = async (prompt: string) => {
+      chatCalls.push(prompt);
+      return specResp;
     };
-    await designPlan(g, "do things", {
+    await designPlan(g, "task", {
       chat,
       dispatch: async (_g, mod, name) => ({
         module: mod,
@@ -188,157 +237,13 @@ describe("designPlan", () => {
         typecheckOutput: "",
       }),
     });
-    expect(call).toBeGreaterThanOrEqual(2);
-    expect(g.getFunction("src/a.ts", "foo")).toBeDefined();
+    // Phase 1 skipped; only phase 2 (spec for foo) hits the LLM.
+    expect(chatCalls).toHaveLength(1);
+    expect(chatCalls[0]).toContain("Fill in the SPEC");
+    expect(g.getFunction("src/a.ts", "foo")!.spec).not.toBeNull();
   });
 
-  it("fails with phase=plan when every function's phase 2 returns bad JSON", async () => {
-    // Phase 1 succeeds with one function; phase 2 returns garbage for
-    // it; the safety net must catch the zero-tests state before dispatch
-    // instead of letting 0/0 auto-pass a garbage body through.
-    const g = createDesignGraph();
-    let turn = 0;
-    const chat = async () => {
-      turn++;
-      if (turn === 1) {
-        return (
-          "```json\n" +
-          JSON.stringify([
-            {
-              module: "src/a.ts",
-              name: "foo",
-              signature: { params: [], returnType: "void" },
-              description: "x",
-            },
-          ]) +
-          "\n```"
-        );
-      }
-      return "not json"; // phase 2 keeps failing across retries
-    };
-    const report = await designPlan(g, "task", {
-      chat,
-      dispatch: async () => {
-        throw new Error("should not dispatch — plan should have aborted");
-      },
-      finalize: async () => {
-        throw new Error("should not finalize");
-      },
-    });
-    expect(report.ok).toBe(false);
-    expect(report.phase).toBe("plan");
-  });
-
-  it("resumes — skips phase 1 only when plan-origin functions exist", async () => {
-    const g = createDesignGraph();
-    // Pretend a prior design_plan run declared this function.
-    g.addFunction(
-      "src/a.ts",
-      "foo",
-      { params: [], returnType: "void" },
-      "pre-declared",
-      "plan",
-    );
-    const chatCalls: string[] = [];
-    const chat = async (prompt: string) => {
-      chatCalls.push(prompt);
-      if (
-        prompt.startsWith("Write PROJECT-LEVEL INTEGRATION TESTS") ||
-        prompt.startsWith("Write INTEGRATION TESTS for the assembly")
-      ) {
-        return '```json\n[{"name":"i","code":"expect(1).toBe(1);"}]\n```';
-      }
-      return '```json\n{"description":"x","tests":[{"name":"t","code":"expect(1).toBe(1);"}]}\n```';
-    };
-    await designPlan(g, "task", {
-      chat,
-      dispatch: async (_g, mod, name) => ({
-        module: mod,
-        name,
-        status: "tests-green",
-        implementation: "// ok",
-        attempts: 1,
-        testOutput: "",
-      }),
-      finalize: async () => ({
-        ok: true,
-        files: {},
-        unimplemented: [],
-        consistency: { ok: true, violations: [], advisories: [] },
-        testsPassed: 1,
-        testsFailed: 0,
-        testOutput: "",
-        typecheckOk: true,
-        typecheckOutput: "",
-      }),
-    });
-    // 2 chat calls: phase 2 for foo + phase 2b project integration.
-    expect(chatCalls).toHaveLength(2);
-    expect(chatCalls[0]).toContain("foo");
-    expect(g.getFunction("src/a.ts", "foo")!.tests).toHaveLength(1);
-  });
-
-  it("does NOT skip phase 1 when only load/manual-origin functions exist", async () => {
-    // design_load populated a function; design_plan should still ask
-    // for NEW planned functions — otherwise the user's task is ignored.
-    const g = createDesignGraph();
-    g.addFunction(
-      "src/a.ts",
-      "loaded",
-      { params: [], returnType: "void" },
-      "from disk",
-      "load",
-    );
-    const chatCalls: string[] = [];
-    const chat = async (prompt: string) => {
-      chatCalls.push(prompt);
-      if (prompt.includes("list the top-level functions needed")) {
-        return (
-          "```json\n" +
-          JSON.stringify([
-            {
-              module: "src/a.ts",
-              name: "newFn",
-              signature: { params: [], returnType: "void" },
-              description: "planned",
-            },
-          ]) +
-          "\n```"
-        );
-      }
-      return '```json\n{"description":"x","tests":[{"name":"t","code":"expect(1).toBe(1);"}]}\n```';
-    };
-    await designPlan(g, "task", {
-      chat,
-      dispatch: async (_g, mod, name) => ({
-        module: mod,
-        name,
-        status: "tests-green",
-        implementation: "// ok",
-        attempts: 1,
-        testOutput: "",
-      }),
-      finalize: async () => ({
-        ok: true,
-        files: {},
-        unimplemented: [],
-        consistency: { ok: true, violations: [], advisories: [] },
-        testsPassed: 2,
-        testsFailed: 0,
-        testOutput: "",
-        typecheckOk: true,
-        typecheckOutput: "",
-      }),
-    });
-    // Phase 1 happened — the first call mentions the planning prompt.
-    expect(chatCalls[0]).toContain("list the top-level functions needed");
-    // The newly-planned function landed in the graph.
-    expect(g.getFunction("src/a.ts", "newFn")).toBeDefined();
-    expect(g.getFunction("src/a.ts", "newFn")!.origin).toBe("plan");
-    expect(g.getFunction("src/a.ts", "loaded")!.origin).toBe("load");
-  });
-
-  it("resumes — skips phase 2 for functions that already have tests", async () => {
+  it("resume — skips phase 2 when spec already attached", async () => {
     const g = createDesignGraph();
     g.addFunction(
       "src/a.ts",
@@ -347,20 +252,19 @@ describe("designPlan", () => {
       "",
       "plan",
     );
-    g.addTest("src/a.ts", "foo", {
-      name: "existing",
-      code: "expect(1).toBe(1);",
+    g.setSpec("src/a.ts", "foo", {
+      purpose: "pre-existing",
+      inputs: [],
+      output: { type: "void", description: "" },
+      sideEffects: [],
+      dependencies: [],
+      edgeCases: [],
+      examples: [],
     });
     const chatCalls: string[] = [];
     const chat = async (prompt: string) => {
       chatCalls.push(prompt);
-      if (
-        prompt.startsWith("Write PROJECT-LEVEL INTEGRATION TESTS") ||
-        prompt.startsWith("Write INTEGRATION TESTS for the assembly")
-      ) {
-        return '```json\n[{"name":"i","code":"expect(1).toBe(1);"}]\n```';
-      }
-      return '```json\n{"description":"x","tests":[]}\n```';
+      return specResp;
     };
     await designPlan(g, "task", {
       chat,
@@ -377,130 +281,28 @@ describe("designPlan", () => {
         files: {},
         unimplemented: [],
         consistency: { ok: true, violations: [], advisories: [] },
-        testsPassed: 1,
+        testsPassed: 0,
         testsFailed: 0,
         testOutput: "",
         typecheckOk: true,
         typecheckOutput: "",
       }),
     });
-    // Phase 1 + per-fn phase 2 both skipped; phase 2b (project
-    // integration) still runs — 1 chat call.
-    expect(chatCalls).toHaveLength(1);
-    expect(chatCalls[0]).toContain("PROJECT-LEVEL INTEGRATION TESTS");
-    expect(g.getFunction("src/a.ts", "foo")!.tests).toHaveLength(1);
+    // Both phases skipped — zero LLM calls.
+    expect(chatCalls).toHaveLength(0);
+    expect(g.getFunction("src/a.ts", "foo")!.spec!.purpose).toBe("pre-existing");
   });
 
-  it("resumes — interleaved: some fns pre-tested, some need phase 2", async () => {
-    const g = createDesignGraph();
-    g.addFunction("src/a.ts", "a", { params: [], returnType: "void" }, "", "plan");
-    g.addTest("src/a.ts", "a", { name: "t", code: "expect(1).toBe(1);" });
-    g.addFunction("src/a.ts", "b", { params: [], returnType: "void" }, "", "plan");
-    // b has no tests → phase 2 should run exactly once, for b.
-    const chatCalls: string[] = [];
-    const chat = async (prompt: string) => {
-      chatCalls.push(prompt);
-      if (
-        prompt.startsWith("Write PROJECT-LEVEL INTEGRATION TESTS") ||
-        prompt.startsWith("Write INTEGRATION TESTS for the assembly")
-      ) {
-        return '```json\n[{"name":"i","code":"expect(1).toBe(1);"}]\n```';
-      }
-      return '```json\n{"description":"x","tests":[{"name":"bt","code":"expect(1).toBe(1);"}]}\n```';
-    };
-    await designPlan(g, "task", {
-      chat,
-      dispatch: async (_g, mod, name) => ({
-        module: mod,
-        name,
-        status: "tests-green",
-        implementation: "// ok",
-        attempts: 1,
-        testOutput: "",
-      }),
-      finalize: async () => ({
-        ok: true,
-        files: {},
-        unimplemented: [],
-        consistency: { ok: true, violations: [], advisories: [] },
-        testsPassed: 2,
-        testsFailed: 0,
-        testOutput: "",
-        typecheckOk: true,
-        typecheckOutput: "",
-      }),
-    });
-    // Phase 2 for b + phase 2b project integration = 2 calls.
-    expect(chatCalls).toHaveLength(2);
-    expect(chatCalls[0]).toMatch(/Function:\s*b\b/);
-    expect(g.getFunction("src/a.ts", "a")!.tests).toHaveLength(1);
-    expect(g.getFunction("src/a.ts", "b")!.tests).toHaveLength(1);
-  });
-
-  it("returns phase=plan when a function ended phase 2 with no tests and no body", async () => {
-    const g = createDesignGraph();
-    let turn = 0;
-    const chat = async () => {
-      turn++;
-      if (turn === 1) {
-        return (
-          "```json\n" +
-          JSON.stringify([
-            {
-              module: "src/a.ts",
-              name: "foo",
-              signature: { params: [], returnType: "void" },
-              description: "x",
-            },
-            {
-              module: "src/a.ts",
-              name: "bar",
-              signature: { params: [], returnType: "void" },
-              description: "y",
-            },
-          ]) +
-          "\n```"
-        );
-      }
-      if (turn === 2) {
-        // foo gets tests.
-        return '```json\n{"description":"x","tests":[{"name":"t","code":"expect(1).toBe(1);"}]}\n```';
-      }
-      // bar's phase 2 fails across retries.
-      return "no json";
-    };
-    const result = await designPlan(g, "task", {
-      chat,
-      dispatch: async () => {
-        throw new Error("dispatch should not run when plan has holes");
-      },
-      finalize: async () => {
-        throw new Error("finalize should not run");
-      },
-    });
-    expect(result.ok).toBe(false);
-    expect(result.phase).toBe("plan");
-  });
-
-  it("recursive plan — `parent` option adds children under the named function", async () => {
+  it("recursive — `parent` option adds children via addFunctionChild", async () => {
     const g = createDesignGraph();
     g.addFunction(
       "src/r.ts",
       "handleSign",
-      {
-        params: [
-          { name: "req", type: "any" },
-          { name: "res", type: "any" },
-        ],
-        returnType: "Promise<void>",
-        isAsync: true,
-      },
-      "handle POST /sign",
+      { params: [], returnType: "void" },
+      "handle sign",
       "plan",
     );
-
     const chat = async (prompt: string) => {
-      // Phase 1 (parent variant): starts with "You are decomposing".
       if (prompt.startsWith("You are decomposing")) {
         return (
           "```json\n" +
@@ -508,35 +310,22 @@ describe("designPlan", () => {
             {
               module: "src/r.ts",
               name: "parseBody",
-              signature: {
-                params: [{ name: "req", type: "any" }],
-                returnType: "Promise<Record<string,string>>",
-                isAsync: true,
-              },
-              description: "parses form body",
+              signature: { params: [], returnType: "void" },
+              description: "parses",
             },
             {
               module: "src/r.ts",
               name: "writeEntry",
-              signature: {
-                params: [{ name: "entry", type: "any" }],
-                returnType: "Promise<void>",
-                isAsync: true,
-              },
-              description: "writes a guestbook entry",
+              signature: { params: [], returnType: "void" },
+              description: "writes",
             },
           ]) +
           "\n```"
         );
       }
-      // Phase 2b (branch integration).
-      if (prompt.startsWith("Write INTEGRATION TESTS for the assembly")) {
-        return '```json\n[{"name":"assembly","code":"expect(1).toBe(1);"}]\n```';
-      }
-      // Phase 2 per-child (FunctionSpec shape).
-      return '```json\n{"description":"x","tests":[{"name":"t","code":"expect(1).toBe(1);"}]}\n```';
+      return specResp;
     };
-    const result = await designPlan(g, "add guestbook entry", {
+    const result = await designPlan(g, "task", {
       chat,
       parent: "handleSign",
       dispatch: async () => {
@@ -550,12 +339,379 @@ describe("designPlan", () => {
     expect(result.phase).toBe("plan");
     const parent = g.getFunction("src/r.ts", "handleSign")!;
     expect(parent.children.sort()).toEqual(["parseBody", "writeEntry"]);
-    // Parent now has integration tests from phase 2b.
-    expect(parent.integrationTests).toHaveLength(1);
-    const p = g.getFunction("src/r.ts", "parseBody")!;
-    expect(p.parent).toBe("handleSign");
-    expect(p.tests).toHaveLength(1);
-    expect(p.origin).toBe("plan");
+    expect(g.getFunction("src/r.ts", "parseBody")!.spec).not.toBeNull();
+    expect(g.getFunction("src/r.ts", "parseBody")!.parent).toBe("handleSign");
+  });
+
+  it("drops unknown dependency names from the LLM spec before storing", async () => {
+    // LLM claims dependency on `nonexistent` — harness must filter it
+    // out at store time so the Implementer prompt doesn't advertise a
+    // sibling that isn't wired.
+    const g = createDesignGraph();
+    const chat = async (prompt: string) => {
+      if (prompt.includes("list the top-level functions")) {
+        return (
+          "```json\n" +
+          JSON.stringify([
+            {
+              module: "src/a.ts",
+              name: "foo",
+              signature: { params: [], returnType: "void" },
+              description: "does foo",
+            },
+            {
+              module: "src/a.ts",
+              name: "bar",
+              signature: { params: [], returnType: "void" },
+              description: "does bar",
+            },
+          ]) +
+          "\n```"
+        );
+      }
+      // Phase 2: both functions claim a dep on a nonexistent sibling
+      // and one on a real one.
+      return (
+        "```json\n" +
+        JSON.stringify({
+          purpose: "x",
+          inputs: [],
+          output: "nothing",
+          sideEffects: [],
+          dependencies: ["bar", "nonexistent"],
+          edgeCases: [],
+          examples: [],
+        }) +
+        "\n```"
+      );
+    };
+    await designPlan(g, "task", {
+      chat,
+      dispatch: async (_g, mod, name) => ({
+        module: mod,
+        name,
+        status: "tests-green",
+        implementation: "// ok",
+        attempts: 1,
+        testOutput: "",
+      }),
+      finalize: async () => ({
+        ok: true,
+        files: {},
+        unimplemented: [],
+        consistency: { ok: true, violations: [], advisories: [] },
+        testsPassed: 0,
+        testsFailed: 0,
+        testOutput: "",
+        typecheckOk: true,
+        typecheckOutput: "",
+      }),
+    });
+    // "nonexistent" must be filtered; "bar" must be preserved.
+    const foo = g.getFunction("src/a.ts", "foo")!;
+    expect(foo.spec!.dependencies).toEqual(["bar"]);
+  });
+
+  it("caps decompose children at a fixed maximum", async () => {
+    const g = createDesignGraph();
+    g.addFunction(
+      "src/p.ts",
+      "parent",
+      { params: [], returnType: "void" },
+      "parent",
+      "plan",
+    );
+    const chat = async (prompt: string) => {
+      if (prompt.startsWith("You are decomposing")) {
+        // 10 children — over the cap
+        return (
+          "```json\n" +
+          JSON.stringify(
+            Array.from({ length: 10 }, (_, i) => ({
+              name: `child${i}`,
+              signature: { params: [], returnType: "void" },
+              description: `child ${i}`,
+            })),
+          ) +
+          "\n```"
+        );
+      }
+      return specResp;
+    };
+    const result = await designPlan(g, "task", {
+      chat,
+      parent: "parent",
+      dispatch: async () => {
+        throw new Error("not used");
+      },
+      finalize: async () => {
+        throw new Error("not used");
+      },
+    });
+    // A hard cap trips the shape-retry loop; with maxShapeRetries=1 and
+    // both attempts returning 10, the plan fails with phase=plan.
+    expect(result.ok).toBe(false);
+    expect(result.phase).toBe("plan");
+  });
+
+  it("decompose phase-2 sibling list includes top-level siblings and the parent", async () => {
+    const g = createDesignGraph();
+    g.addFunction(
+      "src/server.js",
+      "loadEntries",
+      { params: [], returnType: "void" },
+      "loads all entries from disk",
+      "plan",
+    );
+    g.addFunction(
+      "src/server.js",
+      "handleSign",
+      { params: [], returnType: "void" },
+      "handle signing",
+      "plan",
+    );
+    const prompts: string[] = [];
+    const chat = async (prompt: string) => {
+      prompts.push(prompt);
+      if (prompt.startsWith("You are decomposing")) {
+        return (
+          "```json\n" +
+          JSON.stringify([
+            {
+              name: "parseBody",
+              signature: { params: [], returnType: "void" },
+              description: "parses",
+            },
+          ]) +
+          "\n```"
+        );
+      }
+      return specResp;
+    };
+    await designPlan(g, "task", {
+      chat,
+      parent: "handleSign",
+      dispatch: async () => {
+        throw new Error("not used");
+      },
+      finalize: async () => {
+        throw new Error("not used");
+      },
+    });
+    // Find the phase-2 prompt for the child. It's the one asking to
+    // fill the SPEC for the new child `parseBody`.
+    const phase2Prompt = prompts.find(
+      (p) => p.includes("Fill in the SPEC") && p.includes("Function: parseBody"),
+    );
+    expect(phase2Prompt).toBeDefined();
+    // Both the top-level sibling AND the parent must appear in the
+    // sibling section so the Implementer can list them as dependencies.
+    expect(phase2Prompt).toContain("loadEntries");
+    expect(phase2Prompt).toContain("handleSign");
+  });
+
+  it("phase-2 prompt renders the graph's normalized signature (isAsync + Promise)", async () => {
+    // Phase 1 declares `load` with isAsync:false but returnType Promise.
+    // The graph normalizes at ingest. The phase-2 prompt must reflect
+    // the normalized signature, not the LLM's original claim.
+    const g = createDesignGraph();
+    const prompts: string[] = [];
+    const chat = async (prompt: string) => {
+      prompts.push(prompt);
+      if (prompt.includes("list the top-level functions")) {
+        return (
+          "```json\n" +
+          JSON.stringify([
+            {
+              module: "src/a.ts",
+              name: "load",
+              signature: {
+                params: [],
+                returnType: "Promise<string>",
+                isAsync: false, // LLM slip
+              },
+              description: "loads",
+            },
+          ]) +
+          "\n```"
+        );
+      }
+      return specResp;
+    };
+    await designPlan(g, "task", {
+      chat,
+      dispatch: async (_g, mod, name) => ({
+        module: mod,
+        name,
+        status: "tests-green",
+        implementation: "// ok",
+        attempts: 1,
+        testOutput: "",
+      }),
+      finalize: async () => ({
+        ok: true,
+        files: {},
+        unimplemented: [],
+        consistency: { ok: true, violations: [], advisories: [] },
+        testsPassed: 0,
+        testsFailed: 0,
+        testOutput: "",
+        typecheckOk: true,
+        typecheckOutput: "",
+      }),
+    });
+    const phase2Prompt = prompts.find(
+      (p) => p.includes("Fill in the SPEC") && p.includes("Function: load"),
+    );
+    expect(phase2Prompt).toBeDefined();
+    // Normalization forces `async` keyword in the displayed signature.
+    expect(phase2Prompt).toContain("async function load(ctx: Ctx): Promise<string>");
+  });
+
+  it("surfaces cross-module name collision as a plan failure (not a silent skip)", async () => {
+    // A colliding-name error from addFunction must NOT be silently
+    // swallowed — it indicates the LLM picked a bad name.
+    const g = createDesignGraph();
+    g.addFunction(
+      "src/existing.ts",
+      "foo",
+      { params: [], returnType: "void" },
+      "already here",
+      "manual",
+    );
+    const chat = async (prompt: string) => {
+      if (prompt.includes("list the top-level functions")) {
+        return (
+          "```json\n" +
+          JSON.stringify([
+            {
+              module: "src/new.ts",
+              name: "foo", // collides with existing top-level `foo`
+              signature: { params: [], returnType: "void" },
+              description: "dup",
+            },
+          ]) +
+          "\n```"
+        );
+      }
+      return specResp; // phase 2 would succeed if we got that far
+    };
+    const report = await designPlan(g, "task", {
+      chat,
+      dispatch: async () => {
+        throw new Error("should not dispatch");
+      },
+      finalize: async () => {
+        throw new Error("should not finalize");
+      },
+    });
+    expect(report.ok).toBe(false);
+    expect(report.phase).toBe("plan");
+  });
+
+  it("recursive — child modules inherit the parent's module (LLM's claim is ignored)", async () => {
+    const g = createDesignGraph();
+    g.addFunction(
+      "src/server.js",
+      "handleSign",
+      { params: [], returnType: "void" },
+      "handle sign",
+      "plan",
+    );
+    const chat = async (prompt: string) => {
+      if (prompt.startsWith("You are decomposing")) {
+        // LLM returns children with a WRONG module path — the harness
+        // must discard the LLM's module and use the parent's.
+        return (
+          "```json\n" +
+          JSON.stringify([
+            {
+              module: "server.js",
+              name: "parseBody",
+              signature: { params: [], returnType: "void" },
+              description: "parses",
+            },
+            {
+              module: "elsewhere/wrong.ts",
+              name: "writeEntry",
+              signature: { params: [], returnType: "void" },
+              description: "writes",
+            },
+          ]) +
+          "\n```"
+        );
+      }
+      return specResp;
+    };
+    await designPlan(g, "task", {
+      chat,
+      parent: "handleSign",
+      dispatch: async () => {
+        throw new Error("should not dispatch");
+      },
+      finalize: async () => {
+        throw new Error("should not finalize");
+      },
+    });
+    // Both children must live in the PARENT's module, regardless of
+    // what the LLM claimed.
+    expect(g.getFunction("src/server.js", "parseBody")).toBeDefined();
+    expect(g.getFunction("src/server.js", "writeEntry")).toBeDefined();
+    expect(g.getFunction("server.js", "parseBody")).toBeUndefined();
+    expect(g.getFunction("elsewhere/wrong.ts", "writeEntry")).toBeUndefined();
+  });
+
+  it("reports failedSpecs when phase 2 fails for a subset of functions", async () => {
+    const g = createDesignGraph();
+    const chat = async (prompt: string) => {
+      if (prompt.includes("list the top-level functions")) {
+        return (
+          "```json\n" +
+          JSON.stringify([
+            {
+              module: "src/a.ts",
+              name: "foo",
+              signature: { params: [], returnType: "void" },
+              description: "does foo",
+            },
+            {
+              module: "src/a.ts",
+              name: "bar",
+              signature: { params: [], returnType: "void" },
+              description: "does bar",
+            },
+          ]) +
+          "\n```"
+        );
+      }
+      // Fail phase-2 for `bar`, succeed for `foo`.
+      if (prompt.includes("Function: bar")) return "garbage not JSON";
+      return specResp;
+    };
+    const report = await designPlan(g, "task", {
+      chat,
+      dispatch: async (_g, mod, name) => ({
+        module: mod,
+        name,
+        status: "tests-green",
+        implementation: "// ok",
+        attempts: 1,
+        testOutput: "",
+      }),
+      finalize: async () => ({
+        ok: true,
+        files: {},
+        unimplemented: [],
+        consistency: { ok: true, violations: [], advisories: [] },
+        testsPassed: 0,
+        testsFailed: 0,
+        testOutput: "",
+        typecheckOk: true,
+        typecheckOutput: "",
+      }),
+    });
+    // `bar` should appear in failedSpecs, build still proceeds.
+    expect(report.failedSpecs).toEqual(["src/a.ts#bar"]);
   });
 
   it("fails with phase=plan when phase 1 never returns valid JSON", async () => {

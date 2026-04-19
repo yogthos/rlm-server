@@ -73,6 +73,7 @@
     "node": ">=20.0.0"
   },
   "dependencies": {
+    "@vscode/tree-sitter-wasm": "^0.3.1",
     "@yogthos/tree-sitter-clojure": "^0.0.14",
     "node-llama-cpp": "^3.18.1",
     "tau-prolog": "^0.3.4",
