@@ -202,7 +202,23 @@ export async function designLeafUpBuild(
   // rounds without risking infinite spin.
   const startSize = graph.listFunctions().length;
   const MAX_ITERATIONS = Math.max(startSize * 3, 30);
-  const maxConcurrent = options.maxConcurrent ?? 4;
+  // Clamp to at least 1. A non-positive `maxConcurrent` would pick an
+  // empty batch on every iteration and terminate immediately with
+  // everything blocked — surprising failure mode for a misconfig.
+  const maxConcurrent = Math.max(1, options.maxConcurrent ?? 4);
+  // Guard against shared-projectDir + concurrent dispatch. When a
+  // projectDir is set, multiple dispatches would materialize
+  // different function files into the SAME dir simultaneously and
+  // clobber each other's writes mid-test-run. Force sequential in
+  // that case. (Current production wiring doesn't pass projectDir
+  // through leaf-up, so this is defensive.)
+  const effectiveConcurrency = options.projectDir ? 1 : maxConcurrent;
+  if (options.projectDir && maxConcurrent > 1) {
+    debug(
+      "leaf-up-build",
+      `projectDir set — forcing sequential dispatch (maxConcurrent=${maxConcurrent} ignored)`,
+    );
+  }
   let iter = 0;
   while (iter++ < MAX_ITERATIONS) {
     let levels: Map<string, number>;
@@ -222,7 +238,7 @@ export async function designLeafUpBuild(
       green,
       blocked,
       levels,
-      maxConcurrent,
+      effectiveConcurrency,
     );
     if (batch.length === 0) break;
     debug(

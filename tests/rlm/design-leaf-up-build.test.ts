@@ -179,6 +179,60 @@ describe("designLeafUpBuild", () => {
     expect(maxInFlight).toBe(4);
   });
 
+  it("clamps maxConcurrent=0 to 1 (doesn't silently block everything)", async () => {
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "solo", sig());
+    g.setSpec("src/a.ts", "solo", spec());
+    const dispatch = async (_g: any, mod: string, name: string) => {
+      _g.setImplementation(mod, name, "// ok");
+      return {
+        module: mod,
+        name,
+        status: "tests-green" as const,
+        implementation: "// ok",
+        attempts: 1,
+        testOutput: "",
+      };
+    };
+    const report = await designLeafUpBuild(g, { dispatch, maxConcurrent: 0 });
+    // Clamped to 1 → solo dispatched + green.
+    expect(report.ok).toBe(true);
+    expect(report.blocked).toEqual([]);
+  });
+
+  it("forces sequential dispatch when projectDir is set (shared-dir safety)", async () => {
+    const g = createDesignGraph();
+    for (const n of ["a", "b", "c"]) {
+      g.addFunction("src/a.ts", n, sig());
+      g.setSpec("src/a.ts", n, spec());
+    }
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const dispatch = async (_g: any, mod: string, name: string) => {
+      inFlight++;
+      if (inFlight > maxInFlight) maxInFlight = inFlight;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      inFlight--;
+      _g.setImplementation(mod, name, "// ok");
+      _g.setTestStatus(mod, name, "tests-green", "");
+      return {
+        module: mod,
+        name,
+        status: "tests-green" as const,
+        implementation: "// ok",
+        attempts: 1,
+        testOutput: "",
+      };
+    };
+    await designLeafUpBuild(g, {
+      dispatch,
+      maxConcurrent: 4,
+      projectDir: "/tmp/fake",
+    });
+    // projectDir set → maxConcurrent clamped to 1.
+    expect(maxInFlight).toBe(1);
+  });
+
   it("respects maxConcurrent cap — never dispatches more than N at once", async () => {
     const g = createDesignGraph();
     for (const n of ["a", "b", "c", "d", "e", "f"]) {
