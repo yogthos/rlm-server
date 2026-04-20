@@ -935,7 +935,35 @@ export function createDesignDispatchBridge(
         } // close else (structural check passed)
       }
 
+      // Wrap chat with an abort-retry so transient transport failures
+      // (the LLM's HTTP signal timing out even though the model would
+      // have produced a response) don't burn an attempt. Only retries
+      // on abort-like errors; real model/API failures propagate.
+      const MAX_ABORT_RETRIES = 2;
+      const chatWithAbortRetry = async (prompt: string): Promise<string> => {
+        let lastAbort: unknown = null;
+        for (let i = 0; i <= MAX_ABORT_RETRIES; i++) {
+          try {
+            return await chat(prompt);
+          } catch (e) {
+            const msg = e instanceof Error ? e.message : String(e);
+            const isAbort = /abort|AbortError/i.test(msg);
+            if (!isAbort || i === MAX_ABORT_RETRIES) throw e;
+            lastAbort = e;
+            debug(
+              "dispatch",
+              `chat aborted ${key} — abort-retry ${i + 1}/${MAX_ABORT_RETRIES}`,
+            );
+          }
+        }
+        throw lastAbort ?? new Error("unreachable");
+      };
+
+      // Actual attempt count — separate from the loop var so the log
+      // message on exhaustion shows what really ran, not the max.
+      let actualAttempts = 0;
       for (let attempt = 0; attempt < maxAttempts; attempt++) {
+        actualAttempts = attempt + 1;
         // Use feedback on attempt 0 too, as long as something primed it
         // (pre-test architect REVISE or pre-test analyzer rejection).
         // Without this, priming is dead and the Implementer's first
@@ -995,7 +1023,7 @@ export function createDesignDispatchBridge(
         debug("progress", `dispatch: ${key} attempt ${attempt + 1}/${maxAttempts}`);
         let response: string;
         try {
-          response = await chat(prompt);
+          response = await chatWithAbortRetry(prompt);
         } catch (e) {
           lastError = e instanceof Error ? e.message : String(e);
           debug("dispatch", `chat error ${key}: ${lastError}`);
@@ -1314,7 +1342,7 @@ export function createDesignDispatchBridge(
       }
       debug(
         "dispatch",
-        `exhausted ${key} attempts=${maxAttempts} lastError=${lastError}`,
+        `exhausted ${key} attempts=${actualAttempts}/${maxAttempts} lastError=${lastError}`,
       );
 
       // Recovery: if any attempt went tests-green during this dispatch
@@ -1341,9 +1369,9 @@ export function createDesignDispatchBridge(
           name,
           status: "failed",
           implementation: lastGreenBody.body,
-          attempts: maxAttempts,
+          attempts: actualAttempts,
           testOutput: lastGreenBody.output,
-          error: `exhausted ${maxAttempts} attempts; preserving last tests-green body (architect concerns unresolved). ${lastError ?? ""}`.trim(),
+          error: `exhausted ${actualAttempts}/${maxAttempts} attempts; preserving last tests-green body (architect concerns unresolved). ${lastError ?? ""}`.trim(),
         };
       }
 
@@ -1353,7 +1381,7 @@ export function createDesignDispatchBridge(
         name,
         status: "failed",
         implementation: null,
-        attempts: maxAttempts,
+        attempts: actualAttempts,
         testOutput,
         error: lastError ?? "dispatch exhausted attempts without going green",
       };

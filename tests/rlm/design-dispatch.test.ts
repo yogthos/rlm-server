@@ -2202,6 +2202,37 @@ describe("createDesignDispatchBridge", () => {
     expect(g.getFunction("src/a.ts", "foo")!.implementation).toBe("return 1;");
   });
 
+  it("retries on chat abort — transient transport failures don't burn attempts", async () => {
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "foo", { params: [], returnType: "number" });
+    let callCount = 0;
+    const b = createDesignDispatchBridge(
+      g,
+      async () => {
+        callCount++;
+        if (callCount === 1) {
+          const e = new Error("This operation was aborted");
+          throw e;
+        }
+        return (
+          '```ts\nreturn 1;\n```\n' +
+          '```unit-tests\n[{"name":"u","code":"expect(foo(ctx)).toBe(1);"}]\n```'
+        );
+      },
+      {
+        runTests: async () => ({ ok: true, passed: 1, failed: 0, output: "" }),
+        maxReviewCycles: 0,
+        maxAttempts: 2,
+      },
+    );
+    const result = await b.dispatch("src/a.ts", "foo");
+    // Dispatch recovered after the abort-retry — attempt count should
+    // be 1 (the single logical attempt), not 2.
+    expect(result.status).toBe("tests-green");
+    expect(result.attempts).toBe(1);
+    expect(callCount).toBe(2); // one abort + one success
+  });
+
   it("captures chat errors and reports failed", async () => {
     const g = createDesignGraph();
     g.addFunction("src/a.ts", "foo", { params: [], returnType: "number" });
