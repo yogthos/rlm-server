@@ -119,10 +119,10 @@ describe("designLeafUpBuild", () => {
     expect(report.blocked.sort()).toEqual(["leaf", "root"]);
   });
 
-  it("does NOT block the parent when the leaf returned a body even with status=failed", async () => {
-    // Pure-TDD leaf-up accepts best-attempt bodies (stagnation bail,
-    // architect-rejected, whatever) so parents can dispatch against a
-    // real child. Integration pass catches the remaining issues.
+  it("blocks a parent when the leaf dispatch returns status=failed even with a body", async () => {
+    // Pure-TDD pass 2: the Implementer owns body AND tests. If it
+    // returns "failed", it couldn't make its own tests pass — the
+    // contract is broken. Parents must NOT build on that.
     const g = createDesignGraph();
     g.addFunction("src/a.ts", "root", sig());
     g.setSpec("src/a.ts", "root", spec(["leaf"]));
@@ -131,23 +131,21 @@ describe("designLeafUpBuild", () => {
     const order: string[] = [];
     const dispatch = async (_g: any, mod: string, name: string) => {
       order.push(name);
-      _g.setImplementation(mod, name, "// stored");
       return {
         module: mod,
         name,
-        // leaf failed harden BUT has a preserved body.
         status: name === "leaf" ? ("failed" as const) : ("tests-green" as const),
-        implementation: "// preserved body",
+        // Leaf returned a body (red one) — shouldn't help, parent blocks.
+        implementation: "// red body",
         attempts: 1,
         testOutput: "",
         error: "stagnation",
       };
     };
     const report = await designLeafUpBuild(g, { dispatch });
-    // Parent still got dispatched because leaf has a body.
-    expect(order).toEqual(["leaf", "root"]);
-    // Only non-tests-green with NO body would block — this one has a body.
-    expect(report.blocked).toEqual([]);
+    // Parent NOT dispatched — leaf's tests red means the contract is broken.
+    expect(order).toEqual(["leaf"]);
+    expect(report.blocked.sort()).toEqual(["leaf", "root"]);
   });
 
   it("dispatches same-level functions in alphabetical order (deterministic)", async () => {

@@ -187,24 +187,21 @@ export async function designLeafUpBuild(
         blocked.add(name);
         continue;
       }
-      // Block ONLY when there's no body to build on. Leaf-up runs
-      // pure-TDD without architect review; a returned status of
-      // "failed" (stagnation bail, test-exhaustion) still preserves
-      // a best-attempt body via `lastGreenBody`. Parents can dispatch
-      // against a real-but-imperfect child — the integration pass
-      // will catch remaining gaps in context. Only a null body
-      // genuinely blocks downstream work.
-      if (result.implementation === null) {
+      // Block when the function didn't go tests-green. Under pure-TDD
+      // pass 2 (no architect) a `failed` status means the Implementer
+      // never got its own tests to pass — stagnation bail or full
+      // exhaustion. The Implementer owns BOTH the body and the tests,
+      // so "can't make them pass" is a real signal that the function
+      // is broken. Parents building against a red sibling will cascade
+      // their own failures. Integration phase 3 is for end-to-end
+      // bugs in a working assembly, not for fixing individual broken
+      // function contracts.
+      if (result.status !== "tests-green") {
         debug(
           "leaf-up-build",
-          `${name} blocked — no body returned (status=${result.status})`,
+          `${name} BLOCKED (${result.status}) — unit tests red; parents skipped`,
         );
         blocked.add(name);
-      } else if (result.status !== "tests-green") {
-        debug(
-          "leaf-up-build",
-          `${name} not green (${result.status}) but body preserved; parents can proceed`,
-        );
       }
     }
   }
