@@ -46,6 +46,23 @@ describe("extractRequestInfo", () => {
   it("returns null for an empty fence (no actionable requests)", () => {
     expect(extractRequestInfo("```request-info\n\n```")).toBeNull();
   });
+
+  it("merges queries across multiple request-info fences in one response", () => {
+    const response = [
+      "First I want to see callers:",
+      "```request-info",
+      "callers",
+      "```",
+      "And also the helper:",
+      "```request-info",
+      "sibling:formatDate",
+      "spec:bar",
+      "```",
+    ].join("\n");
+    const reqs = extractRequestInfo(response);
+    expect(reqs).toHaveLength(3);
+    expect(reqs!.map((r) => r.kind)).toEqual(["callers", "sibling", "spec"]);
+  });
 });
 
 describe("resolveRequests — built-in handlers", () => {

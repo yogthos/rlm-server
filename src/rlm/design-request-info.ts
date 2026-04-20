@@ -63,16 +63,22 @@ export function listInfoHandlers(): string[] {
 }
 
 export function extractRequestInfo(response: string): InfoRequest[] | null {
-  const m = response.match(/```request-info\s*\r?\n([\s\S]*?)```/);
-  if (!m) return null;
+  // Match ALL request-info fences (not just the first). Models
+  // occasionally scatter requests across separate fences with
+  // narration in between; silently dropping the tail fences would
+  // confuse the model when its second question got no answer.
+  const re = /```request-info\s*\r?\n([\s\S]*?)```/g;
   const requests: InfoRequest[] = [];
-  for (const rawLine of m[1].split("\n")) {
-    const line = rawLine.trim();
-    if (!line || line.startsWith("#")) continue;
-    const idx = line.indexOf(":");
-    const kind = idx === -1 ? line : line.slice(0, idx);
-    const args = idx === -1 ? "" : line.slice(idx + 1);
-    requests.push({ kind: kind.trim(), args: args.trim(), raw: line });
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(response)) !== null) {
+    for (const rawLine of m[1].split("\n")) {
+      const line = rawLine.trim();
+      if (!line || line.startsWith("#")) continue;
+      const idx = line.indexOf(":");
+      const kind = idx === -1 ? line : line.slice(0, idx);
+      const args = idx === -1 ? "" : line.slice(idx + 1);
+      requests.push({ kind: kind.trim(), args: args.trim(), raw: line });
+    }
   }
   return requests.length > 0 ? requests : null;
 }
