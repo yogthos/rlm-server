@@ -121,8 +121,21 @@ registerInfoHandler("stack-trace", (_req, ctx) => {
     lines.push(`--- ${name} ---`);
     lines.push(full.slice(0, 2000));
   }
-  return lines.join("\n");
+  return cap(lines.join("\n"), "stack traces");
 });
+
+/** Cap on bytes emitted by a single handler, so a huge function body
+ *  or test set can't single-handedly blow the Implementer's prompt
+ *  budget. Truncated with a visible marker. */
+const MAX_HANDLER_CHARS = 4000;
+
+function cap(text: string, tag: string): string {
+  if (text.length <= MAX_HANDLER_CHARS) return text;
+  return (
+    text.slice(0, MAX_HANDLER_CHARS) +
+    `\n[... truncated, ${text.length - MAX_HANDLER_CHARS} more chars of ${tag} ...]`
+  );
+}
 
 registerInfoHandler("sibling", (req, ctx) => {
   const name = req.args;
@@ -145,7 +158,7 @@ registerInfoHandler("sibling", (req, ctx) => {
   if (fn.tests.length > 0) {
     lines.push("Unit tests:", renderTests(fn.tests));
   }
-  return lines.join("\n");
+  return cap(lines.join("\n"), `sibling ${name}`);
 });
 
 registerInfoHandler("spec", (req, ctx) => {

@@ -671,12 +671,21 @@ const TEST_FENCE_TAGS = new Set([
   "integration-tests",
 ]);
 
+/** Fence tags that are NEVER a body — they're meta-channels owned by
+ *  other extractors (tests, request-info). extractBody must skip them
+ *  so an info-only response doesn't accidentally produce a "body" of
+ *  the request-info content. */
+const NON_BODY_FENCE_TAGS = new Set([
+  ...TEST_FENCE_TAGS,
+  "request-info",
+]);
+
 export function extractBody(response: string): string | null {
   const re = /```([a-zA-Z][a-zA-Z0-9_-]*(?::[^\s]*)?)?[^\S\n]*\r?\n([\s\S]*?)```/g;
   let m: RegExpExecArray | null;
   while ((m = re.exec(response)) !== null) {
     const tag = (m[1] ?? "").toLowerCase().split(":")[0];
-    if (TEST_FENCE_TAGS.has(tag)) continue;
+    if (NON_BODY_FENCE_TAGS.has(tag)) continue;
     return m[2].replace(/\r\n/g, "\n").trim();
   }
   return null;
@@ -1030,10 +1039,6 @@ export function createDesignDispatchBridge(
       // Last test run's full failure messages, surfaced via the
       // `stack-trace` request-info handler. Populated per test run.
       let lastFullFailureMessages: Map<string, string> | undefined;
-      // Info requested by the Implementer in a prior round of THIS
-      // attempt. Accumulated across info-rounds and prepended to the
-      // prompt; cleared when a real body is produced.
-      let pendingInfoResponse: string | null = null;
       for (let attempt = 0; attempt < maxAttempts; attempt++) {
         actualAttempts = attempt + 1;
         // Use feedback on attempt 0 too, as long as something primed it
@@ -1097,8 +1102,19 @@ export function createDesignDispatchBridge(
         // context (stack traces, sibling bodies, specs, …) before
         // committing to a body. Bounded per attempt so a confused
         // model can't loop indefinitely on info requests.
+        //
+        // Rule: info-only responses (request-info fence, no body
+        // fence) trigger a resolution round + re-prompt. If the
+        // response ALSO contains a body fence, process the body and
+        // skip the info round — the model already made its move.
+        //
+        // Info is rebuilt fresh each round from `accumulatedInfo`,
+        // never by string-concatenating onto the prior prompt; that
+        // caused duplication in the first iteration of this feature.
         const MAX_INFO_ROUNDS = 2;
+        const basePrompt = prompt;
         let infoRounds = 0;
+        let accumulatedInfo: string | null = null;
         let response: string;
         while (true) {
           try {
@@ -1111,7 +1127,12 @@ export function createDesignDispatchBridge(
           }
           debug("dispatch", `response ${key} len=${response.length}ch`);
           const infoReqs = extractRequestInfo(response);
-          if (!infoReqs || infoRounds >= MAX_INFO_ROUNDS) break;
+          const hasBody = extractBody(response) !== null;
+          // Only loop on info-only responses. A response with a body
+          // has already committed to an implementation attempt;
+          // ignoring info requests alongside the body keeps the
+          // attempt counter honest.
+          if (!infoReqs || hasBody || infoRounds >= MAX_INFO_ROUNDS) break;
           infoRounds++;
           debug(
             "dispatch",
@@ -1124,13 +1145,14 @@ export function createDesignDispatchBridge(
             lastTestOutput: testOutput || undefined,
             lastFailureMessages: lastFullFailureMessages,
           });
-          pendingInfoResponse = pendingInfoResponse
-            ? `${pendingInfoResponse}\n\n---\n\n${info}`
+          accumulatedInfo = accumulatedInfo
+            ? `${accumulatedInfo}\n\n--- round ${infoRounds} ---\n\n${info}`
             : info;
-          // Rebuild the prompt with the info appended so the next chat
-          // call sees the answers. Don't increment `attempt`.
-          const infoBlock = `\n\n---\n\nREQUESTED INFO:\n${pendingInfoResponse}\n\nNow respond with body + tests (or another request-info fence if you need more).`;
-          prompt = prompt + infoBlock;
+          // Rebuild prompt from BASE + accumulated info. No string
+          // concatenation onto the already-built prompt.
+          prompt =
+            basePrompt +
+            `\n\n---\n\nREQUESTED INFO:\n${accumulatedInfo}\n\nNow respond with body + tests (or another request-info fence if you need more).`;
         }
         if (lastError && !response) {
           break; // chat threw

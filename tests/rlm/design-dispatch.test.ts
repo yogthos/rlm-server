@@ -2239,6 +2239,99 @@ describe("createDesignDispatchBridge", () => {
     expect(callCount).toBe(2); // one abort + one success
   });
 
+  it("request-info round resolves queries and does NOT consume an attempt", async () => {
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "foo", { params: [], returnType: "number" });
+    g.addFunction("src/a.ts", "helper", { params: [], returnType: "number" });
+    g.setImplementation("src/a.ts", "helper", "return 1;");
+    let call = 0;
+    const prompts: string[] = [];
+    const b = createDesignDispatchBridge(
+      g,
+      async (p) => {
+        prompts.push(p);
+        call++;
+        if (call === 1) {
+          // First response: ONLY a request-info fence.
+          return "```request-info\nsibling:helper\n```";
+        }
+        // After info provided: body + tests.
+        return (
+          '```ts\nreturn 1;\n```\n' +
+          '```unit-tests\n[{"name":"u","code":"expect(foo(ctx)).toBe(1);"}]\n```'
+        );
+      },
+      {
+        runTests: async () => ({ ok: true, passed: 1, failed: 0, output: "" }),
+        maxReviewCycles: 0,
+      },
+    );
+    const result = await b.dispatch("src/a.ts", "foo");
+    expect(result.status).toBe("tests-green");
+    // Only 1 attempt consumed — the info round was free.
+    expect(result.attempts).toBe(1);
+    // Second prompt included the sibling info.
+    expect(prompts[1]).toContain("REQUESTED INFO");
+    expect(prompts[1]).toContain("helper");
+    expect(prompts[1]).toContain("return 1;"); // helper's body
+  });
+
+  it("request-info is ignored when the response also contains a body fence", async () => {
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "foo", { params: [], returnType: "number" });
+    let call = 0;
+    const b = createDesignDispatchBridge(
+      g,
+      async () => {
+        call++;
+        // Both fences in same response: body wins, info ignored.
+        return (
+          '```ts\nreturn 42;\n```\n' +
+          '```unit-tests\n[{"name":"u","code":"expect(foo(ctx)).toBe(42);"}]\n```\n' +
+          '```request-info\nstack-trace\n```'
+        );
+      },
+      {
+        runTests: async () => ({ ok: true, passed: 1, failed: 0, output: "" }),
+        maxReviewCycles: 0,
+      },
+    );
+    const result = await b.dispatch("src/a.ts", "foo");
+    expect(result.status).toBe("tests-green");
+    // Exactly one chat call — no info round fired.
+    expect(call).toBe(1);
+  });
+
+  it("request-info is bounded to MAX_INFO_ROUNDS — drops out and waits for body", async () => {
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "foo", { params: [], returnType: "number" });
+    let call = 0;
+    const b = createDesignDispatchBridge(
+      g,
+      async () => {
+        call++;
+        if (call <= 3) {
+          // Keep emitting info-only fences beyond the cap.
+          return "```request-info\nhelp\n```";
+        }
+        // Eventually emit a real body.
+        return (
+          '```ts\nreturn 1;\n```\n' +
+          '```unit-tests\n[{"name":"u","code":"expect(foo(ctx)).toBe(1);"}]\n```'
+        );
+      },
+      {
+        runTests: async () => ({ ok: true, passed: 1, failed: 0, output: "" }),
+        maxReviewCycles: 0,
+      },
+    );
+    const result = await b.dispatch("src/a.ts", "foo");
+    // Info rounds capped at 2, then dispatcher processes the (now empty)
+    // body response as a normal attempt. Call 3 had no body → retry.
+    // Call 4 has the body → green.
+    expect(result.status).toBe("tests-green");
+  });
+
   it("captures chat errors and reports failed", async () => {
     const g = createDesignGraph();
     g.addFunction("src/a.ts", "foo", { params: [], returnType: "number" });
