@@ -34,18 +34,30 @@ export interface RepairReport {
   error: string | null;
 }
 
-function isProjectTestFailure(failure: IntegrationFailure): boolean {
-  if (failure.testName === "project.runner") return true;
-  if (/project\.integration\.test/.test(failure.stackTrace)) return true;
-  return false;
-}
-
 /**
- * Exported so callers (integration loop) can detect whether a failure
- * is a test-file problem vs. a function-level bug without duplicating
- * the pattern logic.
+ * Decide whether a failure is best repaired in the project TEST FILE
+ * (rewrite the tests) vs. in a function body (regular fix-dispatch).
+ *
+ * Only the synthetic `project.runner` marker triggers repair. Stack-
+ * trace pattern matching is deliberately NOT used: every real
+ * integration test's stack trace includes `project.integration.test`
+ * (that's where the `expect(...)` line lives), so a regex check there
+ * would misroute every genuine function-level assertion failure.
+ *
+ * Tradeoff: we miss the rare case where the test FILE has a direct
+ * assertion not involving any function call. In practice such tests
+ * either (a) fail to load entirely → synthetic marker catches them,
+ * or (b) are simple enough that mis-routing to a function dispatch
+ * doesn't cause pathological loops.
+ *
+ * Exported so callers (integration loop) can detect without
+ * duplicating the rule.
  */
-export { isProjectTestFailure };
+export function isProjectTestFailure(
+  failure: IntegrationFailure,
+): boolean {
+  return failure.testName === "project.runner";
+}
 
 function renderCurrentTests(tests: readonly TestSpec[]): string {
   if (tests.length === 0) return "  (no tests currently)";

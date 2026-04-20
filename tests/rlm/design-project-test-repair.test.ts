@@ -25,15 +25,22 @@ describe("isProjectTestFailure", () => {
     ).toBe(true);
   });
 
-  it("flags failures whose stack points at the integration test file", () => {
+  it("does NOT flag a real assertion failure just because its stack passes through the test file", () => {
+    // EVERY real integration test failure's stack includes the test
+    // file (the assertion line lives there). Matching on that would
+    // misroute function-level failures to the test-file repair path
+    // and break function dispatch entirely. Bug found in review.
     expect(
       isProjectTestFailure({
-        testName: "some real test",
-        message: "asserted",
-        stackTrace:
-          "at /tmp/rlm-int-abc/project.integration.test.ts:15:3",
+        testName: "POST /sign adds an entry",
+        message: "expected 201 to be 200",
+        stackTrace: [
+          "AssertionError: expected 201 to be 200",
+          "    at /tmp/rlm-int-abc/project.integration.test.ts:25:3",
+          "    at handleRequest (/tmp/rlm-int-abc/handleRequest.ts:12:5)",
+        ].join("\n"),
       }),
-    ).toBe(true);
+    ).toBe(false);
   });
 
   it("does NOT flag a function-file failure", () => {
