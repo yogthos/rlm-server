@@ -31,6 +31,7 @@ import { designPlan } from "./design-plan.js";
 import { designCoherence } from "./design-coherence.js";
 import { healStructureCoherence } from "./design-coherence-heal.js";
 import { designLeafUpBuild } from "./design-leaf-up-build.js";
+import { designCleanup } from "./design-cleanup.js";
 import { enumeratePaths } from "./design-paths.js";
 import { designIntegrationTests } from "./design-integration-tests.js";
 import { reviewIntegrationTests } from "./design-integration-review.js";
@@ -177,6 +178,23 @@ export async function designPlanIntegration(
     debug(
       "plan-integration",
       `leaf-up build: ${buildReport.blocked.length} blocked (${buildReport.blocked.join(", ")}); continuing to integration`,
+    );
+  }
+
+  // ─── Phase 4b: post-leaf-up cleanup / tightening ─────────────────
+  // Analysis-only right now — scans observed bodies for functions
+  // that nothing reaches from an entry point (body-orphans) and
+  // spec.dependencies entries that the body never actually calls
+  // (unused-dep). Findings are logged so the integration phase has
+  // context; no automatic repair yet. A future round can wire an
+  // auto-fix dispatch here.
+  const cleanup = await designCleanup(graph);
+  if (!cleanup.ok) {
+    debug(
+      "plan-integration",
+      `cleanup: ${cleanup.findings.length} finding(s) — ${cleanup.findings
+        .map((f) => `${f.kind}:${f.name}${f.dep ? `(${f.dep})` : ""}`)
+        .join(", ")}`,
     );
   }
 
