@@ -171,15 +171,25 @@ export function createIntegrationRunner(
       // Synthesize a diagnostic failure so the loop / user knows the
       // runner itself went sideways.
       if (vitest.exitCode !== 0 && failures.length === 0) {
-        const stderrTail = vitest.stderr.slice(-800);
+        const stderrTail = vitest.stderr.slice(-2000);
         const stdoutTail = vitest.stdout.slice(-800);
+        // Log a short excerpt of stderr prominently — when this
+        // happens, the real error (syntax error in the test file,
+        // missing import, etc.) is almost always in stderr. Without
+        // visibility here, the integration loop just spins dispatching
+        // function fixes that can't resolve a test-file problem.
+        const stderrHead = stderrTail.split("\n").slice(0, 4).join(" | ");
+        debug(
+          "integration-loop",
+          `RUNNER CRASH exit=${vitest.exitCode} stderr[head]: ${stderrHead.slice(0, 400)}`,
+        );
         return {
           ok: false,
           failures: [
             {
               testName: "project.runner",
-              message: `vitest exited ${vitest.exitCode} with no parseable test results (timeout ${timeoutMs}ms may have fired)`,
-              stackTrace: `stderr:\n${stderrTail}\n\nstdout:\n${stdoutTail}`,
+              message: `vitest exited ${vitest.exitCode} with no parseable test results (timeout ${timeoutMs}ms may have fired). First stderr lines: ${stderrHead.slice(0, 500)}`,
+              stackTrace: `stderr (last 2000 chars):\n${stderrTail}\n\nstdout (last 800 chars):\n${stdoutTail}`,
             },
           ],
         };

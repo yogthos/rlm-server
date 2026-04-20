@@ -178,6 +178,10 @@ export interface DispatchRunOptions {
    *  update body AND unit tests coherently, not just iterate on the
    *  body against its current (possibly wrong) unit tests. */
   externalFeedback?: string;
+  /** Top-level user task, surfaced to the request-info `task` handler.
+   *  Helps the Implementer reconnect a single-function dispatch to the
+   *  overall goal when local spec context is ambiguous. */
+  task?: string;
 }
 
 export interface DesignDispatchBridge {
@@ -791,6 +795,7 @@ export function createDesignDispatchBridge(
       // diagnosis path, not a fresh build, so unit tests should be
       // revisited alongside the body.
       const externalFeedback = runOpts?.externalFeedback ?? null;
+      const userTask = runOpts?.task;
       const key = `${module}#${name}`;
       debug(
         "dispatch",
@@ -1144,6 +1149,7 @@ export function createDesignDispatchBridge(
             fnName: name,
             lastTestOutput: testOutput || undefined,
             lastFailureMessages: lastFullFailureMessages,
+            task: userTask,
           });
           accumulatedInfo = accumulatedInfo
             ? `${accumulatedInfo}\n\n--- round ${infoRounds} ---\n\n${info}`
