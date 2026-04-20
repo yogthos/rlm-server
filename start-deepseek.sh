@@ -1,6 +1,7 @@
 #!/bin/bash
 TMPDIR=/tmp \
     RLM_MODEL=deepseek-chat \
+    RLM_MAX_DECOMPOSE_DEPTH=8 \
     RLM_SANDBOX_TIMEOUT=7200000 \
     RLM_MAX_TOKENS=8192 \
     RLM_TIMEOUT_MS=600000 \

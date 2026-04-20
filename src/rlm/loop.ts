@@ -192,8 +192,14 @@ const COMPACT_KEEP_RECENT = 6;
 
 /** Max depth of recursive DECOMPOSE calls before we refuse further
  *  sub-planning. Above this, ask the Implementer to implement or fail
- *  rather than endlessly splitting. */
-const MAX_DECOMPOSE_DEPTH = 4;
+ *  rather than endlessly splitting. Override via RLM_MAX_DECOMPOSE_DEPTH
+ *  env var when a task's complexity genuinely needs a deeper call tree. */
+const MAX_DECOMPOSE_DEPTH = (() => {
+  const raw = process.env.RLM_MAX_DECOMPOSE_DEPTH;
+  if (!raw) return 4;
+  const n = Number.parseInt(raw, 10);
+  return Number.isFinite(n) && n > 0 ? n : 4;
+})();
 
 function buildChat(ctx: RLMContext) {
   return async (prompt: string): Promise<string> => {
