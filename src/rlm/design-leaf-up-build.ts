@@ -142,13 +142,15 @@ function pickReady(
     // All deps (spec + decomposition children) must be green.
     const specDeps = f.spec.dependencies.filter((d) => names.has(d));
     const treeDeps = f.children.filter((d) => names.has(d));
-    const allDeps = new Set<string>([...specDeps, ...treeDeps]);
-    if (![...allDeps].every((d) => green.has(d))) continue;
-    if ([...allDeps].some((d) => blocked.has(d))) {
-      // Dep explicitly broken — cascade block.
+    const allDeps = [...new Set<string>([...specDeps, ...treeDeps])];
+    // Cascade block FIRST — otherwise a parent of a blocked child
+    // just hangs in "not ready" until post-loop sweep, wasting
+    // iterations. Check blocked before green so cascading is immediate.
+    if (allDeps.some((d) => blocked.has(d))) {
       blocked.add(f.name);
       continue;
     }
+    if (!allDeps.every((d) => green.has(d))) continue;
     const L = levels.get(f.name) ?? Number.MAX_SAFE_INTEGER;
     candidates.push({ module: f.module, name: f.name, level: L });
   }
@@ -165,6 +167,10 @@ export async function designLeafUpBuild(
   const decomposed: string[] = [];
   const green = new Set<string>();
   const blocked = new Set<string>();
+  // Names we've already asked the architect to decompose at least once.
+  // A function that stagnates AGAIN after being decomposed gets
+  // blocked instead of looping through another no-op re-plan.
+  const decomposedOnce = new Set<string>();
   // Specless functions can't be dispatched.
   for (const f of graph.listFunctions()) {
     if (f.spec === null) blocked.add(f.name);
@@ -232,10 +238,23 @@ export async function designLeafUpBuild(
     }
 
     if (result.status === "stagnated" && options.decompose) {
+      // Bug-fix: don't re-decompose a function we already split once.
+      // A repeated stagnation means decomposition didn't help, so
+      // further re-planning is no-op waste (designPlan's resume
+      // logic skips phase-1 if children already exist).
+      if (decomposedOnce.has(name)) {
+        debug(
+          "leaf-up-build",
+          `${name} STAGNATED AGAIN after prior decompose — blocking`,
+        );
+        blocked.add(name);
+        continue;
+      }
       debug(
         "leaf-up-build",
         `${name} STAGNATED — clearing body + decomposing`,
       );
+      const childrenBefore = graph.listChildren(name).length;
       graph.clearImplementation(module, name);
       let ok: boolean;
       try {
@@ -248,15 +267,20 @@ export async function designLeafUpBuild(
         blocked.add(name);
         continue;
       }
-      if (ok) {
-        decomposed.push(name);
-        // Parent stays out of green/blocked; next iteration picks up
-        // the new children (they're ready with 0 deps), and eventually
-        // the parent becomes ready once children are green.
+      const childrenAfter = graph.listChildren(name).length;
+      // Bug-fix: if decompose "succeeded" but added no children, we'd
+      // re-dispatch the parent against the same deps and immediately
+      // stagnate again. Treat as a failed split.
+      if (!ok || childrenAfter <= childrenBefore) {
+        debug(
+          "leaf-up-build",
+          `${name} decompose failed (ok=${ok}, children ${childrenBefore}→${childrenAfter}) — blocking`,
+        );
+        blocked.add(name);
         continue;
       }
-      debug("leaf-up-build", `${name} decompose failed — blocking`);
-      blocked.add(name);
+      decomposedOnce.add(name);
+      decomposed.push(name);
       continue;
     }
 

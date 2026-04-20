@@ -261,6 +261,81 @@ describe("designLeafUpBuild", () => {
     expect(report.decomposed).toEqual([]);
   });
 
+  it("blocks the function when decompose returns true but adds no children", async () => {
+    // Guard against the empty-decompose infinite loop: if the LLM
+    // says "split done" but no children were actually added, we'd
+    // re-dispatch the parent against the same deps and stagnate again.
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "stuck", sig());
+    g.setSpec("src/a.ts", "stuck", spec());
+    const dispatch = async (_g: any, mod: string, name: string) => ({
+      module: mod,
+      name,
+      status: "stagnated" as const,
+      implementation: "// red",
+      attempts: 4,
+      testOutput: "",
+    });
+    let decomposeCalls = 0;
+    const decompose = async (_g: any, _fn: string) => {
+      decomposeCalls++;
+      return true; // lies — adds no children
+    };
+    const report = await designLeafUpBuild(g, { dispatch, decompose });
+    expect(report.ok).toBe(false);
+    expect(report.blocked).toContain("stuck");
+    // Only ONE decompose call — the no-children guard catches the
+    // lie on the first return.
+    expect(decomposeCalls).toBe(1);
+  });
+
+  it("blocks the function on SECOND stagnation after a prior decompose", async () => {
+    // Bug guard: a function that stagnates, gets decomposed, and then
+    // stagnates again on re-dispatch must be blocked. Decomposing a
+    // second time is no-op (designPlan's resume skips phase 1).
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "hard", sig());
+    g.setSpec("src/a.ts", "hard", spec());
+    let hardCalls = 0;
+    const dispatch = async (_g: any, mod: string, name: string) => {
+      if (name === "hard") {
+        hardCalls++;
+        return {
+          module: mod,
+          name,
+          status: "stagnated" as const,
+          implementation: "// red",
+          attempts: 4,
+          testOutput: "",
+        };
+      }
+      _g.setImplementation(mod, name, "// ok");
+      return {
+        module: mod,
+        name,
+        status: "tests-green" as const,
+        implementation: "// ok",
+        attempts: 1,
+        testOutput: "",
+      };
+    };
+    let decomposeCalls = 0;
+    const decompose = async (gg: any, fnName: string) => {
+      decomposeCalls++;
+      // Successfully add children on first call.
+      gg.addFunctionChild(fnName, "src/a.ts", "ch1", sig());
+      gg.setSpec("src/a.ts", "ch1", spec());
+      return true;
+    };
+    const report = await designLeafUpBuild(g, { dispatch, decompose });
+    // Decompose fired once. Parent re-dispatched after child green.
+    // Parent stagnates again → blocked (not re-decomposed).
+    expect(decomposeCalls).toBe(1);
+    expect(report.blocked).toContain("hard");
+    // hardCalls = 2: initial stagnation + retry stagnation.
+    expect(hardCalls).toBe(2);
+  });
+
   it("failed decompose blocks the function (no infinite retry)", async () => {
     const g = createDesignGraph();
     g.addFunction("src/a.ts", "unfixable", sig());
