@@ -31,7 +31,7 @@ import { designPlan } from "./design-plan.js";
 import { designCoherence } from "./design-coherence.js";
 import { healStructureCoherence } from "./design-coherence-heal.js";
 import { designLeafUpBuild } from "./design-leaf-up-build.js";
-import { designCleanup } from "./design-cleanup.js";
+import { designCleanup, autoRepairCleanup } from "./design-cleanup.js";
 import { enumeratePaths } from "./design-paths.js";
 import { designIntegrationTests } from "./design-integration-tests.js";
 import { reviewIntegrationTests } from "./design-integration-review.js";
@@ -182,13 +182,14 @@ export async function designPlanIntegration(
   }
 
   // ─── Phase 4b: post-leaf-up cleanup / tightening ─────────────────
-  // Analysis-only right now — scans observed bodies for functions
-  // that nothing reaches from an entry point (body-orphans) and
-  // spec.dependencies entries that the body never actually calls
-  // (unused-dep). Findings are logged so the integration phase has
-  // context; no automatic repair yet. A future round can wire an
-  // auto-fix dispatch here.
+  // Scans observed bodies for functions that nothing reaches from an
+  // entry point (body-orphans) and spec.dependencies entries that the
+  // body never actually calls (unused-dep). Attempts ONE round of
+  // auto-repair — re-dispatches the orphan's decomposition parent (or
+  // the unused-dep's caller) with feedback. Integration phase picks
+  // up anything that still isn't green.
   const cleanup = await designCleanup(graph);
+  let residualFindings = cleanup.findings;
   if (!cleanup.ok) {
     debug(
       "plan-integration",
@@ -196,6 +197,24 @@ export async function designPlanIntegration(
         .map((f) => `${f.kind}:${f.name}${f.dep ? `(${f.dep})` : ""}`)
         .join(", ")}`,
     );
+    const repair = await autoRepairCleanup(
+      graph,
+      cleanup.findings,
+      options.fixDispatch,
+    );
+    debug(
+      "plan-integration",
+      `cleanup auto-repair: repaired=[${repair.repaired.join(", ")}] failed=[${repair.failed.join(", ")}]`,
+    );
+    // Re-run cleanup to get residual findings after repair attempts.
+    const post = await designCleanup(graph);
+    residualFindings = post.findings;
+    if (!post.ok) {
+      debug(
+        "plan-integration",
+        `cleanup residual after repair: ${post.findings.length} finding(s)`,
+      );
+    }
   }
 
   // ─── Phase 5: path enumeration ────────────────────────────────────
@@ -263,6 +282,7 @@ export async function designPlanIntegration(
         failed: [],
         finalize: finalizeReport,
         files: finalizeReport.files,
+        cleanupFindings: residualFindings,
       };
     }
     return {
@@ -273,6 +293,7 @@ export async function designPlanIntegration(
       failed: [],
       finalize: finalizeReport,
       files: finalizeReport.files,
+      cleanupFindings: residualFindings,
     };
   } finally {
     if (projectDir) await projectDir.dispose();

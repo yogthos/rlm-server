@@ -40,6 +40,16 @@ export interface BuildReport {
    *  retries exhausted). Build still proceeds but these functions are
    *  implemented without a contract, so flag them here. */
   failedSpecs?: string[];
+  /** Post-leaf-up cleanup findings (body-orphan, unused-dep).
+   *  Populated by designPlanIntegration's phase 4b. A non-empty list
+   *  that survives auto-repair surfaces here for the caller's info. */
+  cleanupFindings?: {
+    kind: string;
+    module: string;
+    name: string;
+    dep?: string;
+    detail: string;
+  }[];
 }
 
 export interface BuildOptions {

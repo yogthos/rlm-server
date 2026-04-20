@@ -1,6 +1,9 @@
 import { describe, it, expect } from "vitest";
 import { createDesignGraph } from "../../src/rlm/design-graph.js";
-import { designCleanup } from "../../src/rlm/design-cleanup.js";
+import {
+  designCleanup,
+  autoRepairCleanup,
+} from "../../src/rlm/design-cleanup.js";
 
 const sig = () => ({ params: [], returnType: "void" });
 function spec(deps: string[] = []) {
@@ -119,6 +122,128 @@ describe("designCleanup — unused-dep detection", () => {
     const r = await designCleanup(g);
     const unused = r.findings.filter((f) => f.kind === "unused-dep");
     expect(unused).toEqual([]);
+  });
+});
+
+describe("autoRepairCleanup", () => {
+  it("re-dispatches the orphan's DECOMPOSITION PARENT with wire-in feedback", async () => {
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "parent", sig());
+    g.setSpec("src/a.ts", "parent", spec());
+    g.setImplementation("src/a.ts", "parent", "return;"); // doesn't call child
+    g.addFunctionChild("parent", "src/a.ts", "child", sig());
+    g.setSpec("src/a.ts", "child", spec());
+    g.setImplementation("src/a.ts", "child", "return;");
+    const cleanup = await designCleanup(g);
+    expect(cleanup.findings.some((f) => f.name === "child")).toBe(true);
+
+    const calls: Array<{ name: string; feedback?: string }> = [];
+    const dispatch = async (_g: any, mod: string, name: string, opts?: any) => {
+      calls.push({ name, feedback: opts?.feedback });
+      _g.setImplementation(mod, name, "ctx.fns.child(ctx);");
+      return {
+        module: mod,
+        name,
+        status: "tests-green" as const,
+        implementation: "ctx.fns.child(ctx);",
+        attempts: 1,
+        testOutput: "",
+      };
+    };
+    const report = await autoRepairCleanup(g, cleanup.findings, dispatch);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].name).toBe("parent"); // target is parent, not child
+    expect(calls[0].feedback).toMatch(/child/);
+    expect(calls[0].feedback).toMatch(/wire|call.*ctx\.fns/i);
+    expect(report.repaired).toContain("parent");
+  });
+
+  it("re-dispatches the caller with unused-dep feedback", async () => {
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "caller", sig());
+    g.setSpec("src/a.ts", "caller", spec(["unusedDep"]));
+    g.setImplementation("src/a.ts", "caller", "return;");
+    g.addFunction("src/a.ts", "unusedDep", sig());
+    g.setSpec("src/a.ts", "unusedDep", spec());
+    g.setImplementation("src/a.ts", "unusedDep", "return;");
+    const cleanup = await designCleanup(g);
+    const calls: Array<{ name: string; feedback?: string }> = [];
+    const dispatch = async (_g: any, mod: string, name: string, opts?: any) => {
+      calls.push({ name, feedback: opts?.feedback });
+      return {
+        module: mod,
+        name,
+        status: "tests-green" as const,
+        implementation: "// ok",
+        attempts: 1,
+        testOutput: "",
+      };
+    };
+    await autoRepairCleanup(g, cleanup.findings, dispatch);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].name).toBe("caller");
+    expect(calls[0].feedback).toMatch(/unusedDep/);
+    expect(calls[0].feedback).toMatch(/drop.*or.*call|spec\.dependencies/i);
+  });
+
+  it("groups multiple findings for the same target into ONE dispatch", async () => {
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "parent", sig());
+    g.setSpec("src/a.ts", "parent", spec());
+    g.setImplementation("src/a.ts", "parent", "return;");
+    g.addFunctionChild("parent", "src/a.ts", "childA", sig());
+    g.setSpec("src/a.ts", "childA", spec());
+    g.setImplementation("src/a.ts", "childA", "return;");
+    g.addFunctionChild("parent", "src/a.ts", "childB", sig());
+    g.setSpec("src/a.ts", "childB", spec());
+    g.setImplementation("src/a.ts", "childB", "return;");
+    const cleanup = await designCleanup(g);
+    // Two body-orphan findings, both targeting parent.
+    expect(
+      cleanup.findings.filter((f) => f.kind === "body-orphan"),
+    ).toHaveLength(2);
+    const calls: Array<{ name: string; feedback?: string }> = [];
+    const dispatch = async (_g: any, mod: string, name: string, opts?: any) => {
+      calls.push({ name, feedback: opts?.feedback });
+      return {
+        module: mod,
+        name,
+        status: "tests-green" as const,
+        implementation: "// ok",
+        attempts: 1,
+        testOutput: "",
+      };
+    };
+    await autoRepairCleanup(g, cleanup.findings, dispatch);
+    // ONE dispatch, not two.
+    expect(calls).toHaveLength(1);
+    expect(calls[0].name).toBe("parent");
+    // Both children mentioned in feedback.
+    expect(calls[0].feedback).toMatch(/childA/);
+    expect(calls[0].feedback).toMatch(/childB/);
+  });
+
+  it("reports failed repairs when dispatch doesn't go green", async () => {
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "parent", sig());
+    g.setSpec("src/a.ts", "parent", spec());
+    g.setImplementation("src/a.ts", "parent", "return;");
+    g.addFunctionChild("parent", "src/a.ts", "stuck", sig());
+    g.setSpec("src/a.ts", "stuck", spec());
+    g.setImplementation("src/a.ts", "stuck", "return;");
+    const cleanup = await designCleanup(g);
+    const dispatch = async (_g: any, mod: string, name: string) => ({
+      module: mod,
+      name,
+      status: "stagnated" as const,
+      implementation: "// stuck",
+      attempts: 4,
+      testOutput: "",
+      error: "stagnation",
+    });
+    const report = await autoRepairCleanup(g, cleanup.findings, dispatch);
+    expect(report.repaired).toEqual([]);
+    expect(report.failed).toContain("parent");
   });
 });
 

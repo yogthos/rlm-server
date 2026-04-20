@@ -26,6 +26,7 @@
  */
 
 import type { DesignGraph } from "./design-graph.js";
+import type { DispatchResult } from "./design-dispatch.js";
 import { analyzeBody } from "./body-analyzer.js";
 import { debug } from "./debug.js";
 
@@ -141,4 +142,101 @@ export async function designCleanup(
     entryPoints,
     reachable: [...reachable].sort(),
   };
+}
+
+export type FixDispatch = (
+  graph: DesignGraph,
+  module: string,
+  name: string,
+  opts?: { feedback?: string; projectDir?: string },
+) => Promise<DispatchResult>;
+
+export interface AutoRepairReport {
+  /** Function names whose fix-dispatch returned tests-green. */
+  repaired: string[];
+  /** Function names whose fix-dispatch failed / stagnated. */
+  failed: string[];
+}
+
+/**
+ * Basic auto-repair for cleanup findings. Groups findings by the
+ * function that needs to be re-dispatched:
+ *
+ *   - `body-orphan X` → re-dispatch X's decomposition parent with
+ *     feedback "wire in ctx.fns.X or drop it."
+ *   - `unused-dep (X, Y)` → re-dispatch X with feedback "spec lists
+ *     Y but body doesn't call it; drop or use."
+ *
+ * One dispatch per target function per invocation (findings pointing
+ * at the same target share a single dispatch with combined feedback).
+ * No retry/bounding beyond that — if fix dispatch doesn't resolve,
+ * the integration loop will surface the remaining failures. Keeps
+ * the pipeline forward-moving rather than iterating on the same
+ * functions indefinitely.
+ */
+export async function autoRepairCleanup(
+  graph: DesignGraph,
+  findings: CleanupFinding[],
+  dispatch: FixDispatch,
+): Promise<AutoRepairReport> {
+  const targets = new Map<
+    string,
+    { module: string; name: string; messages: string[] }
+  >();
+  for (const f of findings) {
+    if (f.kind === "body-orphan") {
+      // Target = the orphan's decomposition parent (the function
+      // whose body needs to wire in the orphan).
+      const orphan = graph.listFunctions().find((x) => x.name === f.name);
+      if (!orphan?.parent) continue;
+      const parent = graph
+        .listFunctions()
+        .find((x) => x.name === orphan.parent);
+      if (!parent) continue;
+      const key = `${parent.module}#${parent.name}`;
+      if (!targets.has(key)) {
+        targets.set(key, {
+          module: parent.module,
+          name: parent.name,
+          messages: [],
+        });
+      }
+      targets.get(key)!.messages.push(
+        `Cleanup: child function "${f.name}" has a green body but your body doesn't call ctx.fns.${f.name} — wire it into your assembly or drop "${f.name}" from the plan.`,
+      );
+    } else if (f.kind === "unused-dep" && f.dep) {
+      // Target = the caller whose spec lists the unused dep.
+      const key = `${f.module}#${f.name}`;
+      if (!targets.has(key)) {
+        targets.set(key, { module: f.module, name: f.name, messages: [] });
+      }
+      targets.get(key)!.messages.push(
+        `Cleanup: spec.dependencies lists "${f.dep}" but your body doesn't call ctx.fns.${f.dep} — drop the dep or call it.`,
+      );
+    }
+  }
+  const repaired: string[] = [];
+  const failed: string[] = [];
+  for (const { module, name, messages } of targets.values()) {
+    debug(
+      "cleanup",
+      `auto-repair dispatch ${name} — ${messages.length} finding(s)`,
+    );
+    let result: DispatchResult;
+    try {
+      result = await dispatch(graph, module, name, {
+        feedback: messages.join("\n\n"),
+      });
+    } catch (e) {
+      debug(
+        "cleanup",
+        `${name} repair threw: ${e instanceof Error ? e.message : String(e)}`,
+      );
+      failed.push(name);
+      continue;
+    }
+    if (result.status === "tests-green") repaired.push(name);
+    else failed.push(name);
+  }
+  return { repaired, failed };
 }
