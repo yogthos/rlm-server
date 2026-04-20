@@ -1,5 +1,8 @@
 import { describe, it, expect } from "vitest";
-import { parseVitestFailures } from "../../src/rlm/design-integration-runner.js";
+import {
+  parseVitestFailures,
+  parseTscErrors,
+} from "../../src/rlm/design-integration-runner.js";
 
 describe("parseVitestFailures", () => {
   it("returns an empty array on non-JSON output", () => {
@@ -116,5 +119,47 @@ describe("parseVitestFailures", () => {
     const failures = parseVitestFailures(json);
     expect(failures).toHaveLength(1);
     expect(failures[0].testName).toBe("t");
+  });
+});
+
+describe("parseTscErrors", () => {
+  it("returns an empty array when tsc output is clean", () => {
+    expect(parseTscErrors("")).toEqual([]);
+    expect(parseTscErrors("some unrelated output\n")).toEqual([]);
+  });
+
+  it("extracts one IntegrationFailure per tsc error", () => {
+    const stdout = [
+      "src/server.js/handleRequest.ts:12:5 - error TS2322: Type 'string' is not assignable to type 'number'.",
+      "src/server.js/parseFormData.ts:25:9 - error TS2532: Object is possibly 'undefined'.",
+    ].join("\n");
+    const failures = parseTscErrors(stdout);
+    expect(failures).toHaveLength(2);
+    expect(failures[0].testName).toContain("handleRequest");
+    expect(failures[0].message).toContain(
+      "not assignable to type 'number'",
+    );
+    expect(failures[0].stackTrace).toBe(
+      "at src/server.js/handleRequest.ts:12:5",
+    );
+    expect(failures[1].stackTrace).toBe(
+      "at src/server.js/parseFormData.ts:25:9",
+    );
+  });
+
+  it("handles errors mixed with other tsc output lines", () => {
+    const stdout = [
+      "tsc compiling...",
+      "",
+      "src/foo.ts:1:1 - error TS1005: ';' expected.",
+      "",
+      "Found 1 error in 1 file.",
+      "",
+      "Errors  Files",
+      "     1  src/foo.ts:1",
+    ].join("\n");
+    const failures = parseTscErrors(stdout);
+    expect(failures).toHaveLength(1);
+    expect(failures[0].message).toContain("';' expected");
   });
 });

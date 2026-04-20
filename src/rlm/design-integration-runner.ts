@@ -38,6 +38,31 @@ export interface IntegrationRunnerOptions {
 }
 
 /**
+ * Parse tsc --noEmit stdout into IntegrationFailure entries.
+ *
+ * tsc format per error:
+ *   path/to/file.ts:line:col - error TS####: message text
+ *
+ * The stackTrace field is synthesized as `at <file>:<line>:<col>` so
+ * the attribution path can map it to a function the same way it does
+ * for vitest stack frames. One IntegrationFailure per type error.
+ */
+export function parseTscErrors(stdout: string): IntegrationFailure[] {
+  const failures: IntegrationFailure[] = [];
+  const re = /^(.+?):(\d+):(\d+)\s+-\s+error\s+TS\d+:\s+(.*)$/gm;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(stdout)) !== null) {
+    const [, file, line, col, msg] = m;
+    failures.push({
+      testName: `typecheck ${file}`,
+      message: msg.trim(),
+      stackTrace: `at ${file}:${line}:${col}`,
+    });
+  }
+  return failures;
+}
+
+/**
  * Parse vitest --reporter=json stdout into structured failures.
  *
  * Pure function — takes a JSON string, returns `IntegrationFailure[]`.
@@ -136,6 +161,28 @@ async function createScaffoldDir(tmpRoot: string): Promise<string> {
       `symlink node_modules failed (continuing): ${e instanceof Error ? e.message : String(e)}`,
     );
   }
+  // tsconfig for `tsc --noEmit -p dir`. Matches finalize's default
+  // shape so runtime and typecheck agree on module resolution.
+  await writeFile(
+    path.join(dir, "tsconfig.json"),
+    JSON.stringify(
+      {
+        compilerOptions: {
+          target: "ES2022",
+          module: "ESNext",
+          moduleResolution: "Bundler",
+          strict: true,
+          noEmit: true,
+          skipLibCheck: true,
+          esModuleInterop: true,
+        },
+        include: ["**/*.ts"],
+      },
+      null,
+      2,
+    ),
+    "utf8",
+  );
   return dir;
 }
 
@@ -160,11 +207,28 @@ export function createIntegrationRunner(
         dir,
         timeoutMs,
       );
-      const failures = parseVitestFailures(vitest.stdout);
+      const vitestFailures = parseVitestFailures(vitest.stdout);
       debug(
         "integration-loop",
-        `ran vitest — exit=${vitest.exitCode} failures=${failures.length}`,
+        `ran vitest — exit=${vitest.exitCode} failures=${vitestFailures.length}`,
       );
+      // Run tsc in parallel with the integration test signal. Type
+      // errors flow through the same fix-dispatch channel as test
+      // failures — each tsc error becomes an IntegrationFailure whose
+      // stack trace points at the offending file:line so attribution
+      // maps it to a function just like a vitest frame.
+      const tsc = await shellOut(
+        "npx",
+        ["tsc", "--noEmit", "-p", dir],
+        dir,
+        timeoutMs,
+      );
+      const tscFailures = parseTscErrors(tsc.stdout);
+      debug(
+        "integration-loop",
+        `ran tsc — exit=${tsc.exitCode} errors=${tscFailures.length}`,
+      );
+      const failures = [...vitestFailures, ...tscFailures];
       // If vitest crashed / was SIGKILL'd and stdout has no parseable
       // failures, we'd silently return `ok:false, failures:[]` and the
       // integration loop would bail with "no failures attributable."
@@ -195,7 +259,10 @@ export function createIntegrationRunner(
         };
       }
       return {
-        ok: vitest.exitCode === 0 && failures.length === 0,
+        ok:
+          vitest.exitCode === 0 &&
+          tsc.exitCode === 0 &&
+          failures.length === 0,
         failures,
       };
     } finally {
