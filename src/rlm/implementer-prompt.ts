@@ -317,6 +317,20 @@ export async function buildImplementerPrompt(
     "  piling up across cycles.",
     "- Tests are YOURS. Siblings' tests and project-level tests are out",
     "  of scope for you.",
+    "",
+    "Need more context before committing? Emit a ```request-info fence",
+    "INSTEAD of (or alongside) your body. One request per line:",
+    "```request-info",
+    "stack-trace              # full vitest traces from the last run",
+    "sibling:<name>           # a sibling's body + spec + tests",
+    "spec:<name>              # full spec of a function (defaults to self)",
+    "callers                  # who depends on this function",
+    "related                  # ±1 hop subgraph",
+    "help                     # list all supported request kinds",
+    "```",
+    "The harness resolves each request and re-prompts you with answers",
+    "— no attempt is consumed. Use this when the feedback isn't enough",
+    "to diagnose. Max 2 info rounds per attempt.",
   ];
 
   if (feedback) {

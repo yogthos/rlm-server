@@ -19,6 +19,11 @@ import { buildImplementerPrompt } from "./implementer-prompt.js";
 import { runTests, type TestRunResult } from "./test-runner.js";
 import { debug } from "./debug.js";
 import { analyzeBody, type BodyAnalysis } from "./body-analyzer.js";
+import {
+  extractRequestInfo,
+  resolveRequests,
+  type InfoRequest,
+} from "./design-request-info.js";
 
 /**
  * Reconcile `spec.dependencies` with the body's observed `ctx.fns.<X>`
@@ -1022,6 +1027,13 @@ export function createDesignDispatchBridge(
       // Actual attempt count — separate from the loop var so the log
       // message on exhaustion shows what really ran, not the max.
       let actualAttempts = 0;
+      // Last test run's full failure messages, surfaced via the
+      // `stack-trace` request-info handler. Populated per test run.
+      let lastFullFailureMessages: Map<string, string> | undefined;
+      // Info requested by the Implementer in a prior round of THIS
+      // attempt. Accumulated across info-rounds and prepended to the
+      // prompt; cleared when a real body is produced.
+      let pendingInfoResponse: string | null = null;
       for (let attempt = 0; attempt < maxAttempts; attempt++) {
         actualAttempts = attempt + 1;
         // Use feedback on attempt 0 too, as long as something primed it
@@ -1041,7 +1053,7 @@ export function createDesignDispatchBridge(
         ]
           .filter((s): s is string => s !== null && s.length > 0)
           .join("\n\n");
-        const prompt = await buildImplementerPrompt(
+        let prompt = await buildImplementerPrompt(
           graph,
           module,
           name,
@@ -1081,16 +1093,48 @@ export function createDesignDispatchBridge(
           `attempt ${attempt + 1}/${maxAttempts} ${key} prompt=${prompt.length}ch`,
         );
         debug("progress", `dispatch: ${key} attempt ${attempt + 1}/${maxAttempts}`);
+        // Request-info channel: let the Implementer ask for more
+        // context (stack traces, sibling bodies, specs, …) before
+        // committing to a body. Bounded per attempt so a confused
+        // model can't loop indefinitely on info requests.
+        const MAX_INFO_ROUNDS = 2;
+        let infoRounds = 0;
         let response: string;
-        try {
-          response = await chat(prompt);
-        } catch (e) {
-          lastError = e instanceof Error ? e.message : String(e);
-          debug("dispatch", `chat error ${key}: ${lastError}`);
-          break;
+        while (true) {
+          try {
+            response = await chat(prompt);
+          } catch (e) {
+            lastError = e instanceof Error ? e.message : String(e);
+            debug("dispatch", `chat error ${key}: ${lastError}`);
+            response = "";
+            break;
+          }
+          debug("dispatch", `response ${key} len=${response.length}ch`);
+          const infoReqs = extractRequestInfo(response);
+          if (!infoReqs || infoRounds >= MAX_INFO_ROUNDS) break;
+          infoRounds++;
+          debug(
+            "dispatch",
+            `${key} request-info round ${infoRounds}/${MAX_INFO_ROUNDS}: ${infoReqs.map((r: InfoRequest) => r.raw).join(", ")}`,
+          );
+          const info = await resolveRequests(infoReqs, {
+            graph,
+            module,
+            fnName: name,
+            lastTestOutput: testOutput || undefined,
+            lastFailureMessages: lastFullFailureMessages,
+          });
+          pendingInfoResponse = pendingInfoResponse
+            ? `${pendingInfoResponse}\n\n---\n\n${info}`
+            : info;
+          // Rebuild the prompt with the info appended so the next chat
+          // call sees the answers. Don't increment `attempt`.
+          const infoBlock = `\n\n---\n\nREQUESTED INFO:\n${pendingInfoResponse}\n\nNow respond with body + tests (or another request-info fence if you need more).`;
+          prompt = prompt + infoBlock;
         }
-        debug("dispatch", `response ${key} len=${response.length}ch`);
-
+        if (lastError && !response) {
+          break; // chat threw
+        }
         const body = extractBody(response);
         if (!body) {
           lastError =
@@ -1212,6 +1256,10 @@ export function createDesignDispatchBridge(
         }
 
         const tr = await testFn(graph, { module, name, body });
+        // Capture full failure stacks so the request-info channel's
+        // `stack-trace` handler can surface them on the next attempt
+        // if the Implementer asks.
+        lastFullFailureMessages = tr.fullFailureMessages;
         // Stagnation detection: if this attempt's body is within 5% of
         // the previous attempt's length AND the failure count matches,
         // the Implementer is spinning on cosmetic tweaks. Flag the

@@ -34,6 +34,10 @@ export interface TestRunResult {
    *  even if the error text wording differs. Optional for back-compat
    *  with older mocks; absent means "unknown." */
   failingTestNames?: string[];
+  /** Map of fully-qualified test name → full `failureMessages[0]` text
+   *  including the stack trace. Surfaced to the Implementer on request
+   *  via the `stack-trace` info channel. Optional for back-compat. */
+  fullFailureMessages?: Map<string, string>;
 }
 
 export function materializeWithOverride(
@@ -288,6 +292,7 @@ function invokeTestRunner(
         failed: parsed?.failed ?? 0,
         output: output.slice(-4000),
         failingTestNames: parsed?.failingTestNames ?? [],
+        fullFailureMessages: parsed?.fullFailureMessages ?? new Map(),
       });
     });
   });
@@ -380,6 +385,8 @@ export interface VitestCounts {
   failureDigest: string;
   /** Fully-qualified names of failing tests (sorted, deduped). */
   failingTestNames: string[];
+  /** Map of test name → full failure message (including stack trace). */
+  fullFailureMessages: Map<string, string>;
 }
 
 function parseVitestJson(stdout: string): VitestCounts | null {
@@ -391,17 +398,21 @@ function parseVitestJson(stdout: string): VitestCounts | null {
     let failed = 0;
     const failures: string[] = [];
     const failingNames = new Set<string>();
+    const fullFailureMessages = new Map<string, string>();
     const results = Array.isArray(json.testResults) ? json.testResults : [];
     for (const file of results) {
       for (const t of file.assertionResults ?? []) {
         if (t.status === "passed") passed++;
         else if (t.status === "failed") {
           failed++;
-          const title =
-            t.fullName ?? t.title ?? t.ancestorTitles?.join(" > ") ?? "(test)";
-          failingNames.add(String(title));
+          const title = String(
+            t.fullName ?? t.title ?? t.ancestorTitles?.join(" > ") ?? "(test)",
+          );
+          failingNames.add(title);
           const msgs = Array.isArray(t.failureMessages) ? t.failureMessages : [];
-          const firstLine = (msgs[0] ?? "").split("\n")[0].slice(0, 240);
+          const raw = (msgs[0] ?? "").toString();
+          if (raw) fullFailureMessages.set(title, raw);
+          const firstLine = raw.split("\n")[0].slice(0, 240);
           failures.push(`✗ ${title}: ${firstLine || "(no failure message)"}`);
         }
       }
@@ -413,6 +424,7 @@ function parseVitestJson(stdout: string): VitestCounts | null {
       failed,
       failureDigest: failures.slice(0, 20).join("\n"),
       failingTestNames: [...failingNames].sort(),
+      fullFailureMessages,
     };
   } catch {
     return null;
