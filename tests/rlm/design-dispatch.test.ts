@@ -2202,6 +2202,57 @@ describe("createDesignDispatchBridge", () => {
     expect(g.getFunction("src/a.ts", "foo")!.implementation).toBe("return 1;");
   });
 
+  it("propagates chat error after MAX_ABORT_RETRIES consecutive aborts", async () => {
+    // When the transport is genuinely stuck (API down, persistent
+    // socket timeout), abort-retry exhausts its budget and the dispatch
+    // sees the original error.
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "foo", { params: [], returnType: "number" });
+    let callCount = 0;
+    const b = createDesignDispatchBridge(
+      g,
+      async () => {
+        callCount++;
+        throw new Error("This operation was aborted");
+      },
+      {
+        runTests: async () => ({ ok: true, passed: 0, failed: 0, output: "" }),
+        maxReviewCycles: 0,
+        maxAttempts: 2,
+      },
+    );
+    const result = await b.dispatch("src/a.ts", "foo");
+    expect(result.status).toBe("failed");
+    expect(result.error).toMatch(/abort/i);
+    // MAX_ABORT_RETRIES=2 → 3 calls per dispatch attempt. We break out
+    // of the outer loop on chat error, so we only see one attempt's
+    // worth of aborts (3 calls), not 2 × 3.
+    expect(callCount).toBe(3);
+  });
+
+  it("does NOT abort-retry on non-abort chat errors (propagates immediately)", async () => {
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "foo", { params: [], returnType: "number" });
+    let callCount = 0;
+    const b = createDesignDispatchBridge(
+      g,
+      async () => {
+        callCount++;
+        throw new Error("500 Internal Server Error");
+      },
+      {
+        runTests: async () => ({ ok: true, passed: 0, failed: 0, output: "" }),
+        maxReviewCycles: 0,
+        maxAttempts: 2,
+      },
+    );
+    const result = await b.dispatch("src/a.ts", "foo");
+    expect(result.status).toBe("failed");
+    // Only one call — non-abort errors propagate on first hit, the
+    // outer dispatch loop breaks.
+    expect(callCount).toBe(1);
+  });
+
   it("retries on chat abort — transient transport failures don't burn attempts", async () => {
     const g = createDesignGraph();
     g.addFunction("src/a.ts", "foo", { params: [], returnType: "number" });

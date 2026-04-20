@@ -83,7 +83,11 @@ export function loadConfig(overrides?: Partial<ServerConfig>): ServerConfig {
       timeoutMs:
         num(process.env.RLM_TIMEOUT_MS) ??
         overrides?.llm?.timeoutMs ??
-        120_000,
+        // 5 min default — deepseek can exceed 2 min on complex prompts,
+        // and local GGUF inference on long contexts routinely hits
+        // 3-4 min. Too short a default causes spurious AbortController
+        // exhaustion before the model has a chance to respond.
+        300_000,
       contextWindow:
         num(process.env.RLM_CONTEXT_WINDOW) ??
         overrides?.llm?.contextWindow ??

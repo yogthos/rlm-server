@@ -143,6 +143,38 @@ export interface DesignDispatchBridge {
 
 export type ChatFn = (prompt: string) => Promise<string>;
 
+/**
+ * Wrap a ChatFn with abort-retry: on abort-like errors (HTTP signal
+ * fired even though the model might have produced a response), retry
+ * the same prompt up to 2 times before giving up. Non-abort errors
+ * propagate on first occurrence.
+ *
+ * Applies uniformly to the Implementer dispatch, architect review,
+ * and the IMPLEMENT-vs-DECOMPOSE decision. All three go to the same
+ * LLM backend and hit the same transport timeout.
+ */
+const MAX_ABORT_RETRIES = 2;
+export function withAbortRetry(chat: ChatFn): ChatFn {
+  return async (prompt: string): Promise<string> => {
+    let lastAbort: unknown = null;
+    for (let i = 0; i <= MAX_ABORT_RETRIES; i++) {
+      try {
+        return await chat(prompt);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        const isAbort = /abort|AbortError/i.test(msg);
+        if (!isAbort || i === MAX_ABORT_RETRIES) throw e;
+        lastAbort = e;
+        debug(
+          "dispatch",
+          `chat aborted — abort-retry ${i + 1}/${MAX_ABORT_RETRIES}`,
+        );
+      }
+    }
+    throw lastAbort ?? new Error("unreachable");
+  };
+}
+
 export type TestFn = (
   graph: DesignGraph,
   candidate: { module: string; name: string; body: string },
@@ -676,11 +708,15 @@ function replaceTestSet(
 
 export function createDesignDispatchBridge(
   graph: DesignGraph,
-  chat: ChatFn,
+  rawChat: ChatFn,
   options: DispatchOptions = {},
 ): DesignDispatchBridge {
   const maxAttempts = options.maxAttempts ?? 8;
   const maxReviewCycles = options.maxReviewCycles ?? 3;
+  // Wrap the host chat once — every call site inside the dispatcher
+  // (Implementer attempts, architect review, decompose decision) gets
+  // the abort retry.
+  const chat = withAbortRetry(rawChat);
   const rawTestFn = options.runTests ?? runTests;
   const projectDir = options.projectDir;
   const testFn: TestFn = projectDir
@@ -935,30 +971,6 @@ export function createDesignDispatchBridge(
         } // close else (structural check passed)
       }
 
-      // Wrap chat with an abort-retry so transient transport failures
-      // (the LLM's HTTP signal timing out even though the model would
-      // have produced a response) don't burn an attempt. Only retries
-      // on abort-like errors; real model/API failures propagate.
-      const MAX_ABORT_RETRIES = 2;
-      const chatWithAbortRetry = async (prompt: string): Promise<string> => {
-        let lastAbort: unknown = null;
-        for (let i = 0; i <= MAX_ABORT_RETRIES; i++) {
-          try {
-            return await chat(prompt);
-          } catch (e) {
-            const msg = e instanceof Error ? e.message : String(e);
-            const isAbort = /abort|AbortError/i.test(msg);
-            if (!isAbort || i === MAX_ABORT_RETRIES) throw e;
-            lastAbort = e;
-            debug(
-              "dispatch",
-              `chat aborted ${key} — abort-retry ${i + 1}/${MAX_ABORT_RETRIES}`,
-            );
-          }
-        }
-        throw lastAbort ?? new Error("unreachable");
-      };
-
       // Actual attempt count — separate from the loop var so the log
       // message on exhaustion shows what really ran, not the max.
       let actualAttempts = 0;
@@ -1023,7 +1035,7 @@ export function createDesignDispatchBridge(
         debug("progress", `dispatch: ${key} attempt ${attempt + 1}/${maxAttempts}`);
         let response: string;
         try {
-          response = await chatWithAbortRetry(prompt);
+          response = await chat(prompt);
         } catch (e) {
           lastError = e instanceof Error ? e.message : String(e);
           debug("dispatch", `chat error ${key}: ${lastError}`);
