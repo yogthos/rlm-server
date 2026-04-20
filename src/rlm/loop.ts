@@ -561,7 +561,9 @@ async function initHandler(ctx: RLMContext): Promise<RLMContext> {
             projectDir: opts?.projectDir,
             decompose,
             maxReviewCycles: ctx.maxReviewCycles,
-          }).dispatch(module, name);
+          }).dispatch(module, name, {
+            externalFeedback: opts?.feedback,
+          });
         return designPlanIntegration(ctx.designGraph, task, {
           chat,
           hardenDispatch,

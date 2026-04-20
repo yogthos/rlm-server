@@ -124,8 +124,21 @@ export interface DispatchResult {
   error?: string;
 }
 
+export interface DispatchRunOptions {
+  /** External feedback threaded into the Implementer's first prompt.
+   *  Used by the integration loop to carry test-failure context
+   *  ("this project test red'd because X") so the Implementer can
+   *  update body AND unit tests coherently, not just iterate on the
+   *  body against its current (possibly wrong) unit tests. */
+  externalFeedback?: string;
+}
+
 export interface DesignDispatchBridge {
-  dispatch(module: string, name: string): Promise<DispatchResult>;
+  dispatch(
+    module: string,
+    name: string,
+    opts?: DispatchRunOptions,
+  ): Promise<DispatchResult>;
 }
 
 export type ChatFn = (prompt: string) => Promise<string>;
@@ -675,11 +688,17 @@ export function createDesignDispatchBridge(
     : rawTestFn;
 
   return {
-    async dispatch(module, name) {
+    async dispatch(module, name, runOpts) {
       const fn = graph.getFunction(module, name);
       if (!fn) {
         throw new Error(`function not found: ${module}#${name}`);
       }
+      // External feedback (typically integration-loop failure context)
+      // primes the first prompt like architect/analyzer feedback does.
+      // Signals the Implementer that the call came from a failure
+      // diagnosis path, not a fresh build, so unit tests should be
+      // revisited alongside the body.
+      const externalFeedback = runOpts?.externalFeedback ?? null;
       const key = `${module}#${name}`;
       debug(
         "dispatch",
@@ -769,6 +788,12 @@ export function createDesignDispatchBridge(
       let reviewCycles = 0;
       let pendingArchitectFeedback: string | null = null;
       let pendingAnalyzerFeedback: string | null = null;
+      // Prime the first prompt with external feedback if the caller
+      // supplied it (integration-loop failure context). Formatted like
+      // a reviewer critique so the Implementer reads it as actionable.
+      let pendingExternalFeedback: string | null = externalFeedback
+        ? `[integration-loop feedback]\n${externalFeedback}`
+        : null;
       let lastAllTestsFailed = false;
       // Prior architect review feedback, carried forward to subsequent
       // review cycles so the reviewer can see what it said last time
@@ -903,7 +928,17 @@ export function createDesignDispatchBridge(
         // regenerate wastes a cycle rediscovering the problem.
         const hasPrimedFeedback =
           pendingArchitectFeedback !== null ||
-          pendingAnalyzerFeedback !== null;
+          pendingAnalyzerFeedback !== null ||
+          pendingExternalFeedback !== null;
+        // External feedback rides on the architect channel because the
+        // prompt template renders that field as high-priority "you must
+        // address this" feedback.
+        const architectFeedbackCombined = [
+          pendingExternalFeedback,
+          pendingArchitectFeedback,
+        ]
+          .filter((s): s is string => s !== null && s.length > 0)
+          .join("\n\n");
         const prompt = await buildImplementerPrompt(
           graph,
           module,
@@ -915,7 +950,10 @@ export function createDesignDispatchBridge(
                 maxAttempts,
                 previousBody,
                 testOutput,
-                architectFeedback: pendingArchitectFeedback ?? undefined,
+                architectFeedback:
+                  architectFeedbackCombined.length > 0
+                    ? architectFeedbackCombined
+                    : undefined,
                 analyzerFeedback: pendingAnalyzerFeedback ?? undefined,
                 allTestsFailed: lastAllTestsFailed,
                 stagnating,
@@ -932,6 +970,7 @@ export function createDesignDispatchBridge(
         // REVISE-continue) leave it cleared.
         pendingArchitectFeedback = null;
         pendingAnalyzerFeedback = null;
+        pendingExternalFeedback = null;
         lastAllTestsFailed = false;
         stagnating = false;
 

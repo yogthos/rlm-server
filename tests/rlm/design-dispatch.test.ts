@@ -2074,6 +2074,36 @@ describe("createDesignDispatchBridge", () => {
     expect(attempts).toBeLessThan(8);
   });
 
+  it("threads externalFeedback into the implementer prompt (integration-loop path)", async () => {
+    // When the integration loop calls dispatch with a failure message,
+    // the dispatcher must prime the Implementer's first prompt with
+    // that feedback — otherwise the Implementer re-runs the same
+    // failing logic without knowing what went wrong at the project
+    // level.
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "foo", { params: [], returnType: "number" });
+    const seenPrompts: string[] = [];
+    const b = createDesignDispatchBridge(
+      g,
+      async (p) => {
+        seenPrompts.push(p);
+        return (
+          '```ts\nreturn 1;\n```\n' +
+          '```unit-tests\n[{"name":"u","code":"expect(foo(ctx)).toBe(1);"}]\n```'
+        );
+      },
+      {
+        runTests: async () => ({ ok: true, passed: 1, failed: 0, output: "" }),
+        maxReviewCycles: 0,
+      },
+    );
+    await b.dispatch("src/a.ts", "foo", {
+      externalFeedback: "Integration test X failed: expected 500 to be 200",
+    });
+    expect(seenPrompts[0]).toContain("integration-loop feedback");
+    expect(seenPrompts[0]).toContain("expected 500 to be 200");
+  });
+
   it("captures chat errors and reports failed", async () => {
     const g = createDesignGraph();
     g.addFunction("src/a.ts", "foo", { params: [], returnType: "number" });

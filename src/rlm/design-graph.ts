@@ -192,6 +192,11 @@ export interface DesignGraph {
   getProjectConfig(): ProjectConfig | null;
   /** Attach an integration test to the whole project (no specific
    *  function — exercises the top-level assembly). */
+  /** Remove a function from the graph entirely. Drops its entry from
+   *  the parent/child tree (the parent's `children` array) and from
+   *  any sibling spec's `dependencies`. Used by the coherence self-
+   *  heal pass to drop orphans the architect marked for deletion. */
+  removeFunction(module: string, name: string): void;
   addProjectTest(test: TestSpec): void;
   /** Replace the entire project-scope integration test set. Used by
    *  the review pass when the architect revises a test — we swap the
@@ -721,6 +726,36 @@ export function createDesignGraph(): DesignGraph {
 
     getProjectConfig() {
       return projectConfig ? { ...projectConfig } : null;
+    },
+
+    removeFunction(module, name) {
+      const fn = functions.get(fnKey(module, name));
+      if (!fn) return;
+      // Drop from parent's children list.
+      if (fn.parent !== null) {
+        for (const other of functions.values()) {
+          if (other.name === fn.parent) {
+            other.children = other.children.filter((c) => c !== name);
+            break;
+          }
+        }
+      }
+      // Drop from any sibling's spec.dependencies.
+      for (const other of functions.values()) {
+        if (!other.spec) continue;
+        if (other.spec.dependencies.includes(name)) {
+          other.spec = {
+            ...other.spec,
+            dependencies: other.spec.dependencies.filter((d) => d !== name),
+          };
+        }
+      }
+      // Drop from parent pointers on any remaining nodes claiming this
+      // as parent (defensive — orphaned descendants become roots).
+      for (const other of functions.values()) {
+        if (other.parent === name) other.parent = null;
+      }
+      functions.delete(fnKey(module, name));
     },
 
     addProjectTest(test) {

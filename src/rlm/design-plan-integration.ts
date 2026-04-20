@@ -29,6 +29,7 @@ import type { FinalizeReport, FinalizeOptions } from "./finalize.js";
 import type { BuildReport } from "./design-build.js";
 import { designPlan } from "./design-plan.js";
 import { designCoherence } from "./design-coherence.js";
+import { healStructureCoherence } from "./design-coherence-heal.js";
 import { designLeafUpBuild } from "./design-leaf-up-build.js";
 import { enumeratePaths } from "./design-paths.js";
 import { designIntegrationTests } from "./design-integration-tests.js";
@@ -112,13 +113,12 @@ export async function designPlanIntegration(
     return planReport;
   }
 
-  // ─── Phase 3: structure coherence ─────────────────────────────────
-  // Cycles are hard-fail. Phantom deps / orphans are soft — we ask the
-  // architect to fix by re-dispatching an implementer. But since we
-  // don't have bodies yet, the "fix" here means asking the architect
-  // to revise specs. For now we surface as a structural failure and
-  // bail if coherence can't be made clean.
-  debug("plan-integration", "phase 3: structure coherence");
+  // ─── Phase 3: structure coherence + self-heal ─────────────────────
+  // Cycles are hard-fail. Phantom deps / orphans are soft — we try to
+  // auto-heal via healStructureCoherence (mechanical drop for phantom
+  // deps, LLM-driven pick-a-caller-or-drop for orphans). Up to
+  // maxCoherenceCycles iterations.
+  debug("plan-integration", "phase 3: structure coherence + heal");
   const maxCohCycles = options.maxCoherenceCycles ?? 3;
   let cohReport = await designCoherence(graph);
   let cohAttempt = 0;
@@ -136,21 +136,18 @@ export async function designPlanIntegration(
         advisories: [],
       });
     }
-    // Phantom-dep / orphan: ask the architect to revise one affected
-    // function's spec. We don't have a spec-revision LLM path yet,
-    // so just bail with the violations visible to the caller.
+    const heal = await healStructureCoherence(graph, { chat: options.chat });
     debug(
       "plan-integration",
-      `structure coherence has ${cohReport.violations.length} violation(s); no auto-fix yet — bailing`,
+      `heal cycle ${cohAttempt}/${maxCohCycles}: healed=${heal.healed.length} unhealed=${heal.unhealed.length}`,
     );
-    break;
+    if (heal.healed.length === 0) break; // no progress
+    cohReport = await designCoherence(graph);
   }
   if (!cohReport.ok) {
-    // Non-cycle violations still let the pipeline proceed — leaf-up
-    // will skip phantom/orphan functions via dep-gating. Log and go.
     debug(
       "plan-integration",
-      `continuing despite ${cohReport.violations.length} coherence warning(s)`,
+      `continuing despite ${cohReport.violations.length} remaining coherence warning(s)`,
     );
   }
 
