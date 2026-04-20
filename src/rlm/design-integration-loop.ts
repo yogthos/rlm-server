@@ -21,6 +21,7 @@ import type { DesignGraph } from "./design-graph.js";
 import type { DispatchResult } from "./design-dispatch.js";
 import { attributeFailure } from "./design-attribution.js";
 import { extractJson } from "./design-plan.js";
+import { isProjectTestFailure } from "./design-project-test-repair.js";
 import { debug } from "./debug.js";
 
 export interface IntegrationFailure {
@@ -47,7 +48,19 @@ export type FixDispatch = (
 
 export interface IntegrationLoopOptions {
   runner: IntegrationRunner;
+  /** Fix dispatch for FUNCTION targets — failures attributed to a
+   *  specific function in the graph. Called with failure feedback. */
   dispatch: FixDispatch;
+  /** Fix dispatch for the project integration TEST FILE itself.
+   *  Called when failures are synthetic runner crashes (test file
+   *  failed to load) or when stack frames point at the integration
+   *  test file rather than any function. Without this callback such
+   *  failures fall through to regular attribution and usually get
+   *  mis-attributed to an arbitrary function. */
+  fixProjectTests?: (
+    graph: DesignGraph,
+    failures: IntegrationFailure[],
+  ) => Promise<void>;
   /** Chat for the attribution fallback (LLM picks the target when no
    *  stack frame resolves to a known function). */
   chat: (prompt: string) => Promise<string>;
@@ -183,12 +196,22 @@ export async function runIntegrationLoop(
         }
       }
     }
-    // Collapse failures by attributed function so we don't redundantly
-    // dispatch the same body three times in one cycle. Cache per-trace
-    // attribution so identical stack traces skip the LLM fallback.
+    // Collapse failures by attributed target. Two target kinds:
+    //   1. project-tests: the project integration TEST FILE is the
+    //      problem (synthetic runner crash, or stack frame in
+    //      project.integration.test.ts with no function frame).
+    //   2. function: existing behavior — attribute to a specific
+    //      function in the graph.
+    // Cache per-trace attribution so identical stack traces skip the
+    // LLM fallback.
     const grouped = new Map<string, IntegrationFailure[]>();
+    const projectTestFailures: IntegrationFailure[] = [];
     const attrCache = new Map<string, string | null>();
     for (const failure of result.failures) {
+      if (isProjectTestFailure(failure)) {
+        projectTestFailures.push(failure);
+        continue;
+      }
       let fnName = attrCache.get(failure.stackTrace);
       if (fnName === undefined) {
         const attr = await attributeFailure(graph, failure.stackTrace, {
@@ -207,11 +230,10 @@ export async function runIntegrationLoop(
       if (!grouped.has(fnName)) grouped.set(fnName, []);
       grouped.get(fnName)!.push(failure);
     }
-    if (grouped.size === 0) {
+    if (grouped.size === 0 && projectTestFailures.length === 0) {
       // Nothing we can act on; bail rather than spin. Surface a
       // sample failure so the caller can distinguish a genuine dead-
-      // end ("nothing attributable") from a runner crash (synthetic
-      // "project.runner" entry from the integration runner).
+      // end ("nothing attributable") from other cases.
       const sample = result.failures[0];
       const tail = sample
         ? `first failure — ${sample.testName}: ${sample.message.slice(0, 240)}`
@@ -223,6 +245,30 @@ export async function runIntegrationLoop(
         dispatched,
         error: `no failure attributable to any function in the graph after ${iter} iteration(s); ${tail}`,
       };
+    }
+    // Dispatch project-test repairs FIRST — when the test file is
+    // broken, function-level fixes can't be validated anyway.
+    if (projectTestFailures.length > 0) {
+      if (options.fixProjectTests) {
+        debug(
+          "integration-loop",
+          `dispatching project-test repair for ${projectTestFailures.length} failure(s)`,
+        );
+        dispatched.push("__project-tests__");
+        try {
+          await options.fixProjectTests(graph, projectTestFailures);
+        } catch (e) {
+          debug(
+            "integration-loop",
+            `fixProjectTests threw (continuing): ${e instanceof Error ? e.message : String(e)}`,
+          );
+        }
+      } else {
+        debug(
+          "integration-loop",
+          `${projectTestFailures.length} project-test failure(s) but no fixProjectTests callback wired — skipping`,
+        );
+      }
     }
     for (const [name, failures] of grouped) {
       const fn = graph.listFunctions().find((f) => f.name === name);

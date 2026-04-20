@@ -40,6 +40,7 @@ import {
   type IntegrationRunner,
   type FixDispatch,
 } from "./design-integration-loop.js";
+import { repairProjectTests } from "./design-project-test-repair.js";
 import { createProjectDir, type ProjectDir } from "./test-runner.js";
 import { debug } from "./debug.js";
 
@@ -263,6 +264,13 @@ export async function designPlanIntegration(
     const loop = await runIntegrationLoop(graph, {
       runner: options.integrationRunner,
       dispatch: options.fixDispatch,
+      fixProjectTests: async (g, failures) => {
+        await repairProjectTests(g, failures, {
+          chat: options.chat,
+          task,
+          maxRetries: options.maxShapeRetries,
+        });
+      },
       chat: options.chat,
       maxIterations: options.maxIntegrationIterations,
       projectDir: projectDir?.path,

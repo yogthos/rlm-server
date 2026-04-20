@@ -331,6 +331,138 @@ describe("runIntegrationLoop", () => {
     expect(runCount).toBe(2);
   });
 
+  it("project.runner failure routes to fixProjectTests, not fixDispatch", async () => {
+    const g = seed();
+    let runCount = 0;
+    let fixFunctionCalled = false;
+    let projectTestsFixedWith: string[] | null = null;
+    const report = await runIntegrationLoop(g, {
+      runner: async () => {
+        runCount++;
+        if (runCount === 1) {
+          return {
+            ok: false,
+            failures: [
+              {
+                testName: "project.runner",
+                message: "vitest exited 1",
+                stackTrace: "stderr: SyntaxError: Unexpected token",
+              },
+            ],
+          };
+        }
+        return { ok: true, failures: [] };
+      },
+      dispatch: async () => {
+        fixFunctionCalled = true;
+        return {
+          module: "src/a.ts",
+          name: "x",
+          status: "tests-green",
+          implementation: "",
+          attempts: 0,
+          testOutput: "",
+        };
+      },
+      fixProjectTests: async (_g, failures) => {
+        projectTestsFixedWith = failures.map((f) => f.testName);
+      },
+      chat: async () => "unused",
+      maxIterations: 3,
+      augmentOnRecurrence: false,
+    });
+    expect(report.ok).toBe(true);
+    // Function dispatch NOT called — this was a project-test failure.
+    expect(fixFunctionCalled).toBe(false);
+    // fixProjectTests got the failure.
+    expect(projectTestsFixedWith).toEqual(["project.runner"]);
+    expect(report.dispatched).toContain("__project-tests__");
+  });
+
+  it("mixed failures: function target AND project.runner both get routed correctly", async () => {
+    const g = seed();
+    const fnDispatched: string[] = [];
+    let projectTestsCalls = 0;
+    let runCount = 0;
+    await runIntegrationLoop(g, {
+      runner: async () => {
+        runCount++;
+        if (runCount === 1) {
+          return {
+            ok: false,
+            failures: [
+              {
+                testName: "project.runner",
+                message: "crashed",
+                stackTrace: "stderr: ...",
+              },
+              {
+                testName: "real test",
+                message: "asserted wrong",
+                stackTrace:
+                  "at handleRequest (/tmp/proj/handleRequest.ts:5:1)",
+              },
+            ],
+          };
+        }
+        return { ok: true, failures: [] };
+      },
+      dispatch: async (_g, mod, name) => {
+        fnDispatched.push(name);
+        return {
+          module: mod,
+          name,
+          status: "tests-green",
+          implementation: "",
+          attempts: 0,
+          testOutput: "",
+        };
+      },
+      fixProjectTests: async () => {
+        projectTestsCalls++;
+      },
+      chat: async () => "unused",
+      maxIterations: 3,
+      augmentOnRecurrence: false,
+    });
+    expect(projectTestsCalls).toBe(1);
+    expect(fnDispatched).toContain("handleRequest");
+  });
+
+  it("project.runner failure without fixProjectTests callback skips — doesn't misdispatch to a function", async () => {
+    const g = seed();
+    let fixFunctionCalled = false;
+    await runIntegrationLoop(g, {
+      runner: async () => ({
+        ok: false,
+        failures: [
+          {
+            testName: "project.runner",
+            message: "x",
+            stackTrace: "y",
+          },
+        ],
+      }),
+      dispatch: async () => {
+        fixFunctionCalled = true;
+        return {
+          module: "x",
+          name: "x",
+          status: "tests-green",
+          implementation: "",
+          attempts: 0,
+          testOutput: "",
+        };
+      },
+      chat: async () => "unused",
+      maxIterations: 2,
+      augmentOnRecurrence: false,
+    });
+    // Previously the loop would attribute project.runner somewhere and
+    // dispatch a function fix uselessly. Now it skips cleanly.
+    expect(fixFunctionCalled).toBe(false);
+  });
+
   it("handles multiple failures in one iteration — one dispatch per unique function", async () => {
     const g = seed();
     let runCount = 0;
