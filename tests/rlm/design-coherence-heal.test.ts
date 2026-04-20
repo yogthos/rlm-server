@@ -28,7 +28,7 @@ describe("healStructureCoherence", () => {
       return "";
     };
     const result = await healStructureCoherence(g, { chat });
-    expect(result.healed).toContain("phantom-dep:foo");
+    expect(result.healed).toContain("phantom-dep:foo:ghost");
     expect(chatCalled).toBe(false);
     // Phantom dropped; real kept.
     const s = g.getFunction("src/a.ts", "foo")!.spec!;
@@ -61,6 +61,27 @@ describe("healStructureCoherence", () => {
     expect(result.healed).toContain("orphan:junk");
     // Function removed from the graph.
     expect(g.getFunction("src/a.ts", "junk")).toBeUndefined();
+  });
+
+  it("reverts orphan wiring when it would create a cycle", async () => {
+    // Setup: orphan `dep` already depends on `caller`. LLM nominates
+    // `caller` as the parent to take dep as a dep — this would create
+    // `caller` → `dep` → `caller`. Heal must revert and mark unhealed.
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "caller", sig());
+    g.setSpec("src/a.ts", "caller", spec()); // no deps yet
+    g.addFunctionChild("caller", "src/a.ts", "dep", sig());
+    g.setSpec("src/a.ts", "dep", spec(["caller"])); // dep → caller (makes "dep" an orphan: no one calls it)
+    const chat = async () =>
+      '```json\n{"caller":"caller","action":"add-dep"}\n```';
+    const result = await healStructureCoherence(g, { chat });
+    // The heal attempted to wire caller → dep, but that would complete
+    // the cycle caller → dep → caller. Must revert.
+    expect(result.ok).toBe(false);
+    expect(result.unhealed.some((u) => u.includes("orphan:dep"))).toBe(true);
+    // Caller's deps must NOT include dep (revert worked).
+    const callerSpec = g.getFunction("src/a.ts", "caller")!.spec!;
+    expect(callerSpec.dependencies).not.toContain("dep");
   });
 
   it("reports cycles as unhealable (no auto-fix)", async () => {

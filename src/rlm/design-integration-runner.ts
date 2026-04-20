@@ -142,7 +142,9 @@ async function createScaffoldDir(tmpRoot: string): Promise<string> {
 export function createIntegrationRunner(
   options: IntegrationRunnerOptions = {},
 ): (graph: DesignGraph) => Promise<IntegrationRunResult> {
-  const timeoutMs = options.timeoutMs ?? 120_000;
+  // 10 min default — long enough for a project-size vitest run on cold
+  // TS transforms. Caller can override.
+  const timeoutMs = options.timeoutMs ?? 600_000;
   return async (graph) => {
     let dir = options.projectDir;
     let owned = false;
@@ -163,6 +165,25 @@ export function createIntegrationRunner(
         "integration-loop",
         `ran vitest — exit=${vitest.exitCode} failures=${failures.length}`,
       );
+      // If vitest crashed / was SIGKILL'd and stdout has no parseable
+      // failures, we'd silently return `ok:false, failures:[]` and the
+      // integration loop would bail with "no failures attributable."
+      // Synthesize a diagnostic failure so the loop / user knows the
+      // runner itself went sideways.
+      if (vitest.exitCode !== 0 && failures.length === 0) {
+        const stderrTail = vitest.stderr.slice(-800);
+        const stdoutTail = vitest.stdout.slice(-800);
+        return {
+          ok: false,
+          failures: [
+            {
+              testName: "project.runner",
+              message: `vitest exited ${vitest.exitCode} with no parseable test results (timeout ${timeoutMs}ms may have fired)`,
+              stackTrace: `stderr:\n${stderrTail}\n\nstdout:\n${stdoutTail}`,
+            },
+          ],
+        };
+      }
       return {
         ok: vitest.exitCode === 0 && failures.length === 0,
         failures,

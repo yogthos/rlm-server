@@ -184,31 +184,44 @@ export async function runIntegrationLoop(
       }
     }
     // Collapse failures by attributed function so we don't redundantly
-    // dispatch the same body three times in one cycle. Group failures
-    // under the attribution so feedback can include the full context.
+    // dispatch the same body three times in one cycle. Cache per-trace
+    // attribution so identical stack traces skip the LLM fallback.
     const grouped = new Map<string, IntegrationFailure[]>();
+    const attrCache = new Map<string, string | null>();
     for (const failure of result.failures) {
-      const attr = await attributeFailure(graph, failure.stackTrace, {
-        chat: options.chat,
-      });
-      if (!attr.function) {
+      let fnName = attrCache.get(failure.stackTrace);
+      if (fnName === undefined) {
+        const attr = await attributeFailure(graph, failure.stackTrace, {
+          chat: options.chat,
+        });
+        fnName = attr.function;
+        attrCache.set(failure.stackTrace, fnName);
+      }
+      if (!fnName) {
         debug(
           "integration-loop",
           `unattributable failure "${failure.testName}" — skipping`,
         );
         continue;
       }
-      if (!grouped.has(attr.function)) grouped.set(attr.function, []);
-      grouped.get(attr.function)!.push(failure);
+      if (!grouped.has(fnName)) grouped.set(fnName, []);
+      grouped.get(fnName)!.push(failure);
     }
     if (grouped.size === 0) {
-      // Nothing we can act on; bail rather than spin.
+      // Nothing we can act on; bail rather than spin. Surface a
+      // sample failure so the caller can distinguish a genuine dead-
+      // end ("nothing attributable") from a runner crash (synthetic
+      // "project.runner" entry from the integration runner).
+      const sample = result.failures[0];
+      const tail = sample
+        ? `first failure — ${sample.testName}: ${sample.message.slice(0, 240)}`
+        : "(no failures surfaced)";
       return {
         ok: false,
         iterations: iter,
         failuresByIteration,
         dispatched,
-        error: `no failure attributable to any function in the graph after ${iter} iteration(s)`,
+        error: `no failure attributable to any function in the graph after ${iter} iteration(s); ${tail}`,
       };
     }
     for (const [name, failures] of grouped) {
@@ -218,10 +231,20 @@ export async function runIntegrationLoop(
         continue;
       }
       dispatched.push(name);
-      await options.dispatch(graph, fn.module, fn.name, {
-        feedback: buildFeedback(failures),
-        projectDir: options.projectDir,
-      });
+      try {
+        await options.dispatch(graph, fn.module, fn.name, {
+          feedback: buildFeedback(failures),
+          projectDir: options.projectDir,
+        });
+      } catch (e) {
+        // A thrown dispatch must not kill the whole loop. Log and move
+        // to the next target; the next runner invocation will surface
+        // whether the fix landed or not.
+        debug(
+          "integration-loop",
+          `dispatch ${name} threw (continuing): ${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
     }
   }
   return {

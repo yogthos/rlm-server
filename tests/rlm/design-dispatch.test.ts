@@ -2104,6 +2104,104 @@ describe("createDesignDispatchBridge", () => {
     expect(seenPrompts[0]).toContain("expected 500 to be 200");
   });
 
+  it("externalFeedback FORCES the regen loop — no pre-test short-circuit even when body passes unit tests", async () => {
+    // Integration-loop scenario: the function's body happens to pass
+    // its own unit tests AND the architect approves, but the integration
+    // test is red because of an interaction the unit tests don't cover.
+    // Pre-test short-circuit would drop the feedback and return success,
+    // leaving the integration failure in place. Fix: externalFeedback
+    // suppresses the short-circuit.
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "foo", { params: [], returnType: "number" });
+    g.setSpec("src/a.ts", "foo", {
+      purpose: "x",
+      inputs: [],
+      output: { type: "number", description: "" },
+      sideEffects: [],
+      dependencies: [],
+      edgeCases: [],
+      examples: [],
+    });
+    g.setImplementation("src/a.ts", "foo", "return 1;"); // passes unit tests
+    g.addTest("src/a.ts", "foo", {
+      name: "u",
+      code: "expect(foo(ctx)).toBe(1);",
+    });
+    let chatCalls = 0;
+    const b = createDesignDispatchBridge(
+      g,
+      async (prompt) => {
+        chatCalls++;
+        // Architect review prompt — always APPROVE so pre-test WOULD
+        // short-circuit without the fix.
+        if (prompt.includes("You are the ARCHITECT reviewing")) {
+          return "APPROVE";
+        }
+        // Implementer regen — include the unit-tests fence so the
+        // dispatcher can move forward.
+        return (
+          '```ts\nreturn 2;\n```\n' +
+          '```unit-tests\n[{"name":"u","code":"expect(foo(ctx)).toBe(2);"}]\n```'
+        );
+      },
+      {
+        runTests: async () => ({ ok: true, passed: 1, failed: 0, output: "" }),
+        maxReviewCycles: 1,
+      },
+    );
+    // Call with externalFeedback — simulates the integration loop.
+    const result = await b.dispatch("src/a.ts", "foo", {
+      externalFeedback: "Integration test X failed: expected 2 to be 1",
+    });
+    expect(result.status).toBe("tests-green");
+    // The Implementer regen fired — chat was called at least once for
+    // the regen (plus one for review). If pre-test had short-circuited,
+    // attempts would be 0.
+    expect(result.attempts).toBeGreaterThan(0);
+  });
+
+  it("externalFeedback exhaustion preserves the pre-existing body (fallback)", async () => {
+    // If the regen loop exhausts without producing a green body, the
+    // graph should keep the body we started with rather than nulling.
+    // Prevents the fix-loop from making things worse when it can't
+    // converge.
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "foo", { params: [], returnType: "number" });
+    g.setSpec("src/a.ts", "foo", {
+      purpose: "x",
+      inputs: [],
+      output: { type: "number", description: "" },
+      sideEffects: [],
+      dependencies: [],
+      edgeCases: [],
+      examples: [],
+    });
+    g.setImplementation("src/a.ts", "foo", "return 1;");
+    const b = createDesignDispatchBridge(
+      g,
+      async () =>
+        '```ts\nreturn 2;\n```\n' +
+        '```unit-tests\n[{"name":"u","code":"expect(foo(ctx)).toBe(2);"}]\n```',
+      {
+        // Every run red — forces exhaustion / stagnation bail.
+        runTests: async () => ({
+          ok: false,
+          passed: 0,
+          failed: 1,
+          output: "nope",
+        }),
+        maxAttempts: 3,
+        maxReviewCycles: 0,
+      },
+    );
+    const result = await b.dispatch("src/a.ts", "foo", {
+      externalFeedback: "integration test red",
+    });
+    expect(result.status).toBe("failed");
+    // The pre-existing body is preserved — exhaustion kept it.
+    expect(g.getFunction("src/a.ts", "foo")!.implementation).toBe("return 1;");
+  });
+
   it("captures chat errors and reports failed", async () => {
     const g = createDesignGraph();
     g.addFunction("src/a.ts", "foo", { params: [], returnType: "number" });

@@ -36,6 +36,10 @@ export interface CoherenceViolation {
   module: string;
   name: string;
   detail: string;
+  /** For `phantom-dep`: the name the spec lists that isn't in the
+   *  graph. Lets consumers (e.g., heal) act on the violation without
+   *  reparsing `detail`. */
+  phantomName?: string;
 }
 
 export interface CoherenceReport {
@@ -91,6 +95,7 @@ export async function designCoherence(
           module: f.module,
           name: f.name,
           detail: `spec.dependencies of "${f.name}" lists "${d}", but "${d}" isn't defined anywhere in the graph. Either declare "${d}" as a function or drop the dependency.`,
+          phantomName: d,
         });
         continue;
       }

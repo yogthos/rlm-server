@@ -20,6 +20,7 @@
 
 import type { DesignGraph } from "./design-graph.js";
 import { designCoherence } from "./design-coherence.js";
+import { computeDependencyLevels } from "./design-leaf-up-build.js";
 import { extractJson } from "./design-plan.js";
 import { debug } from "./debug.js";
 
@@ -111,21 +112,27 @@ async function healOrphan(
   if (!caller || !caller.spec) return false;
   if (caller.name === name) return false; // no self-cycles
   if (caller.spec.dependencies.includes(name)) return true;
+  const before = caller.spec;
   graph.setSpec(caller.module, caller.name, {
     ...caller.spec,
     dependencies: [...caller.spec.dependencies, name],
   });
+  // Transitive-cycle guard: the LLM might nominate a caller that the
+  // orphan already reaches via some chain. `computeDependencyLevels`
+  // throws on cycles. If wiring created one, revert the setSpec so the
+  // graph stays acyclic. The violation stays unhealed; caller surfaces
+  // it on the next coherence pass.
+  try {
+    computeDependencyLevels(graph);
+  } catch {
+    graph.setSpec(caller.module, caller.name, before);
+    debug(
+      "coherence",
+      `orphan heal reverted: wiring ${caller.name} → ${name} would have created a cycle`,
+    );
+    return false;
+  }
   return true;
-}
-
-/**
- * Extract the phantom name from a phantom-dep violation's detail text.
- * The structure coherence formatter emits:
- *   spec.dependencies of "<caller>" lists "<phantom>", but ...
- */
-function extractPhantomName(detail: string): string | null {
-  const m = detail.match(/lists "([^"]+)"/);
-  return m ? m[1] : null;
 }
 
 export async function healStructureCoherence(
@@ -137,18 +144,27 @@ export async function healStructureCoherence(
   const report = await designCoherence(graph);
   if (report.ok) return { ok: true, healed: [], unhealed: [] };
   for (const v of report.violations) {
-    const tag = `${v.kind}:${v.name}`;
+    const tag = v.phantomName
+      ? `${v.kind}:${v.name}:${v.phantomName}`
+      : `${v.kind}:${v.name}`;
+    // A prior heal may have dropped the target (orphan-drop) or
+    // already removed the phantom as a side-effect (removeFunction
+    // cleans up sibling deps). Skip silently — the violation is
+    // resolved by the earlier action, just not in the stale report.
+    if (!graph.getFunction(v.module, v.name)) {
+      healed.push(tag);
+      continue;
+    }
     if (v.kind === "cycle") {
       unhealed.push(tag);
       continue;
     }
     if (v.kind === "phantom-dep") {
-      const phantom = extractPhantomName(v.detail);
-      if (!phantom) {
+      if (!v.phantomName) {
         unhealed.push(tag);
         continue;
       }
-      const ok = await healPhantomDep(graph, v.module, v.name, phantom);
+      const ok = await healPhantomDep(graph, v.module, v.name, v.phantomName);
       if (ok) healed.push(tag);
       else unhealed.push(tag);
       continue;

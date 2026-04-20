@@ -88,6 +88,27 @@ describe("enumeratePaths", () => {
     expect(paths.length).toBeGreaterThanOrEqual(1);
   });
 
+  it("respects maxPaths cap — appends a truncated sentinel when exceeded", () => {
+    // Build a branchy graph: root → {c1, c2, c3, c4} → {l1, l2, l3, l4}.
+    // 16 paths total; cap at 5 and expect 5 + 1 truncated sentinel.
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "root", sig());
+    g.setSpec("src/a.ts", "root", spec(["c1", "c2", "c3", "c4"]));
+    for (const c of ["c1", "c2", "c3", "c4"]) {
+      g.addFunction("src/a.ts", c, sig());
+      g.setSpec("src/a.ts", c, spec(["l1", "l2", "l3", "l4"]));
+    }
+    for (const l of ["l1", "l2", "l3", "l4"]) {
+      g.addFunction("src/a.ts", l, sig());
+      g.setSpec("src/a.ts", l, spec());
+    }
+    const paths = enumeratePaths(g, { maxPaths: 5 });
+    // Should cap at 5 complete paths + 1 truncated sentinel.
+    expect(paths.length).toBe(6);
+    expect(paths.filter((p) => p.kind === "truncated")).toHaveLength(1);
+    expect(paths[paths.length - 1].kind).toBe("truncated");
+  });
+
   it("isolated node (no deps, no callers) returns a single-node path", () => {
     const g = createDesignGraph();
     g.addFunction("src/a.ts", "solo", sig());

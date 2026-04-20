@@ -21,13 +21,21 @@
 
 import type { DesignGraph } from "./design-graph.js";
 
-export type PathKind = "complete" | "cyclical";
+export type PathKind = "complete" | "cyclical" | "truncated";
 
 export interface Path {
   /** Call chain from entry to terminal. For cyclical paths, the final
    *  node is the one that would have repeated (not included twice). */
   nodes: string[];
   kind: PathKind;
+}
+
+export interface EnumeratePathsOptions {
+  /** Cap on total paths emitted. On branching-heavy graphs the
+   *  enumeration can blow up exponentially (K branches × N depth ⇒
+   *  K^N paths). Default 100. A final `truncated` sentinel path is
+   *  appended when the cap fires so callers know coverage is partial. */
+  maxPaths?: number;
 }
 
 function buildAdjacency(graph: DesignGraph): Map<string, string[]> {
@@ -80,14 +88,22 @@ function findEntryPoints(
   return entries;
 }
 
-export function enumeratePaths(graph: DesignGraph): Path[] {
+export function enumeratePaths(
+  graph: DesignGraph,
+  options: EnumeratePathsOptions = {},
+): Path[] {
+  const maxPaths = options.maxPaths ?? 100;
   const adj = buildAdjacency(graph);
   const entries = findEntryPoints(graph, adj);
   const paths: Path[] = [];
+  let capped = false;
   const dfs = (node: string, trail: string[], visited: Set<string>) => {
+    if (capped) return;
+    if (paths.length >= maxPaths) {
+      capped = true;
+      return;
+    }
     if (visited.has(node)) {
-      // Cycle — emit the truncated path ending at the repeat point and
-      // stop recursing.
       paths.push({ nodes: [...trail, node], kind: "cyclical" });
       return;
     }
@@ -100,11 +116,18 @@ export function enumeratePaths(graph: DesignGraph): Path[] {
       return;
     }
     for (const c of callees) {
+      if (capped) return;
       dfs(c, nextTrail, nextVisited);
     }
   };
   for (const entry of entries) {
+    if (capped) break;
     dfs(entry, [], new Set());
+  }
+  if (capped) {
+    // Sentinel entry lets downstream (integration-test authoring)
+    // report partial coverage rather than silently miss paths.
+    paths.push({ nodes: ["<truncated>"], kind: "truncated" });
   }
   return paths;
 }

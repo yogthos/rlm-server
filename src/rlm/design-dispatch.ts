@@ -831,7 +831,21 @@ export function createDesignDispatchBridge(
       // check structural conformance FIRST (static analysis), then
       // tests, then architect. A loaded body that never went through
       // these gates shouldn't slip past them just because it's stored.
-      if (fn.implementation !== null) {
+      //
+      // EXCEPTION: when the caller primed `externalFeedback` (typically
+      // integration-loop failure context), skip the pre-test entirely.
+      // The body may pass its own unit tests while still causing the
+      // integration test to fail — short-circuiting here would drop
+      // the feedback and leave the bug in place. Force the regenerate
+      // loop so the Implementer sees the failure text.
+      //
+      // Seed `lastGreenBody` with the existing body so that if the
+      // regen loop exhausts without producing a better one, we keep
+      // what we had rather than nulling the implementation.
+      if (externalFeedback !== null && fn.implementation !== null) {
+        lastGreenBody = { body: fn.implementation, output: "" };
+      }
+      if (fn.implementation !== null && externalFeedback === null) {
         const preAnalysis = await analyzeBody(fn.implementation);
         const preKnownNames = new Set(
           graph.listFunctions().map((f) => f.name),

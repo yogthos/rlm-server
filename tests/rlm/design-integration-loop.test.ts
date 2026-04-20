@@ -255,6 +255,82 @@ describe("runIntegrationLoop", () => {
     expect(g.listProjectTests()).toHaveLength(0);
   });
 
+  it("caches attribution per stack trace within an iteration (avoids redundant LLM calls)", async () => {
+    const g = seed();
+    let fallbackCalls = 0;
+    let runCount = 0;
+    const report = await runIntegrationLoop(g, {
+      runner: async () => {
+        runCount++;
+        if (runCount === 1) {
+          // Three failures, all with the SAME unattributable stack.
+          // Attribution should be cached, so fallback LLM fires once.
+          const trace = "at unknown (???:0:0)";
+          return {
+            ok: false,
+            failures: [
+              { testName: "t1", stackTrace: trace, message: "a" },
+              { testName: "t2", stackTrace: trace, message: "b" },
+              { testName: "t3", stackTrace: trace, message: "c" },
+            ],
+          };
+        }
+        return { ok: true, failures: [] };
+      },
+      dispatch: async (_g, mod, name) => ({
+        module: mod,
+        name,
+        status: "tests-green",
+        implementation: "",
+        attempts: 0,
+        testOutput: "",
+      }),
+      chat: async () => {
+        fallbackCalls++;
+        return "garbage";
+      },
+      maxIterations: 2,
+      augmentOnRecurrence: false,
+    });
+    // Only ONE fallback LLM call fired for the three identical traces.
+    expect(fallbackCalls).toBe(1);
+    // Loop bails after no attribution; ok=false expected.
+    expect(report.ok).toBe(false);
+  });
+
+  it("swallows dispatch throws without killing the loop", async () => {
+    const g = seed();
+    let runCount = 0;
+    const report = await runIntegrationLoop(g, {
+      runner: async () => {
+        runCount++;
+        if (runCount === 1) {
+          return {
+            ok: false,
+            failures: [
+              {
+                testName: "t",
+                stackTrace: "at handleRequest (/tmp/proj/handleRequest.ts:1:1)",
+                message: "boom",
+              },
+            ],
+          };
+        }
+        // After the thrown dispatch, the loop should still call runner again.
+        return { ok: true, failures: [] };
+      },
+      dispatch: async () => {
+        throw new Error("dispatch blew up");
+      },
+      chat: async () => "unused",
+      maxIterations: 3,
+      augmentOnRecurrence: false,
+    });
+    // Loop continued past the throw and saw the green runner result.
+    expect(report.ok).toBe(true);
+    expect(runCount).toBe(2);
+  });
+
   it("handles multiple failures in one iteration — one dispatch per unique function", async () => {
     const g = seed();
     let runCount = 0;
