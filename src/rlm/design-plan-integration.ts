@@ -147,21 +147,59 @@ export async function designPlanIntegration(
     }
   }
 
-  // ─── Pass C: harden (best-effort, non-blocking) ───────────────────
-  debug("plan-integration", "pass C: harden");
-  for (const fn of graph.topoSortFunctions()) {
+  // ─── Pass C: harden — bottom-up, assembly-first ──────────────────
+  // Round 14: enforce that a function's dependencies must be
+  // tests-green BEFORE we harden it. Leaves first; parents only once
+  // their subtree stabilises. This makes iterations cumulative:
+  // each harden runs against real, green dependencies rather than
+  // half-broken siblings, giving the Implementer cleaner feedback.
+  //
+  // If a descendant fails to go green (harden returns non-green or
+  // throws), we SKIP the parent. Parents of broken subtrees can't
+  // produce a coherent assembly, and trying just compounds errors.
+  // The integration loop (Pass G) catches the remaining gaps.
+  debug("plan-integration", "pass C: harden (bottom-up)");
+  const topo = graph.topoSortFunctions();
+  const blocked = new Set<string>();
+  for (const fn of topo) {
+    const deps = fn.spec?.dependencies ?? [];
+    const blockedDeps = deps.filter((d) => blocked.has(d));
+    if (blockedDeps.length > 0) {
+      debug(
+        "plan-integration",
+        `harden ${fn.name} SKIPPED — blocked deps: ${blockedDeps.join(", ")}`,
+      );
+      blocked.add(fn.name);
+      continue;
+    }
+    // Reset sketched status so the dispatcher re-runs tests + review.
     if (fn.status === "tests-green") {
       graph.setTestStatus(fn.module, fn.name, "implemented", "");
     }
+    let result;
     try {
-      await options.hardenDispatch(graph, fn.module, fn.name);
+      result = await options.hardenDispatch(graph, fn.module, fn.name);
     } catch (e) {
       debug(
         "plan-integration",
-        `harden ${fn.name} threw (continuing): ${e instanceof Error ? e.message : String(e)}`,
+        `harden ${fn.name} threw: ${e instanceof Error ? e.message : String(e)}`,
       );
+      blocked.add(fn.name);
+      continue;
     }
-    // Swallow exhaustion / failure — integration loop is the truth-teller.
+    if (result.status !== "tests-green") {
+      debug(
+        "plan-integration",
+        `harden ${fn.name} not green (status=${result.status}) — blocking parents`,
+      );
+      blocked.add(fn.name);
+    }
+  }
+  if (blocked.size > 0) {
+    debug(
+      "plan-integration",
+      `harden summary: ${blocked.size}/${topo.length} blocked: ${[...blocked].join(", ")}`,
+    );
   }
 
   // ─── Pass D: path enumeration ─────────────────────────────────────

@@ -20,6 +20,7 @@
 import type { DesignGraph } from "./design-graph.js";
 import type { DispatchResult } from "./design-dispatch.js";
 import { attributeFailure } from "./design-attribution.js";
+import { extractJson } from "./design-plan.js";
 import { debug } from "./debug.js";
 
 export interface IntegrationFailure {
@@ -55,6 +56,11 @@ export interface IntegrationLoopOptions {
   /** Warm project dir forwarded to each fix dispatch (reuses vitest
    *  module cache). Optional. */
   projectDir?: string;
+  /** Round 16: when a test name fails in two consecutive iterations
+   *  (fix didn't stick), ask the LLM for one additional integration
+   *  test that articulates the bug from a different angle. The new
+   *  test lands on the graph via `addProjectTest`. Default true. */
+  augmentOnRecurrence?: boolean;
 }
 
 export interface IntegrationLoopReport {
@@ -77,13 +83,70 @@ function buildFeedback(failures: IntegrationFailure[]): string {
     .join("\n\n---\n\n");
 }
 
+function buildAugmentPrompt(
+  recurring: IntegrationFailure,
+  iteration: number,
+): string {
+  return [
+    `An integration test has failed for ${iteration} iterations in a row.`,
+    "The fix attempts haven't resolved the underlying bug. Coverage is",
+    "likely thin — the existing assertion may not fully articulate what's",
+    "broken. Author ONE additional integration test that exercises the",
+    "same scenario from a different angle (different input, different",
+    "side-effect check, different assertion shape) so the bug has a",
+    "concrete second witness.",
+    "",
+    `Recurring test name: ${recurring.testName}`,
+    `Message: ${recurring.message}`,
+    "Stack (excerpt):",
+    recurring.stackTrace.split("\n").slice(0, 10).join("\n"),
+    "",
+    "Return ONLY a fenced JSON object (SINGLE test):",
+    "```json",
+    '{"name": "<new test name>", "code": "<test body>"}',
+    "```",
+  ].join("\n");
+}
+
+async function augmentTestsForRecurrence(
+  graph: DesignGraph,
+  recurring: IntegrationFailure,
+  iteration: number,
+  chat: (prompt: string) => Promise<string>,
+): Promise<void> {
+  try {
+    const response = await chat(buildAugmentPrompt(recurring, iteration));
+    const parsed = extractJson(response);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return;
+    const r = parsed as Record<string, unknown>;
+    if (typeof r.name !== "string" || typeof r.code !== "string") return;
+    // Avoid duplicating an existing test name.
+    const existing = new Set(graph.listProjectTests().map((t) => t.name));
+    if (existing.has(r.name)) return;
+    graph.addProjectTest({ name: r.name, code: r.code });
+    debug(
+      "integration-loop",
+      `augmented tests with "${r.name}" (recurrence witness)`,
+    );
+  } catch (e) {
+    debug(
+      "integration-loop",
+      `augment threw (non-fatal): ${e instanceof Error ? e.message : String(e)}`,
+    );
+  }
+}
+
 export async function runIntegrationLoop(
   graph: DesignGraph,
   options: IntegrationLoopOptions,
 ): Promise<IntegrationLoopReport> {
   const maxIter = options.maxIterations ?? 5;
+  const augment = options.augmentOnRecurrence ?? true;
   const failuresByIteration: number[] = [];
   const dispatched: string[] = [];
+  /** Per-test iteration counters — how many cycles each test has been
+   *  failing. Drives the recurrence threshold for augmentation. */
+  const recurrenceCount = new Map<string, number>();
   let iter = 0;
   while (iter < maxIter) {
     iter++;
@@ -103,6 +166,23 @@ export async function runIntegrationLoop(
       "integration-loop",
       `iteration ${iter} — ${result.failures.length} failure(s); attributing`,
     );
+    // Track recurrence — tests that fail again bump their counter;
+    // tests that no longer appear drop back to 0 on next iteration.
+    const currentNames = new Set(result.failures.map((f) => f.testName));
+    for (const name of [...recurrenceCount.keys()]) {
+      if (!currentNames.has(name)) recurrenceCount.delete(name);
+    }
+    if (augment) {
+      for (const failure of result.failures) {
+        const prior = recurrenceCount.get(failure.testName) ?? 0;
+        const next = prior + 1;
+        recurrenceCount.set(failure.testName, next);
+        // On the 2nd consecutive occurrence, augment once.
+        if (next === 2) {
+          await augmentTestsForRecurrence(graph, failure, next, options.chat);
+        }
+      }
+    }
     // Collapse failures by attributed function so we don't redundantly
     // dispatch the same body three times in one cycle. Group failures
     // under the attribution so feedback can include the full context.

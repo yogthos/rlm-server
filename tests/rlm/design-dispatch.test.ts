@@ -2157,6 +2157,44 @@ describe("createDesignDispatchBridge", () => {
     expect(tests[0].name).toBe("keep me");
   });
 
+  it("bails early when two consecutive test-red runs produce identical signatures (stagnation)", async () => {
+    // The dispatcher used to spin through all maxAttempts even when the
+    // test output plateaued at an unchanging failure. After Round 13,
+    // a streak of identical failure signatures halts the loop and
+    // returns status=failed with error="stagnation: ..." so the
+    // orchestrator can move on to the next function.
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "foo", { params: [], returnType: "number" });
+    let attempts = 0;
+    const b = createDesignDispatchBridge(
+      g,
+      async () => {
+        attempts++;
+        return (
+          '```ts\nreturn 1;\n```\n' +
+          '```unit-tests\n[{"name":"t","code":"expect(foo(ctx)).toBe(2);"}]\n```'
+        );
+      },
+      {
+        // Same failure output every time → stagnation kicks in.
+        runTests: async () => ({
+          ok: false,
+          passed: 0,
+          failed: 1,
+          output: "expected 1 to be 2",
+        }),
+        maxAttempts: 8,
+      },
+    );
+    const result = await b.dispatch("src/a.ts", "foo");
+    expect(result.status).toBe("failed");
+    expect(result.error).toMatch(/stagnation/i);
+    // 2-streak threshold → bail fires on the 2nd red run. Some additional
+    // attempts happen before tests are parsed (pre-test path etc.), so we
+    // just assert we didn't burn all 8 attempts.
+    expect(attempts).toBeLessThan(8);
+  });
+
   it("captures chat errors and reports failed", async () => {
     const g = createDesignGraph();
     g.addFunction("src/a.ts", "foo", { params: [], returnType: "number" });

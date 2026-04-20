@@ -165,6 +165,96 @@ describe("runIntegrationLoop", () => {
     expect(report.ok).toBe(false);
   });
 
+  it("augments tests on a recurring failure (2nd consecutive cycle) via LLM", async () => {
+    const g = seed();
+    let runCount = 0;
+    let augmentPrompted = false;
+    const report = await runIntegrationLoop(g, {
+      runner: async () => {
+        runCount++;
+        if (runCount < 3) {
+          return {
+            ok: false,
+            failures: [
+              {
+                testName: "same failing test",
+                stackTrace: "at handleRequest (/tmp/proj/handleRequest.ts:1:1)",
+                message: "still broken",
+              },
+            ],
+          };
+        }
+        return { ok: true, failures: [] };
+      },
+      dispatch: async (_g, mod, name) => ({
+        module: mod,
+        name,
+        status: "tests-green",
+        implementation: "// ok",
+        attempts: 1,
+        testOutput: "",
+      }),
+      chat: async (prompt: string) => {
+        if (prompt.includes("additional integration test")) {
+          augmentPrompted = true;
+          return (
+            '```json\n{"name":"recurrence witness","code":"// new assertion"}\n```'
+          );
+        }
+        return "unused";
+      },
+      maxIterations: 5,
+    });
+    expect(augmentPrompted).toBe(true);
+    // New test was added to the graph.
+    const tests = g.listProjectTests();
+    expect(tests.some((t) => t.name === "recurrence witness")).toBe(true);
+    // Still converges once the runner goes green.
+    expect(report.ok).toBe(true);
+  });
+
+  it("does NOT augment when augmentOnRecurrence: false", async () => {
+    const g = seed();
+    let runCount = 0;
+    let augmentPrompted = false;
+    await runIntegrationLoop(g, {
+      runner: async () => {
+        runCount++;
+        if (runCount < 3) {
+          return {
+            ok: false,
+            failures: [
+              {
+                testName: "recurring",
+                stackTrace: "at handleRequest (/tmp/proj/handleRequest.ts:1:1)",
+                message: "x",
+              },
+            ],
+          };
+        }
+        return { ok: true, failures: [] };
+      },
+      dispatch: async (_g, mod, name) => ({
+        module: mod,
+        name,
+        status: "tests-green",
+        implementation: "// ok",
+        attempts: 1,
+        testOutput: "",
+      }),
+      chat: async (prompt: string) => {
+        if (prompt.includes("additional integration test")) {
+          augmentPrompted = true;
+        }
+        return "unused";
+      },
+      maxIterations: 5,
+      augmentOnRecurrence: false,
+    });
+    expect(augmentPrompted).toBe(false);
+    expect(g.listProjectTests()).toHaveLength(0);
+  });
+
   it("handles multiple failures in one iteration — one dispatch per unique function", async () => {
     const g = seed();
     let runCount = 0;

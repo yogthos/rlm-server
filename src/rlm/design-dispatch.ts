@@ -788,18 +788,24 @@ export function createDesignDispatchBridge(
       // review cycles so the reviewer can see what it said last time
       // and avoid contradicting itself.
       let priorReviewFeedback: string | null = null;
-      // Stagnation detection: remember the last two bodies and their
-      // failure counts. If two consecutive bodies are near-identical
-      // (same length within a small delta) AND their failure counts
-      // match, we nudge the Implementer to try a different approach.
+      // Stagnation detection. Two layers:
+      //   1) Nudge (one-shot): on near-identical body + same failed count,
+      //      next prompt asks the Implementer to rethink.
+      //   2) Bail: if the test-output SIGNATURE (failed/passed + trimmed
+      //      failure digest) repeats for two consecutive test-red runs,
+      //      we halt the dispatch and preserve whatever best-attempt
+      //      body we have. Stops the parseFormData 10/5-forever pattern.
+      //      Genetic-algorithm principle: each iteration must leave
+      //      evidence of progress; if it doesn't, move on.
       let lastFailedCount = -1;
       let lastPassedCount = -1;
       let priorBodyLength = -1;
       let stagnating = false;
-      // Stagnation is a one-shot signal per dispatch. Nagging the
-      // Implementer on every attempt when conditions persist doesn't
-      // help — the hint hasn't made a difference the first time.
       let stagnationFired = false;
+      let lastFailureSignature: string | null = null;
+      let identicalFailureStreak = 0;
+      /** Max consecutive identical test-red signatures before bail. */
+      const STAGNATION_BAIL_STREAK = 2;
       // Track the MOST-RECENT tests-green body so we never regress to
       // null on exhaustion. If the Implementer gets a green pass but
       // the architect REVISE's indefinitely, keep the green body; on
@@ -1135,6 +1141,67 @@ export function createDesignDispatchBridge(
         priorBodyLength = body.length;
         lastFailedCount = tr.failed;
         lastPassedCount = tr.passed;
+
+        // Bail on repeated identical failure signatures. We hash
+        // failed/passed counts AND the first 300 chars of output so a
+        // cosmetic rewording doesn't count as the same run, but a
+        // genuine no-op iteration does. Only counts test-red runs —
+        // a green run (even with architect REVISE) is progress.
+        if (!tr.ok && tr.failed > 0) {
+          const sig = `${tr.failed}/${tr.passed}|${(tr.output ?? "").slice(0, 300)}`;
+          if (sig === lastFailureSignature) {
+            identicalFailureStreak++;
+          } else {
+            identicalFailureStreak = 1;
+          }
+          lastFailureSignature = sig;
+          if (identicalFailureStreak >= STAGNATION_BAIL_STREAK) {
+            debug(
+              "dispatch",
+              `stagnation bail ${key} — ${identicalFailureStreak} consecutive identical failures (${tr.failed}/${tr.passed})`,
+            );
+            debug(
+              "progress",
+              `dispatch: ${key} STAGNATION BAIL — ${identicalFailureStreak} identical test-red runs`,
+            );
+            // Preserve best-attempt body if we ever saw green; otherwise
+            // save the current (failing) body so something lands in the
+            // graph for downstream passes.
+            if (lastGreenBody) {
+              graph.setImplementation(module, name, lastGreenBody.body);
+              graph.setTestStatus(
+                module,
+                name,
+                "architect-rejected",
+                lastGreenBody.output,
+              );
+              return {
+                module,
+                name,
+                status: "failed",
+                implementation: lastGreenBody.body,
+                attempts: attempt + 1,
+                testOutput: lastGreenBody.output,
+                error: "stagnation: identical failures across attempts",
+              };
+            }
+            graph.setImplementation(module, name, body);
+            graph.setTestStatus(module, name, "tests-red", tr.output);
+            return {
+              module,
+              name,
+              status: "failed",
+              implementation: body,
+              attempts: attempt + 1,
+              testOutput: tr.output,
+              error: "stagnation: identical failures across attempts",
+            };
+          }
+        } else {
+          // Reset the streak on anything that isn't a red run.
+          identicalFailureStreak = 0;
+          lastFailureSignature = null;
+        }
 
         previousBody = body;
         testOutput = tr.output;
