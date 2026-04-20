@@ -31,7 +31,8 @@ import { renderFileSet } from "./final-files.js";
 import { designBuild } from "./design-build.js";
 import { designLoad } from "./design-load.js";
 import { designPlan } from "./design-plan.js";
-import { designPlanThreePass } from "./design-plan-three-pass.js";
+import { designPlanIntegration } from "./design-plan-integration.js";
+import { createIntegrationRunner } from "./design-integration-runner.js";
 
 import type { RLMContext, RLMResult, LLMClient, ChatMessage } from "./types.js";
 import { createHandleStore } from "./handles.js";
@@ -574,10 +575,12 @@ async function initHandler(ctx: RLMContext): Promise<RLMContext> {
             maxReviewCycles: ctx.maxReviewCycles,
             mode: "harden",
           }).dispatch(module, name);
-        return designPlanThreePass(ctx.designGraph, task, {
+        return designPlanIntegration(ctx.designGraph, task, {
           chat,
           sketchDispatch,
           hardenDispatch,
+          fixDispatch: hardenDispatch,
+          integrationRunner: createIntegrationRunner(),
           finalize,
         });
       },

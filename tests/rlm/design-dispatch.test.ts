@@ -2102,6 +2102,61 @@ describe("createDesignDispatchBridge", () => {
     );
   });
 
+  it("replaces unit tests wholesale on each regen — no accumulation of contradictory assertions", async () => {
+    // Before Round 6, mergeTests appended new tests to existing ones,
+    // deduping only by name. A model that emitted two differently-named
+    // tests asserting contradictory things about the same input would
+    // keep both, stalling forever at N/M. After the fix, each regen
+    // replaces the test set with whatever the LLM emits.
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "foo", { params: [], returnType: "number" });
+    g.addTest("src/a.ts", "foo", {
+      name: "stale A",
+      code: "expect(foo(ctx)).toBe(1);",
+    });
+    g.addTest("src/a.ts", "foo", {
+      name: "stale B",
+      code: "expect(foo(ctx)).toBe(2);",
+    });
+    expect(g.getFunction("src/a.ts", "foo")!.tests).toHaveLength(2);
+    const b = createDesignDispatchBridge(
+      g,
+      async () =>
+        '```ts\nreturn 1;\n```\n' +
+        '```unit-tests\n[{"name":"fresh","code":"expect(foo(ctx)).toBe(1);"}]\n```',
+      {
+        runTests: async () => ({ ok: true, passed: 1, failed: 0, output: "" }),
+      },
+    );
+    await b.dispatch("src/a.ts", "foo");
+    const tests = g.getFunction("src/a.ts", "foo")!.tests;
+    expect(tests).toHaveLength(1);
+    expect(tests[0].name).toBe("fresh");
+  });
+
+  it("leaves existing unit tests untouched when the LLM emits no test fence", async () => {
+    // Replace-on-regen must only fire when the LLM actually emits a
+    // unit-tests patch. A response that omits the fence leaves stored
+    // tests alone (otherwise we'd erase valid tests every cycle).
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "foo", { params: [], returnType: "number" });
+    g.addTest("src/a.ts", "foo", {
+      name: "keep me",
+      code: "expect(foo(ctx)).toBe(1);",
+    });
+    const b = createDesignDispatchBridge(
+      g,
+      async () => "```ts\nreturn 1;\n```",
+      {
+        runTests: async () => ({ ok: true, passed: 1, failed: 0, output: "" }),
+      },
+    );
+    await b.dispatch("src/a.ts", "foo");
+    const tests = g.getFunction("src/a.ts", "foo")!.tests;
+    expect(tests).toHaveLength(1);
+    expect(tests[0].name).toBe("keep me");
+  });
+
   it("captures chat errors and reports failed", async () => {
     const g = createDesignGraph();
     g.addFunction("src/a.ts", "foo", { params: [], returnType: "number" });

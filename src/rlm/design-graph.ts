@@ -193,6 +193,10 @@ export interface DesignGraph {
   /** Attach an integration test to the whole project (no specific
    *  function — exercises the top-level assembly). */
   addProjectTest(test: TestSpec): void;
+  /** Replace the entire project-scope integration test set. Used by
+   *  the review pass when the architect revises a test — we swap the
+   *  old entry for the rewritten one rather than accumulate both. */
+  replaceProjectTests(tests: TestSpec[]): void;
   /** All project-scope integration tests. */
   listProjectTests(): TestSpec[];
   /** Replace the function's description (for progressive enrichment
@@ -721,6 +725,11 @@ export function createDesignGraph(): DesignGraph {
 
     addProjectTest(test) {
       projectTests.push(test);
+    },
+
+    replaceProjectTests(tests) {
+      projectTests.length = 0;
+      for (const t of tests) projectTests.push(t);
     },
 
     listProjectTests() {

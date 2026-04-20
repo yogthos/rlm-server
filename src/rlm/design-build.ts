@@ -26,6 +26,7 @@ export interface BuildReport {
     | "consistency"
     | "dispatch"
     | "project-tests"
+    | "integration"
     | "finalize"
     | "done";
   consistency: ConsistencyReport;

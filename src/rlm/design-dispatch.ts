@@ -657,10 +657,21 @@ export function extractIntegrationTests(response: string): TestSpec[] | null {
   return extractFencedTests(response, "integration-tests");
 }
 
-function mergeTests(existing: TestSpec[], patch: TestSpec[]): TestSpec[] {
-  const byName = new Map(existing.map((t) => [t.name, t] as const));
-  for (const p of patch) byName.set(p.name, p);
-  return [...byName.values()];
+/**
+ * Round 6: on each regen, the Implementer's emitted test fence is the
+ * authoritative test set for the function. We REPLACE rather than
+ * merge — this prevents contradictory assertions from accumulating
+ * across cycles (the failure mode that stalled parseFormData at 10/5
+ * with four pairs of mutually-exclusive tests for the same input).
+ *
+ * The caller only invokes this when `patch !== null`, so a response
+ * that omits the fence leaves existing tests alone.
+ */
+function replaceTestSet(
+  _existing: TestSpec[],
+  patch: TestSpec[],
+): TestSpec[] {
+  return [...patch];
 }
 
 export function createDesignDispatchBridge(
@@ -1019,7 +1030,7 @@ export function createDesignDispatchBridge(
         if (current) {
           const appliedUnit = unitPatch ?? legacyPatch;
           if (appliedUnit !== null) {
-            const next = mergeTests(current.tests, appliedUnit);
+            const next = replaceTestSet(current.tests, appliedUnit);
             graph.replaceTests(module, name, next);
             debug(
               "dispatch",
@@ -1044,7 +1055,7 @@ export function createDesignDispatchBridge(
                 `dispatch: ${key} integration-tests ignored (leaf)`,
               );
             } else {
-              const next = mergeTests(current.integrationTests, integrationPatch);
+              const next = replaceTestSet(current.integrationTests, integrationPatch);
               graph.replaceIntegrationTests(module, name, next);
               debug(
                 "dispatch",
