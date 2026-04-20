@@ -116,7 +116,7 @@ describe("designPlanIntegration — happy path", () => {
 });
 
 describe("designPlanIntegration — bottom-up gating", () => {
-  it("skips hardening a parent when its leaf dep fails harden", async () => {
+  it("skips hardening a parent when its leaf dep returns NO body (implementation=null)", async () => {
     const g = createDesignGraph();
     seedVitestConfig(g);
     // Pre-seed structure: parent depends on child.
@@ -152,9 +152,9 @@ describe("designPlanIntegration — bottom-up gating", () => {
       return {
         module: mod,
         name,
-        // Child fails harden → parent must be skipped by leaf-up.
         status: name === "child" ? ("failed" as const) : ("tests-green" as const),
-        implementation: "// h",
+        // Child returns null body → genuinely unusable → parent must skip.
+        implementation: name === "child" ? null : "// h",
         attempts: 1,
         testOutput: "",
       };

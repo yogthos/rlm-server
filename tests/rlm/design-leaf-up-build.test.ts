@@ -93,7 +93,7 @@ describe("designLeafUpBuild", () => {
     expect(report.blocked).toEqual([]);
   });
 
-  it("blocks a parent when its leaf dep can't be made green", async () => {
+  it("blocks a parent when its leaf dep returns no body (implementation=null)", async () => {
     const g = createDesignGraph();
     g.addFunction("src/a.ts", "root", sig());
     g.setSpec("src/a.ts", "root", spec(["leaf"]));
@@ -105,9 +105,9 @@ describe("designLeafUpBuild", () => {
       return {
         module: mod,
         name,
-        // leaf fails harden; root must be skipped.
         status: name === "leaf" ? ("failed" as const) : ("tests-green" as const),
-        implementation: null,
+        // null body on the leaf → genuinely blocks parent.
+        implementation: name === "leaf" ? null : "// ok",
         attempts: 1,
         testOutput: "",
         error: "stuck",
@@ -117,6 +117,37 @@ describe("designLeafUpBuild", () => {
     expect(report.ok).toBe(false);
     expect(order).toEqual(["leaf"]); // root never dispatched
     expect(report.blocked.sort()).toEqual(["leaf", "root"]);
+  });
+
+  it("does NOT block the parent when the leaf returned a body even with status=failed", async () => {
+    // Pure-TDD leaf-up accepts best-attempt bodies (stagnation bail,
+    // architect-rejected, whatever) so parents can dispatch against a
+    // real child. Integration pass catches the remaining issues.
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "root", sig());
+    g.setSpec("src/a.ts", "root", spec(["leaf"]));
+    g.addFunction("src/a.ts", "leaf", sig());
+    g.setSpec("src/a.ts", "leaf", spec());
+    const order: string[] = [];
+    const dispatch = async (_g: any, mod: string, name: string) => {
+      order.push(name);
+      _g.setImplementation(mod, name, "// stored");
+      return {
+        module: mod,
+        name,
+        // leaf failed harden BUT has a preserved body.
+        status: name === "leaf" ? ("failed" as const) : ("tests-green" as const),
+        implementation: "// preserved body",
+        attempts: 1,
+        testOutput: "",
+        error: "stagnation",
+      };
+    };
+    const report = await designLeafUpBuild(g, { dispatch });
+    // Parent still got dispatched because leaf has a body.
+    expect(order).toEqual(["leaf", "root"]);
+    // Only non-tests-green with NO body would block — this one has a body.
+    expect(report.blocked).toEqual([]);
   });
 
   it("dispatches same-level functions in alphabetical order (deterministic)", async () => {

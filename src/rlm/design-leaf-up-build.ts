@@ -187,12 +187,24 @@ export async function designLeafUpBuild(
         blocked.add(name);
         continue;
       }
-      if (result.status !== "tests-green") {
+      // Block ONLY when there's no body to build on. Leaf-up runs
+      // pure-TDD without architect review; a returned status of
+      // "failed" (stagnation bail, test-exhaustion) still preserves
+      // a best-attempt body via `lastGreenBody`. Parents can dispatch
+      // against a real-but-imperfect child — the integration pass
+      // will catch remaining gaps in context. Only a null body
+      // genuinely blocks downstream work.
+      if (result.implementation === null) {
         debug(
           "leaf-up-build",
-          `${name} not green (${result.status}) — blocking`,
+          `${name} blocked — no body returned (status=${result.status})`,
         );
         blocked.add(name);
+      } else if (result.status !== "tests-green") {
+        debug(
+          "leaf-up-build",
+          `${name} not green (${result.status}) but body preserved; parents can proceed`,
+        );
       }
     }
   }
