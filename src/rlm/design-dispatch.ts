@@ -165,19 +165,6 @@ export interface DispatchOptions {
    *  the Implementer is re-dispatched with the feedback injected.
    *  0 disables review (legacy behavior). Default 3. */
   maxReviewCycles?: number;
-  /** Dispatch mode:
-   *  - `"harden"` (default, legacy): run tests, architect review,
-   *    full review cycle. Body saved only when both green + approved.
-   *  - `"sketch"`: best-effort skeleton pass. Implementer writes a
-   *    body only (no tests). Body-analyzer still runs (rejects
-   *    imports / undeclared sibling calls). NO tests, NO architect
-   *    review. Body saved on first analyzer-clean response.
-   *
-   *  The sketch mode supports a two-pass workflow: first produce a
-   *  call-graph-consistent skeleton fast, then harden with tests and
-   *  review. Avoids the test-review feedback loops stalling initial
-   *  implementation. */
-  mode?: "sketch" | "harden";
 }
 
 /** Architect's post-green verdict on an Implementer's work. */
@@ -681,7 +668,6 @@ export function createDesignDispatchBridge(
 ): DesignDispatchBridge {
   const maxAttempts = options.maxAttempts ?? 8;
   const maxReviewCycles = options.maxReviewCycles ?? 3;
-  const mode = options.mode ?? "harden";
   const rawTestFn = options.runTests ?? runTests;
   const projectDir = options.projectDir;
   const testFn: TestFn = projectDir
@@ -846,23 +832,6 @@ export function createDesignDispatchBridge(
           pendingAnalyzerFeedback = preViolations.join("\n\n");
           testOutput = "";
           // Fall through to the regenerate loop (no early return).
-        } else if (mode === "sketch") {
-          // Sketch mode + clean analyzer → keep the loaded body as-is.
-          // No tests, no review: that's the whole point of sketch.
-          reconcileSpecDependencies(graph, module, name, preAnalysis);
-          graph.setTestStatus(module, name, "tests-green", "");
-          debug(
-            "dispatch",
-            `pre-test sketch ${key} — keeping loaded body (no tests, no review)`,
-          );
-          return {
-            module,
-            name,
-            status: "tests-green",
-            implementation: fn.implementation,
-            attempts: 0,
-            testOutput: "",
-          };
         } else {
         const pre = await testFn(graph, { module, name, body: fn.implementation });
         debug(
@@ -953,7 +922,6 @@ export function createDesignDispatchBridge(
                 previousPassed: lastPassedCount >= 0 ? lastPassedCount : undefined,
                 previousFailed: lastFailedCount >= 0 ? lastFailedCount : undefined,
               },
-          { mode },
         );
         // Consumed — clear so a subsequent test-failure retry uses
         // test output, not stale review/analyzer feedback. Same
@@ -1073,33 +1041,6 @@ export function createDesignDispatchBridge(
               );
             }
           }
-        }
-
-        // SKETCH MODE short-circuit: the body passed static analysis,
-        // that's enough. Save and return — no tests, no architect
-        // review. The hardening pass will add both later.
-        if (mode === "sketch") {
-          graph.setImplementation(module, name, body);
-          graph.setTestStatus(module, name, "tests-green", "");
-          // Reconcile dependencies from the observed call sites so the
-          // coherence pass (Phase 4) sees the actual call graph.
-          reconcileSpecDependencies(graph, module, name, analysis);
-          debug(
-            "dispatch",
-            `saved ${key} (sketch-mode, ${attempt + 1} attempts)`,
-          );
-          debug(
-            "progress",
-            `dispatch: ${key} SKETCH-SAVED (${attempt + 1} attempts)`,
-          );
-          return {
-            module,
-            name,
-            status: "tests-green",
-            implementation: body,
-            attempts: attempt + 1,
-            testOutput: "",
-          };
         }
 
         // No tests to run yet — the Implementer must emit at least one

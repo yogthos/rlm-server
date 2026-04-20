@@ -551,18 +551,6 @@ async function initHandler(ctx: RLMContext): Promise<RLMContext> {
         debug("bridge", `design_plan invoked task=${task.slice(0, 60)}...`);
         const { decompose, finalize } = buildBridgeHelpers(ctx);
         const chat = buildChat(ctx);
-        const sketchDispatch = (
-          g: RLMContext["designGraph"],
-          module: string,
-          name: string,
-          opts?: { projectDir?: string; feedback?: string },
-        ) =>
-          createDesignDispatchBridge(g, chat, {
-            projectDir: opts?.projectDir,
-            decompose,
-            maxReviewCycles: ctx.maxReviewCycles,
-            mode: "sketch",
-          }).dispatch(module, name);
         const hardenDispatch = (
           g: RLMContext["designGraph"],
           module: string,
@@ -573,11 +561,9 @@ async function initHandler(ctx: RLMContext): Promise<RLMContext> {
             projectDir: opts?.projectDir,
             decompose,
             maxReviewCycles: ctx.maxReviewCycles,
-            mode: "harden",
           }).dispatch(module, name);
         return designPlanIntegration(ctx.designGraph, task, {
           chat,
-          sketchDispatch,
           hardenDispatch,
           fixDispatch: hardenDispatch,
           integrationRunner: createIntegrationRunner(),

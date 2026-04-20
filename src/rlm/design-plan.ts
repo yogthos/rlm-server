@@ -24,8 +24,8 @@ import { debug } from "./debug.js";
 
 export interface DesignPlanOptions {
   chat: (prompt: string) => Promise<string>;
-  dispatch: BuildOptions["dispatch"];
-  finalize: BuildOptions["finalize"];
+  dispatch?: BuildOptions["dispatch"];
+  finalize?: BuildOptions["finalize"];
   /** How many times to retry each JSON phase when shape validation fails. */
   maxShapeRetries?: number;
   /** Plan the children of an EXISTING function rather than top-level
@@ -34,6 +34,10 @@ export interface DesignPlanOptions {
    *  in the parent's assembly; phase 3 (build) is SKIPPED — the
    *  caller decides when to dispatch. */
   parent?: string;
+  /** When true, return after phase 2 (specs attached) without calling
+   *  `designBuild`. Used by the integration orchestrator which runs
+   *  its own leaf-up build pass afterwards. */
+  skipBuild?: boolean;
 }
 
 export interface PlannedFunction {
@@ -885,7 +889,31 @@ export async function designPlan(
   // spec declares as dependencies). Project-level tests are no longer
   // emitted by the planner.
 
-  // ── Phase 3: mechanical build (skipped for sub-tree plans) ──────
+  // ── Phase 3: mechanical build ───────────────────────────────────
+  // Skipped when:
+  //   - This is a sub-tree plan (caller drives dispatch)
+  //   - skipBuild is true (caller runs its own build — e.g. the
+  //     integration orchestrator's leaf-up pass)
+  if (options.skipBuild) {
+    debug(
+      "plan",
+      `phase 3 SKIPPED (skipBuild) — ${specsAttached} specs, ${plannedNames.length} functions`,
+    );
+    debug(
+      "progress",
+      `plan: phase 3 skipped (skipBuild) — ${specsAttached} specs, ${plannedNames.length} functions`,
+    );
+    return {
+      ok: true,
+      phase: "plan",
+      consistency: graph.consistency(),
+      dispatched: [],
+      failed: [],
+      finalize: null,
+      files: {},
+      failedSpecs,
+    };
+  }
   if (parentName) {
     // Recursive call — children are now declared + tested; the outer
     // dispatch loop will pick them up depth-first. Return a plan-only
@@ -918,6 +946,11 @@ export async function designPlan(
     "progress",
     `plan: handoff to build — ${specsAttached} specs, ${plannedNames.length} functions, ${failedSpecs.length} specless`,
   );
+  if (!options.dispatch || !options.finalize) {
+    throw new Error(
+      "designPlan requires `dispatch` and `finalize` when skipBuild is not set",
+    );
+  }
   const buildReport = await designBuild(graph, {
     dispatch: options.dispatch,
     finalize: options.finalize,

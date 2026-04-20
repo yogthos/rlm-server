@@ -114,22 +114,15 @@ export interface ImplementerFeedback {
   previousFailed?: number;
 }
 
-export interface ImplementerPromptOptions {
-  /** Dispatch mode. `"sketch"` produces a prompt that asks for the
-   *  BODY ONLY (no unit-tests / integration-tests fences) — used in
-   *  the first skeleton pass. `"harden"` (default) asks for body +
-   *  tests + test patches, matching the existing contract. */
-  mode?: "sketch" | "harden";
-}
+export interface ImplementerPromptOptions {}
 
 export async function buildImplementerPrompt(
   graph: DesignGraph,
   module: string,
   name: string,
   feedback?: ImplementerFeedback,
-  options?: ImplementerPromptOptions,
+  _options?: ImplementerPromptOptions,
 ): Promise<string> {
-  const mode = options?.mode ?? "harden";
   const fn = graph.getFunction(module, name);
   if (!fn) {
     throw new Error(`function not found: ${module}#${name}`);
@@ -268,85 +261,62 @@ export async function buildImplementerPrompt(
       : []),
     ...existingTestsBlock,
     ...existingBlock,
-    ...(mode === "sketch"
-      ? [
-          "",
-          "This is a **SKETCH / FIRST-PASS** dispatch. Your job is a",
-          "best-effort body — no tests yet. A later pass will harden",
-          "this with tests and reviewer feedback. Focus on the core",
-          "behavior described in the purpose.",
-          "",
-          "Task — emit ONE fenced code block:",
-          "",
-          "```ts — the function body (statements only, no signature, no",
-          `surrounding \`function\` declaration). This is what \`${fn.name}\``,
-          "does when called.",
-          "",
-          "Rules:",
-          "- Do NOT emit `unit-tests` or `integration-tests` fences.",
-          "  Tests come in the hardening pass.",
-          "- Still respect proc-ts conventions: `ctx` is the first param",
-          "  (injected), sibling calls go through `ctx.fns.<name>(ctx, ...)`,",
-          "  no top-level `import` statements.",
-        ]
-      : [
-          "",
-          "Task — emit THREE fenced blocks in your response:",
-          "",
-          "1. ```ts — the function body (statements only, no signature, no",
-          `   surrounding \`function\` declaration). This is what \`${fn.name}\``,
-          "   does when called.",
-          "",
-          "2. ```unit-tests — JSON array of tests that exercise THIS function",
-          "   in isolation. Each entry is `{\"name\": \"...\", \"code\": \"...\"}`.",
-          frameworkGuidanceLine,
-          `   Call the function under test as \`${fn.name}(ctx, ...)\`.`,
-          "   Cover every edge case from the spec and at least one example.",
-          "   Unit tests should NOT depend on siblings — stub `ctx.fns.<name>`",
-          "   if needed.",
-          "",
-          integrationNeeded
-            ? "3. ```integration-tests — REQUIRED. JSON array, same shape."
-            : "3. ```integration-tests — MUST be an empty array `[]` for this function.",
-          integrationNeeded
-            ? "   Integration tests run with real siblings wired via `ctx.fns`."
-            : "   This function has no children to assemble, so integration tests",
-          integrationNeeded
-            ? "   Because this function assembles children, you MUST include at"
-            : "   would not run (the harness only materializes integration test",
-          integrationNeeded
-            ? "   least one integration test that exercises the full wire-up."
-            : "   files for branches). Emit `[]` and put behavior coverage in unit tests.",
-          "",
-          "Fence shape:",
-          "```ts",
-          "// body statements",
-          "```",
-          "```unit-tests",
-          "[",
-          '  {"name": "...", "code": "..."}',
-          "]",
-          "```",
-          "```integration-tests",
-          "[",
-          '  {"name": "...", "code": "..."}',
-          "]",
-          "```",
-          "",
-          "Rules:",
-          "- Do not narrate, do not call test_run, do not call design_implement.",
-          "  The harness runs the tests and saves the body on your behalf.",
-          "- If the tests fail, you will be called again with the failure output.",
-          "  You can revise BOTH the body and the tests on each retry — whichever",
-          "  you believe is wrong. Emitting a `unit-tests` or `integration-tests`",
-          "  block REPLACES the stored tests entirely with whatever you emit —",
-          "  so include the COMPLETE test set every time you emit the fence, not",
-          "  a partial patch. Omit the block to keep existing tests unchanged.",
-          "  The replace-on-emit rule prevents contradictory assertions from",
-          "  piling up across cycles.",
-          "- Tests are YOURS. Siblings' tests and project-level tests are out",
-          "  of scope for you.",
-        ]),
+    "",
+    "Task — emit THREE fenced blocks in your response:",
+    "",
+    "1. ```ts — the function body (statements only, no signature, no",
+    `   surrounding \`function\` declaration). This is what \`${fn.name}\``,
+    "   does when called.",
+    "",
+    "2. ```unit-tests — JSON array of tests that exercise THIS function",
+    "   in isolation. Each entry is `{\"name\": \"...\", \"code\": \"...\"}`.",
+    frameworkGuidanceLine,
+    `   Call the function under test as \`${fn.name}(ctx, ...)\`.`,
+    "   Cover every edge case from the spec and at least one example.",
+    "   Unit tests should NOT depend on siblings — stub `ctx.fns.<name>`",
+    "   if needed.",
+    "",
+    integrationNeeded
+      ? "3. ```integration-tests — REQUIRED. JSON array, same shape."
+      : "3. ```integration-tests — MUST be an empty array `[]` for this function.",
+    integrationNeeded
+      ? "   Integration tests run with real siblings wired via `ctx.fns`."
+      : "   This function has no children to assemble, so integration tests",
+    integrationNeeded
+      ? "   Because this function assembles children, you MUST include at"
+      : "   would not run (the harness only materializes integration test",
+    integrationNeeded
+      ? "   least one integration test that exercises the full wire-up."
+      : "   files for branches). Emit `[]` and put behavior coverage in unit tests.",
+    "",
+    "Fence shape:",
+    "```ts",
+    "// body statements",
+    "```",
+    "```unit-tests",
+    "[",
+    '  {"name": "...", "code": "..."}',
+    "]",
+    "```",
+    "```integration-tests",
+    "[",
+    '  {"name": "...", "code": "..."}',
+    "]",
+    "```",
+    "",
+    "Rules:",
+    "- Do not narrate, do not call test_run, do not call design_implement.",
+    "  The harness runs the tests and saves the body on your behalf.",
+    "- If the tests fail, you will be called again with the failure output.",
+    "  You can revise BOTH the body and the tests on each retry — whichever",
+    "  you believe is wrong. Emitting a `unit-tests` or `integration-tests`",
+    "  block REPLACES the stored tests entirely with whatever you emit —",
+    "  so include the COMPLETE test set every time you emit the fence, not",
+    "  a partial patch. Omit the block to keep existing tests unchanged.",
+    "  The replace-on-emit rule prevents contradictory assertions from",
+    "  piling up across cycles.",
+    "- Tests are YOURS. Siblings' tests and project-level tests are out",
+    "  of scope for you.",
   ];
 
   if (feedback) {

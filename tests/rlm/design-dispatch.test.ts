@@ -117,27 +117,25 @@ describe("branch decomposition/recomposition enforcement", () => {
     );
     let attempt = 0;
     const prompts: string[] = [];
+    const tests = '```unit-tests\n[{"name":"u","code":"expect(1).toBe(1);"}]\n```';
     const b = createDesignDispatchBridge(
       g,
       async (p) => {
         prompts.push(p);
         attempt++;
         if (attempt === 1) {
-          // Missing childB.
-          return "```ts\nctx.fns.childA(ctx);\n```";
+          return `\`\`\`ts\nctx.fns.childA(ctx);\n\`\`\`\n${tests}`;
         }
-        // Clean call to both children.
-        return "```ts\nctx.fns.childA(ctx);\nctx.fns.childB(ctx);\n```";
+        return `\`\`\`ts\nctx.fns.childA(ctx);\nctx.fns.childB(ctx);\n\`\`\`\n${tests}`;
       },
       {
-        runTests: async () => ({ ok: true, passed: 0, failed: 0, output: "" }),
-        mode: "sketch",
+        runTests: async () => ({ ok: true, passed: 1, failed: 0, output: "" }),
+        maxReviewCycles: 0,
       },
     );
     const result = await b.dispatch("src/a.ts", "parent");
     expect(result.status).toBe("tests-green");
     expect(result.attempts).toBe(2);
-    // The retry prompt must name the missing child.
     expect(prompts[1]).toMatch(/childB/);
     expect(prompts[1]).toMatch(/call.*ctx\.fns|must.*call|missing/i);
   });
@@ -157,13 +155,14 @@ describe("branch decomposition/recomposition enforcement", () => {
       "childB",
       { params: [], returnType: "void" },
     );
+    const tests = '```unit-tests\n[{"name":"u","code":"expect(1).toBe(1);"}]\n```';
     const b = createDesignDispatchBridge(
       g,
       async () =>
-        "```ts\nctx.fns.childA(ctx);\nctx.fns.childB(ctx);\n```",
+        `\`\`\`ts\nctx.fns.childA(ctx);\nctx.fns.childB(ctx);\n\`\`\`\n${tests}`,
       {
-        runTests: async () => ({ ok: true, passed: 0, failed: 0, output: "" }),
-        mode: "sketch",
+        runTests: async () => ({ ok: true, passed: 1, failed: 0, output: "" }),
+        maxReviewCycles: 0,
       },
     );
     const result = await b.dispatch("src/a.ts", "parent");
@@ -174,138 +173,18 @@ describe("branch decomposition/recomposition enforcement", () => {
   it("leaf (children=[]) has no recomposition requirement — any body accepted", async () => {
     const g = createDesignGraph();
     g.addFunction("src/a.ts", "leaf", { params: [], returnType: "number" });
+    const tests = '```unit-tests\n[{"name":"u","code":"expect(1).toBe(1);"}]\n```';
     const b = createDesignDispatchBridge(
       g,
-      async () => "```ts\nreturn 42;\n```",
+      async () => `\`\`\`ts\nreturn 42;\n\`\`\`\n${tests}`,
       {
-        runTests: async () => ({ ok: true, passed: 0, failed: 0, output: "" }),
-        mode: "sketch",
+        runTests: async () => ({ ok: true, passed: 1, failed: 0, output: "" }),
+        maxReviewCycles: 0,
       },
     );
     const result = await b.dispatch("src/a.ts", "leaf");
     expect(result.status).toBe("tests-green");
     expect(result.attempts).toBe(1);
-  });
-});
-
-describe("sketch mode dispatch (no tests, no review)", () => {
-  it("sketch mode: saves body without calling testFn or architect review", async () => {
-    const g = createDesignGraph();
-    g.addFunction("src/a.ts", "foo", { params: [], returnType: "number" });
-    g.setSpec("src/a.ts", "foo", {
-      purpose: "returns 1",
-      inputs: [],
-      output: { type: "number", description: "" },
-      sideEffects: [],
-      dependencies: [],
-      edgeCases: [],
-      examples: [],
-    });
-    const prompts: string[] = [];
-    let testFnCalled = false;
-    const b = createDesignDispatchBridge(
-      g,
-      async (p) => {
-        prompts.push(p);
-        if (p.includes("You are the ARCHITECT reviewing")) {
-          throw new Error("architect review must NOT run in sketch mode");
-        }
-        // No unit-tests fence expected in sketch mode.
-        return "```ts\nreturn 1;\n```";
-      },
-      {
-        runTests: async () => {
-          testFnCalled = true;
-          return { ok: true, passed: 0, failed: 0, output: "" };
-        },
-        mode: "sketch",
-      },
-    );
-    const result = await b.dispatch("src/a.ts", "foo");
-    expect(result.status).toBe("tests-green");
-    expect(result.implementation).toBe("return 1;");
-    expect(g.getFunction("src/a.ts", "foo")!.implementation).toBe("return 1;");
-    expect(testFnCalled).toBe(false);
-  });
-
-  it("sketch mode: still rejects top-level imports via body-analyzer", async () => {
-    const g = createDesignGraph();
-    g.addFunction("src/a.ts", "foo", { params: [], returnType: "number" });
-    let attempt = 0;
-    const b = createDesignDispatchBridge(
-      g,
-      async () => {
-        attempt++;
-        if (attempt === 1) {
-          // Forbidden: top-level import.
-          return "```ts\nimport fs from 'node:fs';\nreturn 1;\n```";
-        }
-        return "```ts\nreturn 1;\n```";
-      },
-      {
-        runTests: async () => ({ ok: true, passed: 0, failed: 0, output: "" }),
-        mode: "sketch",
-      },
-    );
-    const result = await b.dispatch("src/a.ts", "foo");
-    expect(result.status).toBe("tests-green");
-    expect(result.implementation).toBe("return 1;");
-  });
-
-  it("sketch mode: pre-test path skips architect review + testFn (preserves loaded body)", async () => {
-    const g = createDesignGraph();
-    g.addFunction("src/a.ts", "foo", { params: [], returnType: "number" });
-    g.setSpec("src/a.ts", "foo", {
-      purpose: "x",
-      inputs: [],
-      output: { type: "number", description: "" },
-      sideEffects: [],
-      dependencies: [],
-      edgeCases: [],
-      examples: [],
-    });
-    g.setImplementation("src/a.ts", "foo", "return 7;");
-    let testFnCalled = false;
-    const b = createDesignDispatchBridge(
-      g,
-      async (p) => {
-        if (p.includes("You are the ARCHITECT reviewing")) {
-          throw new Error("architect must NOT run in sketch mode pre-test");
-        }
-        return "```ts\nreturn 7;\n```";
-      },
-      {
-        runTests: async () => {
-          testFnCalled = true;
-          return { ok: true, passed: 0, failed: 0, output: "" };
-        },
-        mode: "sketch",
-      },
-    );
-    const result = await b.dispatch("src/a.ts", "foo");
-    expect(result.status).toBe("tests-green");
-    // Body untouched.
-    expect(g.getFunction("src/a.ts", "foo")!.implementation).toBe("return 7;");
-    // testFn never called in sketch-mode pre-test.
-    expect(testFnCalled).toBe(false);
-  });
-
-  it("sketch mode: no unit-tests fence required from Implementer", async () => {
-    const g = createDesignGraph();
-    g.addFunction("src/a.ts", "foo", { params: [], returnType: "number" });
-    const b = createDesignDispatchBridge(
-      g,
-      async () => "```ts\nreturn 42;\n```", // body only, no tests fence
-      {
-        runTests: async () => ({ ok: true, passed: 0, failed: 0, output: "" }),
-        mode: "sketch",
-      },
-    );
-    const result = await b.dispatch("src/a.ts", "foo");
-    // Must NOT retry asking for tests — sketch mode doesn't need them.
-    expect(result.status).toBe("tests-green");
-    expect(result.attempts).toBe(1);
-    expect(g.getFunction("src/a.ts", "foo")!.tests).toHaveLength(0);
   });
 });
 

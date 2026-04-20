@@ -123,26 +123,6 @@ describe("buildImplementerPrompt", () => {
     expect(p).toContain("function foo(ctx: Ctx): void");
   });
 
-  it("sketch mode: prompt does NOT ask for unit-tests or integration-tests fences", async () => {
-    const g = seedGraph();
-    const p = await buildImplementerPrompt(g, "src/db.ts", "connect", undefined, {
-      mode: "sketch",
-    });
-    // The body is all we want in sketch mode — no test authoring yet.
-    expect(p).not.toMatch(/```unit-tests/);
-    expect(p).not.toMatch(/```integration-tests/);
-    // It should still ask for the code body.
-    expect(p).toMatch(/```ts/);
-    // It should tell the Implementer this is a sketch pass.
-    expect(p).toMatch(/sketch|best[- ]effort|first pass/i);
-  });
-
-  it("harden mode (default): still asks for tests fences", async () => {
-    const g = seedGraph();
-    const p = await buildImplementerPrompt(g, "src/db.ts", "connect");
-    expect(p).toMatch(/```unit-tests/);
-  });
-
   it("asks the Implementer to emit unit-tests when none exist yet", async () => {
     const g = createDesignGraph();
     g.addFunction("src/a.ts", "foo", { params: [], returnType: "void" });
