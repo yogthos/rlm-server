@@ -96,6 +96,30 @@ export interface ImplementerFeedback {
    *  the Implementer knows this is a structural proc-ts violation,
    *  not a test failure. */
   analyzerFeedback?: string;
+  /** True when every declared test failed on the last attempt (0
+   *  passing, >0 failing). Prompts the Implementer to question
+   *  whether its TESTS, not just its body, match the spec — same
+   *  agent writes both, so they can be wrong in the same way. */
+  allTestsFailed?: boolean;
+  /** True when the dispatch loop has seen two+ near-identical bodies
+   *  in a row and the test failure count hasn't dropped. The prompt
+   *  nudges the Implementer toward a materially different approach
+   *  instead of another cosmetic tweak. */
+  stagnating?: boolean;
+  /** Number of tests that PASSED on the previous attempt. Shown with
+   *  a "do not regress" directive so the Implementer protects the
+   *  green tests when revising (e.g. after architect REVISE or when
+   *  adding new tests). */
+  previousPassed?: number;
+  previousFailed?: number;
+}
+
+export interface ImplementerPromptOptions {
+  /** Dispatch mode. `"sketch"` produces a prompt that asks for the
+   *  BODY ONLY (no unit-tests / integration-tests fences) — used in
+   *  the first skeleton pass. `"harden"` (default) asks for body +
+   *  tests + test patches, matching the existing contract. */
+  mode?: "sketch" | "harden";
 }
 
 export async function buildImplementerPrompt(
@@ -103,7 +127,9 @@ export async function buildImplementerPrompt(
   module: string,
   name: string,
   feedback?: ImplementerFeedback,
+  options?: ImplementerPromptOptions,
 ): Promise<string> {
+  const mode = options?.mode ?? "harden";
   const fn = graph.getFunction(module, name);
   if (!fn) {
     throw new Error(`function not found: ${module}#${name}`);
@@ -120,6 +146,15 @@ export async function buildImplementerPrompt(
   const specBlock: string[] = fn.spec
     ? ["", "SPEC (from the Architect — your contract):", renderSpec(fn.spec)]
     : ["", "(no spec attached — derive tests from the description and signature)"];
+
+  // Test framework was picked in phase 0; adapt the test-harness
+  // guidance to match. Default to vitest for manual/legacy graphs that
+  // never went through phase 0.
+  const framework = graph.getProjectConfig()?.testFramework ?? "vitest";
+  const frameworkGuidanceLine =
+    framework === "jest"
+      ? "   The test `code` runs inside a **jest** `it(...)` body — use `jest.fn()` / `jest.spyOn()` / `jest.mock()` for mocks. The `vi` global is NOT defined under jest."
+      : "   The test `code` runs inside a **vitest** `it(...)` body — use `vi.fn()` / `vi.spyOn()` / `vi.mock()` for mocks. The `jest` global is NOT defined; `jest.fn()` throws at load time and fails every test.";
 
   const existingBlock: string[] = [];
   if (fn.implementation !== null) {
@@ -233,59 +268,82 @@ export async function buildImplementerPrompt(
       : []),
     ...existingTestsBlock,
     ...existingBlock,
-    "",
-    "Task — emit THREE fenced blocks in your response:",
-    "",
-    "1. ```ts — the function body (statements only, no signature, no",
-    `   surrounding \`function\` declaration). This is what \`${fn.name}\``,
-    "   does when called.",
-    "",
-    "2. ```unit-tests — JSON array of tests that exercise THIS function",
-    "   in isolation. Each entry is `{\"name\": \"...\", \"code\": \"...\"}`.",
-    "   The test `code` runs inside a vitest `it(...)` body — you can",
-    `   call the function under test as \`${fn.name}(ctx, ...)\` (it is`,
-    "   imported for you). Cover every edge case from the spec and at",
-    "   least one example. Unit tests should NOT depend on siblings —",
-    "   stub `ctx.fns.<name>` if needed.",
-    "",
-    integrationNeeded
-      ? "3. ```integration-tests — REQUIRED. JSON array, same shape."
-      : "3. ```integration-tests — MUST be an empty array `[]` for this function.",
-    integrationNeeded
-      ? "   Integration tests run with real siblings wired via `ctx.fns`."
-      : "   This function has no children to assemble, so integration tests",
-    integrationNeeded
-      ? "   Because this function assembles children, you MUST include at"
-      : "   would not run (the harness only materializes integration test",
-    integrationNeeded
-      ? "   least one integration test that exercises the full wire-up."
-      : "   files for branches). Emit `[]` and put behavior coverage in unit tests.",
-    "",
-    "Fence shape:",
-    "```ts",
-    "// body statements",
-    "```",
-    "```unit-tests",
-    "[",
-    '  {"name": "...", "code": "..."}',
-    "]",
-    "```",
-    "```integration-tests",
-    "[",
-    '  {"name": "...", "code": "..."}',
-    "]",
-    "```",
-    "",
-    "Rules:",
-    "- Do not narrate, do not call test_run, do not call design_implement.",
-    "  The harness runs the tests and saves the body on your behalf.",
-    "- If the tests fail, you will be called again with the failure output.",
-    "  You can revise BOTH the body and the tests on each retry — whichever",
-    "  you believe is wrong. Emitting a `unit-tests` or `integration-tests`",
-    "  block on retry patches the stored tests (same-name overwrites,",
-    "  new-name appends). Omit the block to keep existing tests unchanged.",
-    "- Tests are YOURS. Siblings' tests and project-level tests are out",
-    "  of scope for you.",
+    ...(mode === "sketch"
+      ? [
+          "",
+          "This is a **SKETCH / FIRST-PASS** dispatch. Your job is a",
+          "best-effort body — no tests yet. A later pass will harden",
+          "this with tests and reviewer feedback. Focus on the core",
+          "behavior described in the purpose.",
+          "",
+          "Task — emit ONE fenced code block:",
+          "",
+          "```ts — the function body (statements only, no signature, no",
+          `surrounding \`function\` declaration). This is what \`${fn.name}\``,
+          "does when called.",
+          "",
+          "Rules:",
+          "- Do NOT emit `unit-tests` or `integration-tests` fences.",
+          "  Tests come in the hardening pass.",
+          "- Still respect proc-ts conventions: `ctx` is the first param",
+          "  (injected), sibling calls go through `ctx.fns.<name>(ctx, ...)`,",
+          "  no top-level `import` statements.",
+        ]
+      : [
+          "",
+          "Task — emit THREE fenced blocks in your response:",
+          "",
+          "1. ```ts — the function body (statements only, no signature, no",
+          `   surrounding \`function\` declaration). This is what \`${fn.name}\``,
+          "   does when called.",
+          "",
+          "2. ```unit-tests — JSON array of tests that exercise THIS function",
+          "   in isolation. Each entry is `{\"name\": \"...\", \"code\": \"...\"}`.",
+          frameworkGuidanceLine,
+          `   Call the function under test as \`${fn.name}(ctx, ...)\`.`,
+          "   Cover every edge case from the spec and at least one example.",
+          "   Unit tests should NOT depend on siblings — stub `ctx.fns.<name>`",
+          "   if needed.",
+          "",
+          integrationNeeded
+            ? "3. ```integration-tests — REQUIRED. JSON array, same shape."
+            : "3. ```integration-tests — MUST be an empty array `[]` for this function.",
+          integrationNeeded
+            ? "   Integration tests run with real siblings wired via `ctx.fns`."
+            : "   This function has no children to assemble, so integration tests",
+          integrationNeeded
+            ? "   Because this function assembles children, you MUST include at"
+            : "   would not run (the harness only materializes integration test",
+          integrationNeeded
+            ? "   least one integration test that exercises the full wire-up."
+            : "   files for branches). Emit `[]` and put behavior coverage in unit tests.",
+          "",
+          "Fence shape:",
+          "```ts",
+          "// body statements",
+          "```",
+          "```unit-tests",
+          "[",
+          '  {"name": "...", "code": "..."}',
+          "]",
+          "```",
+          "```integration-tests",
+          "[",
+          '  {"name": "...", "code": "..."}',
+          "]",
+          "```",
+          "",
+          "Rules:",
+          "- Do not narrate, do not call test_run, do not call design_implement.",
+          "  The harness runs the tests and saves the body on your behalf.",
+          "- If the tests fail, you will be called again with the failure output.",
+          "  You can revise BOTH the body and the tests on each retry — whichever",
+          "  you believe is wrong. Emitting a `unit-tests` or `integration-tests`",
+          "  block on retry patches the stored tests (same-name overwrites,",
+          "  new-name appends). Omit the block to keep existing tests unchanged.",
+          "- Tests are YOURS. Siblings' tests and project-level tests are out",
+          "  of scope for you.",
+        ]),
   ];
 
   if (feedback) {
@@ -298,6 +356,30 @@ export async function buildImplementerPrompt(
       feedback.previousBody,
       "```",
     );
+    if (typeof feedback.previousPassed === "number") {
+      lines.push(
+        "",
+        `Previous attempt: ${feedback.previousPassed} tests passed, ${feedback.previousFailed ?? 0} failed.`,
+        "**Do not regress** — whatever you change, preserve the tests that",
+        "were already passing. If a previously-passing test now fails,",
+        "your new body broke something that was working.",
+      );
+    }
+    // Body-size advisory — a large body usually means the function is
+    // doing more than the ~30-line budget admits, which itself causes
+    // stuck-retry loops (Implementer can't hold the whole thing in
+    // view). Not blocking, just a nudge.
+    if (feedback.previousBody.length > 2000) {
+      lines.push(
+        "",
+        `**Body size warning** — your previous body was ${feedback.previousBody.length} chars.`,
+        "Proc-ts targets ~30-line functions. If this body is already",
+        "large, the spec is likely under-decomposed: split the logic",
+        "into smaller pieces (inline helpers at the top of the body,",
+        "or explicitly note in your response that this function should",
+        "have been decomposed so the Architect can re-plan).",
+      );
+    }
     if (feedback.analyzerFeedback) {
       lines.push(
         "",
@@ -331,6 +413,28 @@ export async function buildImplementerPrompt(
         "",
         "Revise whatever is wrong — the body, the tests, or both.",
       );
+      if (feedback.allTestsFailed) {
+        lines.push(
+          "",
+          "**Every test failed.** That's a strong signal the tests",
+          "themselves may be wrong — you wrote both body and tests",
+          "from the same reading of the SPEC, and if that reading was",
+          "off, they'll fail together. Before changing the body, re-read",
+          "the SPEC and check: do your TESTS' expectations match what",
+          "the spec actually requires? If not, fix the tests first.",
+        );
+      }
+      if (feedback.stagnating) {
+        lines.push(
+          "",
+          "**Stagnation detected** — your recent attempts have produced",
+          "nearly identical bodies and the same failure count. Cosmetic",
+          "tweaks aren't converging. Try a **materially different**",
+          "approach: re-read the SPEC from the top, reconsider your",
+          "data flow and algorithm, and rewrite the body from scratch",
+          "rather than patching the previous one.",
+        );
+      }
     }
   }
 

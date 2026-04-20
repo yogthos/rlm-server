@@ -97,6 +97,218 @@ describe("extractUnitTests / extractIntegrationTests", () => {
   });
 });
 
+describe("branch decomposition/recomposition enforcement", () => {
+  it("branch body that doesn't call a declared child is rejected with actionable feedback", async () => {
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "parent", { params: [], returnType: "void" });
+    g.addFunctionChild(
+      "parent",
+      "src/a.ts",
+      "childA",
+      { params: [], returnType: "void" },
+      "first child",
+    );
+    g.addFunctionChild(
+      "parent",
+      "src/a.ts",
+      "childB",
+      { params: [], returnType: "void" },
+      "second child",
+    );
+    let attempt = 0;
+    const prompts: string[] = [];
+    const b = createDesignDispatchBridge(
+      g,
+      async (p) => {
+        prompts.push(p);
+        attempt++;
+        if (attempt === 1) {
+          // Missing childB.
+          return "```ts\nctx.fns.childA(ctx);\n```";
+        }
+        // Clean call to both children.
+        return "```ts\nctx.fns.childA(ctx);\nctx.fns.childB(ctx);\n```";
+      },
+      {
+        runTests: async () => ({ ok: true, passed: 0, failed: 0, output: "" }),
+        mode: "sketch",
+      },
+    );
+    const result = await b.dispatch("src/a.ts", "parent");
+    expect(result.status).toBe("tests-green");
+    expect(result.attempts).toBe(2);
+    // The retry prompt must name the missing child.
+    expect(prompts[1]).toMatch(/childB/);
+    expect(prompts[1]).toMatch(/call.*ctx\.fns|must.*call|missing/i);
+  });
+
+  it("branch body that calls ALL declared children is accepted", async () => {
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "parent", { params: [], returnType: "void" });
+    g.addFunctionChild(
+      "parent",
+      "src/a.ts",
+      "childA",
+      { params: [], returnType: "void" },
+    );
+    g.addFunctionChild(
+      "parent",
+      "src/a.ts",
+      "childB",
+      { params: [], returnType: "void" },
+    );
+    const b = createDesignDispatchBridge(
+      g,
+      async () =>
+        "```ts\nctx.fns.childA(ctx);\nctx.fns.childB(ctx);\n```",
+      {
+        runTests: async () => ({ ok: true, passed: 0, failed: 0, output: "" }),
+        mode: "sketch",
+      },
+    );
+    const result = await b.dispatch("src/a.ts", "parent");
+    expect(result.status).toBe("tests-green");
+    expect(result.attempts).toBe(1);
+  });
+
+  it("leaf (children=[]) has no recomposition requirement — any body accepted", async () => {
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "leaf", { params: [], returnType: "number" });
+    const b = createDesignDispatchBridge(
+      g,
+      async () => "```ts\nreturn 42;\n```",
+      {
+        runTests: async () => ({ ok: true, passed: 0, failed: 0, output: "" }),
+        mode: "sketch",
+      },
+    );
+    const result = await b.dispatch("src/a.ts", "leaf");
+    expect(result.status).toBe("tests-green");
+    expect(result.attempts).toBe(1);
+  });
+});
+
+describe("sketch mode dispatch (no tests, no review)", () => {
+  it("sketch mode: saves body without calling testFn or architect review", async () => {
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "foo", { params: [], returnType: "number" });
+    g.setSpec("src/a.ts", "foo", {
+      purpose: "returns 1",
+      inputs: [],
+      output: { type: "number", description: "" },
+      sideEffects: [],
+      dependencies: [],
+      edgeCases: [],
+      examples: [],
+    });
+    const prompts: string[] = [];
+    let testFnCalled = false;
+    const b = createDesignDispatchBridge(
+      g,
+      async (p) => {
+        prompts.push(p);
+        if (p.includes("You are the ARCHITECT reviewing")) {
+          throw new Error("architect review must NOT run in sketch mode");
+        }
+        // No unit-tests fence expected in sketch mode.
+        return "```ts\nreturn 1;\n```";
+      },
+      {
+        runTests: async () => {
+          testFnCalled = true;
+          return { ok: true, passed: 0, failed: 0, output: "" };
+        },
+        mode: "sketch",
+      },
+    );
+    const result = await b.dispatch("src/a.ts", "foo");
+    expect(result.status).toBe("tests-green");
+    expect(result.implementation).toBe("return 1;");
+    expect(g.getFunction("src/a.ts", "foo")!.implementation).toBe("return 1;");
+    expect(testFnCalled).toBe(false);
+  });
+
+  it("sketch mode: still rejects top-level imports via body-analyzer", async () => {
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "foo", { params: [], returnType: "number" });
+    let attempt = 0;
+    const b = createDesignDispatchBridge(
+      g,
+      async () => {
+        attempt++;
+        if (attempt === 1) {
+          // Forbidden: top-level import.
+          return "```ts\nimport fs from 'node:fs';\nreturn 1;\n```";
+        }
+        return "```ts\nreturn 1;\n```";
+      },
+      {
+        runTests: async () => ({ ok: true, passed: 0, failed: 0, output: "" }),
+        mode: "sketch",
+      },
+    );
+    const result = await b.dispatch("src/a.ts", "foo");
+    expect(result.status).toBe("tests-green");
+    expect(result.implementation).toBe("return 1;");
+  });
+
+  it("sketch mode: pre-test path skips architect review + testFn (preserves loaded body)", async () => {
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "foo", { params: [], returnType: "number" });
+    g.setSpec("src/a.ts", "foo", {
+      purpose: "x",
+      inputs: [],
+      output: { type: "number", description: "" },
+      sideEffects: [],
+      dependencies: [],
+      edgeCases: [],
+      examples: [],
+    });
+    g.setImplementation("src/a.ts", "foo", "return 7;");
+    let testFnCalled = false;
+    const b = createDesignDispatchBridge(
+      g,
+      async (p) => {
+        if (p.includes("You are the ARCHITECT reviewing")) {
+          throw new Error("architect must NOT run in sketch mode pre-test");
+        }
+        return "```ts\nreturn 7;\n```";
+      },
+      {
+        runTests: async () => {
+          testFnCalled = true;
+          return { ok: true, passed: 0, failed: 0, output: "" };
+        },
+        mode: "sketch",
+      },
+    );
+    const result = await b.dispatch("src/a.ts", "foo");
+    expect(result.status).toBe("tests-green");
+    // Body untouched.
+    expect(g.getFunction("src/a.ts", "foo")!.implementation).toBe("return 7;");
+    // testFn never called in sketch-mode pre-test.
+    expect(testFnCalled).toBe(false);
+  });
+
+  it("sketch mode: no unit-tests fence required from Implementer", async () => {
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "foo", { params: [], returnType: "number" });
+    const b = createDesignDispatchBridge(
+      g,
+      async () => "```ts\nreturn 42;\n```", // body only, no tests fence
+      {
+        runTests: async () => ({ ok: true, passed: 0, failed: 0, output: "" }),
+        mode: "sketch",
+      },
+    );
+    const result = await b.dispatch("src/a.ts", "foo");
+    // Must NOT retry asking for tests — sketch mode doesn't need them.
+    expect(result.status).toBe("tests-green");
+    expect(result.attempts).toBe(1);
+    expect(g.getFunction("src/a.ts", "foo")!.tests).toHaveLength(0);
+  });
+});
+
 describe("body-analyzer integration", () => {
   it("rejects a body containing a top-level import statement", async () => {
     const g = createDesignGraph();
@@ -431,6 +643,48 @@ describe("parseReviewVerdict", () => {
     expect(parseReviewVerdict("```\nrevise\nneed more\n```").approved).toBe(false);
   });
 
+  it("parses the spec field tag on a REVISE verdict", () => {
+    const v = parseReviewVerdict(
+      "```\nREVISE purpose\nBody doesn't match the spec's stated purpose.\n```",
+    );
+    expect(v.approved).toBe(false);
+    expect(v.specField).toBe("purpose");
+    expect(v.feedback).toMatch(/stated purpose/);
+  });
+
+  it("accepts other valid spec fields (edgeCases, sideEffects, output, inputs, dependencies, examples)", () => {
+    for (const field of [
+      "edgeCases",
+      "sideEffects",
+      "output",
+      "inputs",
+      "dependencies",
+      "examples",
+    ]) {
+      const v = parseReviewVerdict(
+        "```\nREVISE " + field + "\nsome feedback\n```",
+      );
+      expect(v.approved).toBe(false);
+      expect(v.specField).toBe(field);
+    }
+  });
+
+  it("REVISE without a recognized field tag still rejects (no field coerced)", () => {
+    const v = parseReviewVerdict("```\nREVISE\ngeneric feedback\n```");
+    expect(v.approved).toBe(false);
+    expect(v.specField).toBeUndefined();
+  });
+
+  it("REVISE with an unknown tag leaves specField undefined (back-compat)", () => {
+    const v = parseReviewVerdict(
+      "```\nREVISE quality\ncode smell\n```",
+    );
+    expect(v.approved).toBe(false);
+    // `quality` is not in our spec-field allowlist — treat as
+    // untagged to avoid giving the Implementer a misleading citation.
+    expect(v.specField).toBeUndefined();
+  });
+
   it("handles REVISE with trailing punctuation or markdown", () => {
     expect(parseReviewVerdict("```\nREVISE:\nbody doesn't handle X\n```").approved).toBe(false);
     expect(parseReviewVerdict("```\n**REVISE**\nbody doesn't handle X\n```").approved).toBe(false);
@@ -498,6 +752,503 @@ describe("architect review (post-green gate)", () => {
     expect(result.status).toBe("tests-green");
     // One Implementer call + one Architect review.
     expect(calls.filter((c) => c.includes("You are the ARCHITECT reviewing"))).toHaveLength(1);
+  });
+
+  it("review prompt shows the full wrapped function (signature + body), not body-only", async () => {
+    // Without this, the architect sees a body like `const x = ...; return x;`
+    // and mistakenly concludes "no ctx parameter" — the wrapping
+    // signature is invisible. The review must show the rendered
+    // `export default function <name>(ctx: Ctx, ...) { <body> }` form.
+    const g = createDesignGraph();
+    g.addFunction(
+      "src/a.ts",
+      "foo",
+      { params: [{ name: "n", type: "number" }], returnType: "string" },
+    );
+    g.setSpec("src/a.ts", "foo", {
+      purpose: "stringify n",
+      inputs: [{ name: "n", type: "number", description: "the number" }],
+      output: { type: "string", description: "" },
+      sideEffects: [],
+      dependencies: [],
+      edgeCases: [],
+      examples: [],
+    });
+    const prompts: string[] = [];
+    const b = createDesignDispatchBridge(
+      g,
+      async (p) => {
+        prompts.push(p);
+        if (p.includes("You are the ARCHITECT reviewing")) {
+          return "```\nAPPROVE\n```";
+        }
+        return (
+          "```ts\nreturn String(n);\n```\n" +
+          '```unit-tests\n[{"name":"u","code":"expect(foo(ctx,1)).toBe(\\"1\\");"}]\n```'
+        );
+      },
+      {
+        runTests: async () => ({ ok: true, passed: 1, failed: 0, output: "ok" }),
+        maxReviewCycles: 1,
+      },
+    );
+    await b.dispatch("src/a.ts", "foo");
+    const review = prompts.find((p) =>
+      p.includes("You are the ARCHITECT reviewing"),
+    );
+    expect(review).toBeDefined();
+    // Must show the FULL signature, not just the body statements.
+    expect(review).toMatch(/function foo\(ctx: Ctx, n: number\): string/);
+  });
+
+  it("review prompt enumerates the spec's edgeCases verbatim + says NOT to invent new ones", async () => {
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "foo", { params: [], returnType: "void" });
+    g.setSpec("src/a.ts", "foo", {
+      purpose: "does x",
+      inputs: [],
+      output: { type: "void", description: "" },
+      sideEffects: [],
+      dependencies: [],
+      edgeCases: [
+        "empty input returns []",
+        "null throws TypeError",
+      ],
+      examples: [],
+    });
+    const prompts: string[] = [];
+    const b = createDesignDispatchBridge(
+      g,
+      async (p) => {
+        prompts.push(p);
+        if (p.includes("You are the ARCHITECT reviewing")) {
+          return "```\nAPPROVE\n```";
+        }
+        return (
+          "```ts\nreturn;\n```\n" +
+          '```unit-tests\n[{"name":"u","code":"foo(ctx);"}]\n```'
+        );
+      },
+      {
+        runTests: async () => ({ ok: true, passed: 1, failed: 0, output: "ok" }),
+        maxReviewCycles: 1,
+      },
+    );
+    await b.dispatch("src/a.ts", "foo");
+    const review = prompts.find((p) =>
+      p.includes("You are the ARCHITECT reviewing"),
+    );
+    expect(review).toBeDefined();
+    // Must show the edgeCases verbatim so the architect anchors to them.
+    expect(review).toContain("empty input returns []");
+    expect(review).toContain("null throws TypeError");
+    // Must tell the architect NOT to invent edgeCases outside the list.
+    expect(review).toMatch(/NOT.*invent|only.*(?:listed|above)/i);
+  });
+
+  it("review prompt instructs REVISE with a spec-field tag (structured verdict)", async () => {
+    const g = seed();
+    const prompts: string[] = [];
+    const b = createDesignDispatchBridge(
+      g,
+      async (p) => {
+        prompts.push(p);
+        if (p.includes("You are the ARCHITECT reviewing")) {
+          return "```\nAPPROVE\n```";
+        }
+        return (
+          "```ts\nreturn 1;\n```\n" +
+          '```unit-tests\n[{"name":"u","code":"expect(foo(ctx)).toBe(1);"}]\n```'
+        );
+      },
+      {
+        runTests: async () => ({ ok: true, passed: 1, failed: 0, output: "ok" }),
+        maxReviewCycles: 1,
+      },
+    );
+    await b.dispatch("src/a.ts", "foo");
+    const review = prompts.find((p) =>
+      p.includes("You are the ARCHITECT reviewing"),
+    );
+    expect(review).toBeDefined();
+    // The prompt must advertise the allowed spec fields so the LLM
+    // cites one — this traces critiques back to the spec.
+    expect(review).toContain("purpose");
+    expect(review).toContain("edgeCases");
+    expect(review).toContain("sideEffects");
+    expect(review).toMatch(/REVISE <\w+>|REVISE <[\w|]+>/);
+  });
+
+  it("review prompt includes proc-ts convention reminder (ctx, ctx.fns, no imports)", async () => {
+    const g = seed();
+    const prompts: string[] = [];
+    const b = createDesignDispatchBridge(
+      g,
+      async (p) => {
+        prompts.push(p);
+        if (p.includes("You are the ARCHITECT reviewing")) {
+          return "```\nAPPROVE\n```";
+        }
+        return (
+          "```ts\nreturn 1;\n```\n" +
+          '```unit-tests\n[{"name":"u","code":"expect(foo(ctx)).toBe(1);"}]\n```'
+        );
+      },
+      {
+        runTests: async () => ({ ok: true, passed: 1, failed: 0, output: "ok" }),
+        maxReviewCycles: 1,
+      },
+    );
+    await b.dispatch("src/a.ts", "foo");
+    const review = prompts.find((p) =>
+      p.includes("You are the ARCHITECT reviewing"),
+    );
+    expect(review).toBeDefined();
+    // proc-ts reminder must appear so the architect doesn't flag
+    // ctx-passing or ctx.fns.<name>(ctx, …) as incorrect.
+    expect(review).toMatch(/proc-ts/i);
+    expect(review).toMatch(/ctx\.fns/);
+  });
+
+  it("review prompt anchors critique to the spec (no general-quality feature creep)", async () => {
+    const g = seed();
+    const prompts: string[] = [];
+    const b = createDesignDispatchBridge(
+      g,
+      async (p) => {
+        prompts.push(p);
+        if (p.includes("You are the ARCHITECT reviewing")) {
+          return "```\nAPPROVE\n```";
+        }
+        return (
+          "```ts\nreturn 1;\n```\n" +
+          '```unit-tests\n[{"name":"u","code":"expect(foo(ctx)).toBe(1);"}]\n```'
+        );
+      },
+      {
+        runTests: async () => ({ ok: true, passed: 1, failed: 0, output: "ok" }),
+        maxReviewCycles: 1,
+      },
+    );
+    await b.dispatch("src/a.ts", "foo");
+    const review = prompts.find((p) =>
+      p.includes("You are the ARCHITECT reviewing"),
+    );
+    expect(review).toBeDefined();
+    // Must tell the architect to anchor to the SPEC and not invent
+    // requirements outside it.
+    expect(review).toMatch(/only (?:raise|flag|reject) .* (?:in|from) the SPEC|DO NOT .* outside|anchor .* spec/i);
+  });
+
+  it("stagnation hint fires at most ONCE per dispatch even if conditions persist", async () => {
+    const g = seed();
+    const prompts: string[] = [];
+    // All attempts return the same body + same failures — stagnation
+    // conditions persist. We should see the hint once, then not again.
+    const b = createDesignDispatchBridge(
+      g,
+      async (p) => {
+        prompts.push(p);
+        return (
+          "```ts\nreturn 0;\n```\n" +
+          '```unit-tests\n[{"name":"u","code":"expect(foo(ctx)).toBe(1);"}]\n```'
+        );
+      },
+      {
+        runTests: async () => ({ ok: false, passed: 0, failed: 2, output: "red" }),
+        maxReviewCycles: 0,
+        maxAttempts: 6,
+      },
+    );
+    await b.dispatch("src/a.ts", "foo");
+    const stagnationPrompts = prompts.filter((p) =>
+      /Stagnation detected/.test(p),
+    );
+    // Hint fires at most once even though conditions persist across
+    // multiple attempts. Nagging doesn't help.
+    expect(stagnationPrompts.length).toBeLessThanOrEqual(1);
+  });
+
+  it("stagnation does NOT flag on review-driven iterations (tests green but architect REVISE)", async () => {
+    // Attempts that go GREEN and get REVISE'd by the architect are not
+    // "cosmetic tweaks" — the Implementer is responding to reviewer
+    // feedback. Flagging them as stagnation sends a misleading nudge.
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "foo", { params: [], returnType: "number" });
+    g.setSpec("src/a.ts", "foo", {
+      purpose: "returns 1",
+      inputs: [],
+      output: { type: "number", description: "" },
+      sideEffects: [],
+      dependencies: [],
+      edgeCases: [],
+      examples: [],
+    });
+    const prompts: string[] = [];
+    let reviewIdx = 0;
+    const b = createDesignDispatchBridge(
+      g,
+      async (p) => {
+        prompts.push(p);
+        if (p.includes("You are the ARCHITECT reviewing")) {
+          reviewIdx++;
+          // Two REVISE cycles, then APPROVE.
+          if (reviewIdx < 3) return "```\nREVISE purpose\nkeep iterating\n```";
+          return "```\nAPPROVE\n```";
+        }
+        // Each attempt returns a similar-length body (triggers the
+        // length heuristic) and tests always pass.
+        return (
+          "```ts\nreturn 1;\n```\n" +
+          '```unit-tests\n[{"name":"u","code":"expect(foo(ctx)).toBe(1);"}]\n```'
+        );
+      },
+      {
+        runTests: async () => ({ ok: true, passed: 1, failed: 0, output: "ok" }),
+        maxReviewCycles: 3,
+      },
+    );
+    await b.dispatch("src/a.ts", "foo");
+    const implementerPrompts = prompts.filter(
+      (p) => !p.includes("You are the ARCHITECT reviewing"),
+    );
+    // None of the retries should claim stagnation — tests never
+    // failed, and failures going from 0 to 0 isn't stagnation.
+    for (const p of implementerPrompts) {
+      expect(p).not.toMatch(/Stagnation detected/);
+    }
+  });
+
+  it("pre-test green → REVISE → regenerate-loop red exhaust preserves the pre-loaded body", async () => {
+    // Repro: stored body was green AND architect REVISE'd in pre-test.
+    // The regenerate loop then burns all attempts on broken bodies.
+    // On exhaustion the pre-loaded green body must be restored —
+    // without the fix, lastGreenBody is null and we drop to stub.
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "foo", { params: [], returnType: "number" });
+    g.setSpec("src/a.ts", "foo", {
+      purpose: "returns 1",
+      inputs: [],
+      output: { type: "number", description: "" },
+      sideEffects: [],
+      dependencies: [],
+      edgeCases: [],
+      examples: [],
+    });
+    // Seed a working body on the graph — simulates a loaded/stored impl.
+    g.setImplementation("src/a.ts", "foo", "return 1;");
+    const b = createDesignDispatchBridge(
+      g,
+      async (p) => {
+        if (p.includes("You are the ARCHITECT reviewing")) {
+          return "```\nREVISE purpose\nnever happy\n```";
+        }
+        // All Implementer responses produce a broken body (fails tests).
+        return (
+          "```ts\nreturn 0;\n```\n" +
+          '```unit-tests\n[{"name":"u","code":"expect(foo(ctx)).toBe(1);"}]\n```'
+        );
+      },
+      {
+        runTests: async (_g, c) => ({
+          ok: c.body === "return 1;",
+          passed: c.body === "return 1;" ? 1 : 0,
+          failed: c.body === "return 1;" ? 0 : 1,
+          output: c.body === "return 1;" ? "pass" : "red",
+        }),
+        maxReviewCycles: 3,
+        maxAttempts: 3,
+      },
+    );
+    await b.dispatch("src/a.ts", "foo");
+    // Pre-loaded green body must survive the failed regenerate loop.
+    expect(g.getFunction("src/a.ts", "foo")!.implementation).toBe("return 1;");
+    expect(g.getFunction("src/a.ts", "foo")!.status).toBe("architect-rejected");
+  });
+
+  it("preserves a tests-green body when architect cap exhausts (never regress to null)", async () => {
+    // Attempt 1: tests green → architect REVISE (cycle 1).
+    // Attempt 2: tests green → architect REVISE (cycle 2).
+    // Attempt 3: tests green → architect REVISE (cycle 3 = cap).
+    // At cap exhaustion, the LAST green body must be saved to the
+    // graph with architect-rejected status — better to have
+    // functional-but-unreviewed code than a null implementation.
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "foo", { params: [], returnType: "number" });
+    g.setSpec("src/a.ts", "foo", {
+      purpose: "returns 1",
+      inputs: [],
+      output: { type: "number", description: "" },
+      sideEffects: [],
+      dependencies: [],
+      edgeCases: [],
+      examples: [],
+    });
+    const b = createDesignDispatchBridge(
+      g,
+      async (p) => {
+        if (p.includes("You are the ARCHITECT reviewing")) {
+          return "```\nREVISE purpose\nnever happy\n```";
+        }
+        return (
+          "```ts\nreturn 1;\n```\n" +
+          '```unit-tests\n[{"name":"u","code":"expect(foo(ctx)).toBe(1);"}]\n```'
+        );
+      },
+      {
+        runTests: async () => ({ ok: true, passed: 1, failed: 0, output: "ok" }),
+        maxReviewCycles: 3,
+        maxAttempts: 5,
+      },
+    );
+    const result = await b.dispatch("src/a.ts", "foo");
+    // Dispatch is marked failed per the architect-cap policy, but
+    // the last tests-green body is preserved on the graph so
+    // finalize can emit real code.
+    expect(result.status).toBe("failed");
+    expect(result.implementation).toBe("return 1;");
+    expect(g.getFunction("src/a.ts", "foo")!.implementation).toBe("return 1;");
+    expect(g.getFunction("src/a.ts", "foo")!.status).toBe("architect-rejected");
+  });
+
+  it("preserves the last tests-green body when attempts exhaust after regression (handleRequest pattern)", async () => {
+    // Attempt 1: tests green → architect REVISE.
+    // Attempt 2+: tests RED (regression triggered by chasing review).
+    // On attempts-exhausted, the attempt-1 green body must be saved
+    // (this is the `handleRequest` regression pattern from the run).
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "foo", { params: [], returnType: "number" });
+    g.setSpec("src/a.ts", "foo", {
+      purpose: "returns 1",
+      inputs: [],
+      output: { type: "number", description: "" },
+      sideEffects: [],
+      dependencies: [],
+      edgeCases: [],
+      examples: [],
+    });
+    let attempt = 0;
+    const b = createDesignDispatchBridge(
+      g,
+      async (p) => {
+        if (p.includes("You are the ARCHITECT reviewing")) {
+          return "```\nREVISE purpose\nneeds more\n```";
+        }
+        attempt++;
+        if (attempt === 1) {
+          // Green body that satisfies the spec directly.
+          return (
+            "```ts\nreturn 1;\n```\n" +
+            '```unit-tests\n[{"name":"u","code":"expect(foo(ctx)).toBe(1);"}]\n```'
+          );
+        }
+        // All subsequent attempts emit a wrong body that fails tests.
+        return (
+          "```ts\nreturn 0;\n```\n" +
+          '```unit-tests\n[{"name":"u","code":"expect(foo(ctx)).toBe(1);"}]\n```'
+        );
+      },
+      {
+        runTests: async (_g, c) => ({
+          ok: c.body === "return 1;",
+          passed: c.body === "return 1;" ? 1 : 0,
+          failed: c.body === "return 1;" ? 0 : 1,
+          output: c.body === "return 1;" ? "pass" : "red",
+        }),
+        maxReviewCycles: 3,
+        maxAttempts: 4,
+      },
+    );
+    const result = await b.dispatch("src/a.ts", "foo");
+    expect(result.implementation).toBe("return 1;");
+    expect(g.getFunction("src/a.ts", "foo")!.implementation).toBe("return 1;");
+    expect(g.getFunction("src/a.ts", "foo")!.status).toBe("architect-rejected");
+  });
+
+  it("cycle 2+ review prompt includes the PRIOR cycle's feedback (no flip-flops)", async () => {
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "foo", { params: [], returnType: "number" });
+    g.setSpec("src/a.ts", "foo", {
+      purpose: "returns 1",
+      inputs: [],
+      output: { type: "number", description: "" },
+      sideEffects: [],
+      dependencies: [],
+      edgeCases: ["zero", "negative"],
+      examples: [],
+    });
+    const reviewPrompts: string[] = [];
+    let reviewIdx = 0;
+    const b = createDesignDispatchBridge(
+      g,
+      async (p) => {
+        if (p.includes("You are the ARCHITECT reviewing")) {
+          reviewPrompts.push(p);
+          reviewIdx++;
+          if (reviewIdx === 1)
+            return "```\nREVISE edgeCases\nMissing the zero-input case explicitly.\n```";
+          return "```\nAPPROVE\n```";
+        }
+        return (
+          "```ts\nreturn 1;\n```\n" +
+          '```unit-tests\n[{"name":"u","code":"expect(foo(ctx)).toBe(1);"}]\n```'
+        );
+      },
+      {
+        runTests: async () => ({ ok: true, passed: 1, failed: 0, output: "ok" }),
+        maxReviewCycles: 2,
+      },
+    );
+    await b.dispatch("src/a.ts", "foo");
+    // Cycle 2's review prompt must embed cycle 1's critique so the
+    // architect can confirm it was addressed (vs silently contradict).
+    expect(reviewPrompts.length).toBe(2);
+    expect(reviewPrompts[1]).toMatch(/previous.*feedback|prior.*cycle|cycle 1/i);
+    expect(reviewPrompts[1]).toContain("zero-input case");
+  });
+
+  it("REVISE with a spec-field tag → retry prompt leads with the cited field", async () => {
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "foo", { params: [], returnType: "number" });
+    g.setSpec("src/a.ts", "foo", {
+      purpose: "returns 1",
+      inputs: [],
+      output: { type: "number", description: "" },
+      sideEffects: [],
+      dependencies: [],
+      edgeCases: ["zero", "negative"],
+      examples: [],
+    });
+    const prompts: string[] = [];
+    let reviewIdx = 0;
+    const b = createDesignDispatchBridge(
+      g,
+      async (p) => {
+        prompts.push(p);
+        if (p.includes("You are the ARCHITECT reviewing")) {
+          reviewIdx++;
+          if (reviewIdx === 1) {
+            return "```\nREVISE edgeCases\nMissing the zero-input case.\n```";
+          }
+          return "```\nAPPROVE\n```";
+        }
+        return (
+          "```ts\nreturn 1;\n```\n" +
+          '```unit-tests\n[{"name":"u","code":"expect(foo(ctx)).toBe(1);"}]\n```'
+        );
+      },
+      {
+        runTests: async () => ({ ok: true, passed: 1, failed: 0, output: "ok" }),
+        maxReviewCycles: 2,
+      },
+    );
+    await b.dispatch("src/a.ts", "foo");
+    const implementerPrompts = prompts.filter(
+      (p) => !p.includes("You are the ARCHITECT reviewing"),
+    );
+    // Second Implementer prompt must name the cited spec field so the
+    // Implementer knows which part of the spec to consult.
+    expect(implementerPrompts[1]).toMatch(/spec\.edgeCases|edgeCases/);
   });
 
   it("REVISE after tests-green → second Implementer prompt contains architect feedback", async () => {
@@ -645,8 +1396,10 @@ describe("architect review (post-green gate)", () => {
         if (p.includes("You are the ARCHITECT reviewing")) {
           return "```\nAPPROVE\n```";
         }
+        // Branch body must call all declared children (new
+        // decomposition/recomposition check).
         return (
-          "```ts\nreturn 1;\n```\n" +
+          "```ts\nctx.fns.childA(ctx, 2);\nctx.fns.childB(ctx);\nreturn 1;\n```\n" +
           '```unit-tests\n[{"name":"u","code":"expect(foo(ctx)).toBe(1);"}]\n```\n' +
           '```integration-tests\n[{"name":"i","code":"expect(foo(ctx)).toBe(1);"}]\n```'
         );
@@ -712,6 +1465,60 @@ describe("architect review (post-green gate)", () => {
     }
   });
 
+  it("'all tests failed' flag clears when the next attempt fails extraction (no tests ran)", async () => {
+    // Staleness repro:
+    //   attempt 1 → tests red 0/N (flag TRUE)
+    //   attempt 2 → chat returns no fenced block → extraction fails
+    //               → continue without running tests
+    //   attempt 3 → prompt must NOT say "every test failed" because
+    //               no tests ran on attempt 2. Without the fix the
+    //               stale flag bleeds into this prompt.
+    const g = seed();
+    const prompts: string[] = [];
+    let attempt = 0;
+    const b = createDesignDispatchBridge(
+      g,
+      async (p) => {
+        prompts.push(p);
+        attempt++;
+        if (attempt === 1) {
+          return (
+            "```ts\nreturn 0;\n```\n" +
+            '```unit-tests\n[{"name":"u","code":"expect(foo(ctx)).toBe(1);"}]\n```'
+          );
+        }
+        if (attempt === 2) {
+          // No fenced block — extraction fails.
+          return "no fence at all";
+        }
+        // Attempt 3: valid body that goes green so dispatch terminates.
+        return (
+          "```ts\nreturn 1;\n```\n" +
+          '```unit-tests\n[{"name":"u","code":"expect(foo(ctx)).toBe(1);"}]\n```'
+        );
+      },
+      {
+        runTests: async (_g, c) => {
+          const passes = c.body === "return 1;";
+          return {
+            ok: passes,
+            passed: passes ? 1 : 0,
+            failed: passes ? 0 : 1,
+            output: passes ? "ok" : "red",
+          };
+        },
+        maxReviewCycles: 0,
+        maxAttempts: 5,
+      },
+    );
+    await b.dispatch("src/a.ts", "foo");
+    // Attempt 2 SHOULD carry the hint — attempt 1 was 0/1.
+    expect(prompts[1]).toMatch(/every test failed/i);
+    // Attempt 3 must NOT — attempt 2 didn't run tests (extraction fail).
+    expect(prompts[2]).toBeDefined();
+    expect(prompts[2]).not.toMatch(/every test failed/i);
+  });
+
   it("maxReviewCycles=0 disables review (existing behavior)", async () => {
     const g = seed();
     const prompts: string[] = [];
@@ -732,6 +1539,292 @@ describe("architect review (post-green gate)", () => {
     const result = await b.dispatch("src/a.ts", "foo");
     expect(result.status).toBe("tests-green");
     expect(prompts.some((p) => p.includes("You are the ARCHITECT reviewing"))).toBe(false);
+  });
+});
+
+describe("askDecompose complexity floor (skip the LLM call)", () => {
+  it("does NOT auto-IMPLEMENT when spec.purpose is long (>300 chars — proxy for scope)", async () => {
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "foo", { params: [], returnType: "number" });
+    g.setSpec("src/a.ts", "foo", {
+      purpose: "x".repeat(400),
+      inputs: [],
+      output: { type: "number", description: "" },
+      sideEffects: [],
+      dependencies: [],
+      edgeCases: ["a", "b"],
+      examples: [],
+    });
+    let decomposeAsked = false;
+    const b = createDesignDispatchBridge(
+      g,
+      async (p) => {
+        if (p.includes("deciding how to implement")) {
+          decomposeAsked = true;
+          return "```\nIMPLEMENT\n```";
+        }
+        if (p.includes("You are the ARCHITECT reviewing")) {
+          return "```\nAPPROVE\n```";
+        }
+        return (
+          "```ts\nreturn 1;\n```\n" +
+          '```unit-tests\n[{"name":"u","code":"expect(foo(ctx)).toBe(1);"}]\n```'
+        );
+      },
+      {
+        decompose: async () => true,
+        runTests: async () => ({ ok: true, passed: 1, failed: 0, output: "ok" }),
+        maxReviewCycles: 0,
+      },
+    );
+    await b.dispatch("src/a.ts", "foo");
+    // Long purpose indicates scope — LLM must be consulted for the
+    // DECOMPOSE decision even if deps=0 and edgeCases are few.
+    expect(decomposeAsked).toBe(true);
+  });
+
+  it("does NOT auto-IMPLEMENT when spec.sideEffects.length > 1 (multiple concerns)", async () => {
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "foo", { params: [], returnType: "void" });
+    g.setSpec("src/a.ts", "foo", {
+      purpose: "short",
+      inputs: [],
+      output: { type: "void", description: "" },
+      sideEffects: ["writes a file", "sends an HTTP response", "logs to console"],
+      dependencies: [],
+      edgeCases: [],
+      examples: [],
+    });
+    let decomposeAsked = false;
+    const b = createDesignDispatchBridge(
+      g,
+      async (p) => {
+        if (p.includes("deciding how to implement")) {
+          decomposeAsked = true;
+          return "```\nIMPLEMENT\n```";
+        }
+        if (p.includes("You are the ARCHITECT reviewing")) {
+          return "```\nAPPROVE\n```";
+        }
+        return (
+          "```ts\nreturn;\n```\n" +
+          '```unit-tests\n[{"name":"u","code":"foo(ctx);"}]\n```'
+        );
+      },
+      {
+        decompose: async () => true,
+        runTests: async () => ({ ok: true, passed: 1, failed: 0, output: "ok" }),
+        maxReviewCycles: 0,
+      },
+    );
+    await b.dispatch("src/a.ts", "foo");
+    expect(decomposeAsked).toBe(true);
+  });
+
+  it("auto-IMPLEMENT when spec has 0 deps and <=5 edgeCases — no chat call for decompose", async () => {
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "foo", { params: [], returnType: "number" });
+    g.setSpec("src/a.ts", "foo", {
+      purpose: "returns 1",
+      inputs: [],
+      output: { type: "number", description: "" },
+      sideEffects: [],
+      dependencies: [],
+      edgeCases: ["zero", "negative"],
+      examples: [],
+    });
+    const prompts: string[] = [];
+    const b = createDesignDispatchBridge(
+      g,
+      async (p) => {
+        prompts.push(p);
+        if (p.includes("deciding how to implement")) {
+          throw new Error("askDecompose LLM call must be skipped for leaf spec");
+        }
+        if (p.includes("You are the ARCHITECT reviewing")) {
+          return "```\nAPPROVE\n```";
+        }
+        return (
+          "```ts\nreturn 1;\n```\n" +
+          '```unit-tests\n[{"name":"u","code":"expect(foo(ctx)).toBe(1);"}]\n```'
+        );
+      },
+      {
+        decompose: async () => true,
+        runTests: async () => ({ ok: true, passed: 1, failed: 0, output: "ok" }),
+        maxReviewCycles: 1,
+      },
+    );
+    const result = await b.dispatch("src/a.ts", "foo");
+    expect(result.status).toBe("tests-green");
+  });
+
+  it("still calls the LLM when deps > 0", async () => {
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "foo", { params: [], returnType: "number" });
+    g.addFunction("src/a.ts", "dep", { params: [], returnType: "number" });
+    g.setSpec("src/a.ts", "foo", {
+      purpose: "orchestrates",
+      inputs: [],
+      output: { type: "number", description: "" },
+      sideEffects: [],
+      dependencies: ["dep"],
+      edgeCases: [],
+      examples: [],
+    });
+    let decomposeAsked = false;
+    const b = createDesignDispatchBridge(
+      g,
+      async (p) => {
+        if (p.includes("deciding how to implement")) {
+          decomposeAsked = true;
+          return "```\nIMPLEMENT\n```";
+        }
+        if (p.includes("You are the ARCHITECT reviewing")) {
+          return "```\nAPPROVE\n```";
+        }
+        return (
+          "```ts\nreturn ctx.fns.dep(ctx);\n```\n" +
+          '```unit-tests\n[{"name":"u","code":"expect(foo(ctx)).toBe(1);"}]\n```'
+        );
+      },
+      {
+        decompose: async () => true,
+        runTests: async () => ({ ok: true, passed: 1, failed: 0, output: "ok" }),
+        maxReviewCycles: 0,
+      },
+    );
+    await b.dispatch("src/a.ts", "foo");
+    expect(decomposeAsked).toBe(true);
+  });
+
+  it("still calls the LLM when edgeCases > 5", async () => {
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "foo", { params: [], returnType: "number" });
+    g.setSpec("src/a.ts", "foo", {
+      purpose: "many cases",
+      inputs: [],
+      output: { type: "number", description: "" },
+      sideEffects: [],
+      dependencies: [],
+      edgeCases: ["a", "b", "c", "d", "e", "f"], // 6 > 5
+      examples: [],
+    });
+    let decomposeAsked = false;
+    const b = createDesignDispatchBridge(
+      g,
+      async (p) => {
+        if (p.includes("deciding how to implement")) {
+          decomposeAsked = true;
+          return "```\nIMPLEMENT\n```";
+        }
+        if (p.includes("You are the ARCHITECT reviewing")) {
+          return "```\nAPPROVE\n```";
+        }
+        return (
+          "```ts\nreturn 1;\n```\n" +
+          '```unit-tests\n[{"name":"u","code":"expect(foo(ctx)).toBe(1);"}]\n```'
+        );
+      },
+      {
+        decompose: async () => true,
+        runTests: async () => ({ ok: true, passed: 1, failed: 0, output: "ok" }),
+        maxReviewCycles: 0,
+      },
+    );
+    await b.dispatch("src/a.ts", "foo");
+    expect(decomposeAsked).toBe(true);
+  });
+});
+
+describe("askDecompose prompt wording (reuse + 30-line budget)", () => {
+  it("strongly prefers IMPLEMENT and mentions the ~30-line budget", async () => {
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "foo", { params: [], returnType: "number" });
+    g.addFunction("src/a.ts", "dep", { params: [], returnType: "number" });
+    g.setSpec("src/a.ts", "foo", {
+      purpose: "orchestrates one dep",
+      inputs: [],
+      output: { type: "number", description: "" },
+      sideEffects: [],
+      dependencies: ["dep"],
+      edgeCases: [],
+      examples: [],
+    });
+    const prompts: string[] = [];
+    const b = createDesignDispatchBridge(
+      g,
+      async (p) => {
+        prompts.push(p);
+        return "```\nIMPLEMENT\n```";
+      },
+      {
+        decompose: async () => true,
+        runTests: async () => ({ ok: true, passed: 1, failed: 0, output: "ok" }),
+        maxReviewCycles: 0,
+      },
+    );
+    await b.dispatch("src/a.ts", "foo").catch(() => {});
+    const decomposePrompt = prompts.find((p) =>
+      p.includes("deciding how to implement"),
+    );
+    expect(decomposePrompt).toBeDefined();
+    // Budget framing — "30 lines" appears as concrete guidance.
+    expect(decomposePrompt).toMatch(/30 lines/i);
+    // IMPLEMENT is the default; DECOMPOSE requires justification.
+    expect(decomposePrompt).toMatch(/prefer IMPLEMENT/i);
+  });
+
+  it("lists existing functions with their PURPOSES so the LLM can reuse them", async () => {
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "foo", { params: [], returnType: "void" });
+    g.addFunction(
+      "src/a.ts",
+      "loadEntries",
+      { params: [], returnType: "Entry[]" },
+      "Read guestbook entries from disk",
+    );
+    g.setSpec("src/a.ts", "loadEntries", {
+      purpose: "Read guestbook entries from guestbook.json",
+      inputs: [],
+      output: { type: "Entry[]", description: "" },
+      sideEffects: ["reads filesystem"],
+      dependencies: [],
+      edgeCases: [],
+      examples: [],
+    });
+    g.setSpec("src/a.ts", "foo", {
+      purpose: "uses something",
+      inputs: [],
+      output: { type: "void", description: "" },
+      sideEffects: ["writes a response"],
+      dependencies: ["bogus"],
+      edgeCases: ["a", "b", "c", "d", "e"],
+      examples: [],
+    });
+    const prompts: string[] = [];
+    const b = createDesignDispatchBridge(
+      g,
+      async (p) => {
+        prompts.push(p);
+        return "```\nIMPLEMENT\n```";
+      },
+      {
+        decompose: async () => true,
+        runTests: async () => ({ ok: true, passed: 1, failed: 0, output: "ok" }),
+        maxReviewCycles: 0,
+      },
+    );
+    await b.dispatch("src/a.ts", "foo").catch(() => {});
+    const decomposePrompt = prompts.find((p) =>
+      p.includes("deciding how to implement"),
+    );
+    expect(decomposePrompt).toBeDefined();
+    // Existing function shown with its purpose (not just name).
+    expect(decomposePrompt).toContain("loadEntries");
+    expect(decomposePrompt).toMatch(/Read guestbook entries/);
+    // Reuse framing is explicit.
+    expect(decomposePrompt).toMatch(/reuse|REUSE/);
   });
 });
 
@@ -766,7 +1859,8 @@ describe("askDecompose prompt (spec-driven)", () => {
     // The old wording said "Read the purpose and tests carefully"; now
     // tests are not shown until the Implementer writes them.
     expect(decomposePrompt).not.toMatch(/purpose and tests/i);
-    expect(decomposePrompt).toMatch(/purpose and spec/i);
+    // Spec purpose is rendered directly in the prompt.
+    expect(decomposePrompt).toMatch(/Purpose:\s*compose sub-steps/);
   });
 
   it("includes spec.dependencies in the decompose prompt", async () => {
@@ -811,8 +1905,10 @@ describe("dispatch stores unit + integration tests from the Implementer", () => 
       { params: [], returnType: "number" },
       "",
     );
+    // Branch body must call the declared child (new
+    // decomposition/recomposition check).
     const response =
-      "```ts\nreturn 1;\n```\n" +
+      "```ts\nreturn ctx.fns.helper(ctx);\n```\n" +
       '```unit-tests\n[{"name":"u","code":"expect(foo(ctx)).toBe(1);"}]\n```\n' +
       '```integration-tests\n[{"name":"i","code":"expect(foo(ctx)).toBe(1);"}]\n```';
     const b = createDesignDispatchBridge(g, async () => response, {

@@ -112,10 +112,22 @@ export interface ModuleNode {
   exports: string[];
 }
 
+/**
+ * Architect-chosen project-level config: the raw package.json (as authored
+ * in phase 0) plus the test framework detected from its devDependencies.
+ * `null` until `setProjectConfig` is called; once set, it's sticky across
+ * resumes and drives emitter + test-runner choices downstream.
+ */
+export interface ProjectConfig {
+  packageJson: string;
+  testFramework: "vitest" | "jest";
+}
+
 export interface DesignGraphSnapshot {
   modules: Record<string, ModuleNode>;
   functions: Record<string, FunctionNode>;
   projectTests: TestSpec[];
+  projectConfig: ProjectConfig | null;
 }
 
 export type ConsistencyViolation =
@@ -174,6 +186,10 @@ export interface DesignGraph {
     name: string,
     tests: TestSpec[],
   ): void;
+  /** Attach the Architect's phase-0 package.json + detected test
+   *  framework. Sticky across resumes. */
+  setProjectConfig(config: ProjectConfig): void;
+  getProjectConfig(): ProjectConfig | null;
   /** Attach an integration test to the whole project (no specific
    *  function — exercises the top-level assembly). */
   addProjectTest(test: TestSpec): void;
@@ -250,6 +266,19 @@ function renderBody(fn: FunctionNode): string {
   return `throw new Error(\`${fn.name}: not implemented (TODO)\`);`;
 }
 
+/**
+ * Import line for describe/it/expect/<mocker> based on the project's
+ * configured test framework. vitest pulls `vi`; jest pulls `jest`.
+ */
+function renderTestFrameworkImport(
+  framework: ProjectConfig["testFramework"],
+): string {
+  if (framework === "jest") {
+    return `import { describe, it, expect, jest } from "@jest/globals";`;
+  }
+  return `import { describe, it, expect, vi } from "vitest";`;
+}
+
 /** Emit one file per function in proc-ts style: filename = function name. */
 function renderFunctionFile(fn: FunctionNode): string {
   const lines: string[] = [];
@@ -271,10 +300,11 @@ function renderFunctionFile(fn: FunctionNode): string {
 function renderFunctionTestFile(
   target: FunctionNode,
   allFns: FunctionNode[],
+  framework: ProjectConfig["testFramework"],
 ): string {
   if (target.tests.length === 0) return "";
   const lines: string[] = [];
-  lines.push(`import { describe, it, expect } from "vitest";`);
+  lines.push(renderTestFrameworkImport(framework));
   // Common Node built-ins that test code frequently references. The
   // LLM writes bodies inline without top-of-file imports, so give it a
   // base palette available by namespace. Unused imports are cheap.
@@ -320,6 +350,7 @@ function renderFunctionTestFile(
 function renderIntegrationTestFile(
   target: FunctionNode,
   allFns: FunctionNode[],
+  framework: ProjectConfig["testFramework"],
 ): string {
   if (target.integrationTests.length === 0) return "";
   // Integration tests only make sense on BRANCH functions — they
@@ -327,7 +358,7 @@ function renderIntegrationTestFile(
   // against sibling stubs at dispatch time, producing false failures.
   if (target.children.length === 0) return "";
   const lines: string[] = [];
-  lines.push(`import { describe, it, expect } from "vitest";`);
+  lines.push(renderTestFrameworkImport(framework));
   lines.push(`import * as fs from "node:fs";`);
   lines.push(`import * as path from "node:path";`);
   lines.push(`import * as http from "node:http";`);
@@ -367,10 +398,11 @@ function renderIntegrationTestFile(
 function renderProjectTestFile(
   allFns: FunctionNode[],
   projectTests: TestSpec[],
+  framework: ProjectConfig["testFramework"],
 ): string {
   if (projectTests.length === 0 || allFns.length === 0) return "";
   const lines: string[] = [];
-  lines.push(`import { describe, it, expect } from "vitest";`);
+  lines.push(renderTestFrameworkImport(framework));
   lines.push(`import * as fs from "node:fs";`);
   lines.push(`import * as path from "node:path";`);
   lines.push(`import * as http from "node:http";`);
@@ -436,6 +468,7 @@ function materializeGraph(
   _modules: Map<string, ModuleNode>,
   functions: Map<string, FunctionNode>,
   projectTests: TestSpec[],
+  projectConfig: ProjectConfig | null,
   override?: { module: string; name: string; body: string },
 ): Record<string, string> {
   if (functions.size === 0) return {};
@@ -449,18 +482,22 @@ function materializeGraph(
     );
   }
   const files: Record<string, string> = {};
+  if (projectConfig) {
+    files["package.json"] = projectConfig.packageJson;
+  }
   files["ctx.ts"] = renderCtxFile();
   files["ctx_fns.d.ts"] = renderCtxFnsFile(rendered);
+  const framework = projectConfig?.testFramework ?? "vitest";
   for (const fn of rendered) {
     files[`${fn.name}.ts`] = renderFunctionFile(fn);
-    const unit = renderFunctionTestFile(fn, rendered);
+    const unit = renderFunctionTestFile(fn, rendered, framework);
     if (unit.length > 0) files[`${fn.name}.test.ts`] = unit;
-    const integration = renderIntegrationTestFile(fn, rendered);
+    const integration = renderIntegrationTestFile(fn, rendered, framework);
     if (integration.length > 0) {
       files[`${fn.name}.integration.test.ts`] = integration;
     }
   }
-  const project = renderProjectTestFile(rendered, projectTests);
+  const project = renderProjectTestFile(rendered, projectTests, framework);
   if (project.length > 0) files["project.integration.test.ts"] = project;
   return files;
 }
@@ -469,6 +506,7 @@ export function createDesignGraph(): DesignGraph {
   const modules = new Map<string, ModuleNode>();
   const functions = new Map<string, FunctionNode>();
   const projectTests: TestSpec[] = [];
+  let projectConfig: ProjectConfig | null = null;
   let mutationChain: Promise<unknown> = Promise.resolve();
 
   function ensureModule(path: string): ModuleNode {
@@ -671,6 +709,16 @@ export function createDesignGraph(): DesignGraph {
       fn.integrationTests.push(...tests);
     },
 
+    setProjectConfig(config) {
+      // Store a fresh copy so outside callers can't mutate our state by
+      // reference.
+      projectConfig = { ...config };
+    },
+
+    getProjectConfig() {
+      return projectConfig ? { ...projectConfig } : null;
+    },
+
     addProjectTest(test) {
       projectTests.push(test);
     },
@@ -761,7 +809,13 @@ export function createDesignGraph(): DesignGraph {
           throw new Error(`function not found: ${key}`);
         }
       }
-      return materializeGraph(modules, functions, projectTests, override);
+      return materializeGraph(
+        modules,
+        functions,
+        projectTests,
+        projectConfig,
+        override,
+      );
     },
 
     async withLock<T>(fn: () => Promise<T>): Promise<T> {
@@ -807,6 +861,7 @@ export function createDesignGraph(): DesignGraph {
         modules: modSnap,
         functions: fnSnap,
         projectTests: projectTests.map((t) => ({ ...t })),
+        projectConfig: projectConfig ? { ...projectConfig } : null,
       };
     },
   };

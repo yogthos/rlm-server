@@ -239,13 +239,15 @@ describe("designBuild", () => {
     );
     // A spec gates the IMPLEMENT-vs-DECOMPOSE decision; without it
     // dispatch skips straight to body generation.
+    // Include dependencies + 5 edge cases so the spec defeats the
+    // complexity floor and the decompose-decision LLM call actually runs.
     g.setSpec("src/a.ts", "tooDeep", {
       purpose: "x",
       inputs: [],
       output: { type: "void", description: "" },
-      sideEffects: [],
-      dependencies: [],
-      edgeCases: [],
+      sideEffects: ["writes", "reads"],
+      dependencies: ["a", "b"],
+      edgeCases: ["e1", "e2", "e3", "e4", "e5"],
       examples: [],
     });
 

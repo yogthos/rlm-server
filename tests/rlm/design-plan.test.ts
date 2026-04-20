@@ -6,6 +6,7 @@ import {
   parseFunctionList,
   parseTestList,
   parseFunctionSpec,
+  parsePackageJson,
 } from "../../src/rlm/design-plan.js";
 
 describe("extractJson", () => {
@@ -54,6 +55,122 @@ describe("parseTestList", () => {
   });
   it("rejects entries missing a field", () => {
     expect(() => parseTestList([{ name: "adds" }])).toThrow();
+  });
+});
+
+describe("parseFunctionList — module path sanity", () => {
+  it("rejects module paths that escape the project (..)", () => {
+    expect(() =>
+      parseFunctionList([
+        {
+          module: "../escape.ts",
+          name: "foo",
+          signature: { params: [], returnType: "void" },
+          description: "",
+        },
+      ]),
+    ).toThrow(/module path/i);
+  });
+
+  it("rejects empty module paths", () => {
+    expect(() =>
+      parseFunctionList([
+        {
+          module: "",
+          name: "foo",
+          signature: { params: [], returnType: "void" },
+          description: "",
+        },
+      ]),
+    ).toThrow(/module/i);
+  });
+
+  it("rejects absolute module paths", () => {
+    expect(() =>
+      parseFunctionList([
+        {
+          module: "/etc/passwd",
+          name: "foo",
+          signature: { params: [], returnType: "void" },
+          description: "",
+        },
+      ]),
+    ).toThrow(/module path/i);
+  });
+
+  it("accepts well-formed relative paths", () => {
+    const fns = parseFunctionList([
+      {
+        module: "src/server.js",
+        name: "foo",
+        signature: { params: [], returnType: "void" },
+        description: "",
+      },
+    ]);
+    expect(fns[0].module).toBe("src/server.js");
+  });
+});
+
+describe("parsePackageJson", () => {
+  it("accepts valid JSON with vitest in devDependencies", () => {
+    const raw = JSON.stringify({
+      name: "proj",
+      type: "module",
+      devDependencies: { vitest: "^2.0.0" },
+    });
+    const cfg = parsePackageJson(raw);
+    expect(cfg.testFramework).toBe("vitest");
+    expect(cfg.packageJson).toBe(raw);
+  });
+
+  it("accepts valid JSON with jest in devDependencies", () => {
+    const raw = JSON.stringify({
+      name: "proj",
+      type: "module",
+      devDependencies: { jest: "^29.0.0", "@jest/globals": "^29.0.0" },
+    });
+    const cfg = parsePackageJson(raw);
+    expect(cfg.testFramework).toBe("jest");
+  });
+
+  it("rejects a package.json with BOTH vitest and jest (ambiguous)", () => {
+    const raw = JSON.stringify({
+      name: "proj",
+      type: "module",
+      devDependencies: { vitest: "^2.0.0", jest: "^29.0.0" },
+    });
+    expect(() => parsePackageJson(raw)).toThrow(/both/i);
+  });
+
+  it("rejects a package.json with NEITHER vitest nor jest", () => {
+    const raw = JSON.stringify({
+      name: "proj",
+      type: "module",
+      devDependencies: { typescript: "^5.0.0" },
+    });
+    expect(() => parsePackageJson(raw)).toThrow(/vitest|jest/i);
+  });
+
+  it("rejects missing devDependencies", () => {
+    const raw = JSON.stringify({ name: "proj", type: "module" });
+    expect(() => parsePackageJson(raw)).toThrow(/devDependencies/i);
+  });
+
+  it('requires "type": "module" (ESM is mandatory for proc-ts emitter)', () => {
+    const raw = JSON.stringify({
+      name: "proj",
+      devDependencies: { vitest: "^2.0.0" },
+    });
+    expect(() => parsePackageJson(raw)).toThrow(/type.*module/i);
+  });
+
+  it("rejects non-JSON input", () => {
+    expect(() => parsePackageJson("not json")).toThrow();
+  });
+
+  it("rejects non-object JSON (array / string / number)", () => {
+    expect(() => parsePackageJson("[]")).toThrow();
+    expect(() => parsePackageJson('"hi"')).toThrow();
   });
 });
 
@@ -126,6 +243,22 @@ describe("parseFunctionSpec (signature-driven)", () => {
     expect(() => parseFunctionSpec(rest, twoArgSig)).toThrow(/output/);
   });
 
+  it("JSON-stringifies non-string example inputs/outputs instead of [object Object]", () => {
+    const raw = {
+      ...validRawSpec,
+      examples: [
+        { input: { a: 1, b: 2 }, output: { sum: 3 } },
+        { input: [1, 2, 3], output: 6 },
+      ],
+    };
+    const spec = parseFunctionSpec(raw, twoArgSig);
+    expect(spec.examples[0].input).toBe('{"a":1,"b":2}');
+    expect(spec.examples[0].output).toBe('{"sum":3}');
+    expect(spec.examples[1].input).toBe("[1,2,3]");
+    // Numbers stay readable too.
+    expect(spec.examples[1].output).toBe("6");
+  });
+
   it("rejects empty output string", () => {
     expect(() =>
       parseFunctionSpec({ ...validRawSpec, output: "" }, twoArgSig),
@@ -149,9 +282,167 @@ const specJson = JSON.stringify({
 });
 const specResp = `\`\`\`json\n${specJson}\n\`\`\``;
 
+/**
+ * Seed a project config so existing root-level tests skip phase 0.
+ * Phase 0 is exercised directly by the dedicated phase-0 tests; other
+ * designPlan tests focus on phase 1 / 2 / build and don't need to
+ * re-walk the package.json flow.
+ */
+function seedVitestProjectConfig(g: ReturnType<typeof createDesignGraph>): void {
+  g.setProjectConfig({
+    packageJson:
+      '{"name":"test","version":"0.1.0","type":"module","scripts":{"test":"vitest run"},"dependencies":{},"devDependencies":{"vitest":"^2.0.0"}}',
+    testFramework: "vitest",
+  });
+}
+
 describe("designPlan", () => {
+  it("phase 0 asks the Architect for a package.json and stores the config", async () => {
+    const g = createDesignGraph();
+    const prompts: string[] = [];
+    const chat = async (prompt: string) => {
+      prompts.push(prompt);
+      if (prompt.includes("fill in this package.json")) {
+        return (
+          "```json\n" +
+          JSON.stringify({
+            name: "guestbook",
+            version: "0.1.0",
+            type: "module",
+            scripts: { test: "vitest run" },
+            dependencies: {},
+            devDependencies: { vitest: "^2.0.0" },
+          }) +
+          "\n```"
+        );
+      }
+      if (prompt.includes("list the top-level functions")) {
+        return (
+          "```json\n" +
+          JSON.stringify([
+            {
+              module: "src/a.ts",
+              name: "foo",
+              signature: { params: [], returnType: "void" },
+              description: "does foo",
+            },
+          ]) +
+          "\n```"
+        );
+      }
+      return specResp;
+    };
+    await designPlan(g, "task", {
+      chat,
+      dispatch: async (_g, mod, name) => ({
+        module: mod,
+        name,
+        status: "tests-green",
+        implementation: "// ok",
+        attempts: 1,
+        testOutput: "",
+      }),
+      finalize: async () => ({
+        ok: true,
+        files: {},
+        unimplemented: [],
+        consistency: { ok: true, violations: [], advisories: [] },
+        testsPassed: 0,
+        testsFailed: 0,
+        testOutput: "",
+        typecheckOk: true,
+        typecheckOutput: "",
+      }),
+    });
+    const cfg = g.getProjectConfig();
+    expect(cfg).not.toBeNull();
+    expect(cfg!.testFramework).toBe("vitest");
+    expect(cfg!.packageJson).toContain('"name":"guestbook"');
+  });
+
+  it("resume — phase 0 skipped when projectConfig already set", async () => {
+    const g = createDesignGraph();
+    g.setProjectConfig({
+      packageJson:
+        '{"name":"x","devDependencies":{"jest":"^29.0.0"}}',
+      testFramework: "jest",
+    });
+    const prompts: string[] = [];
+    const chat = async (prompt: string) => {
+      prompts.push(prompt);
+      if (prompt.includes("list the top-level functions")) {
+        return (
+          "```json\n" +
+          JSON.stringify([
+            {
+              module: "src/a.ts",
+              name: "foo",
+              signature: { params: [], returnType: "void" },
+              description: "does foo",
+            },
+          ]) +
+          "\n```"
+        );
+      }
+      return specResp;
+    };
+    await designPlan(g, "task", {
+      chat,
+      dispatch: async (_g, mod, name) => ({
+        module: mod,
+        name,
+        status: "tests-green",
+        implementation: "// ok",
+        attempts: 1,
+        testOutput: "",
+      }),
+      finalize: async () => ({
+        ok: true,
+        files: {},
+        unimplemented: [],
+        consistency: { ok: true, violations: [], advisories: [] },
+        testsPassed: 0,
+        testsFailed: 0,
+        testOutput: "",
+        typecheckOk: true,
+        typecheckOutput: "",
+      }),
+    });
+    // The phase-0 prompt must not have been emitted.
+    expect(prompts.some((p) => p.includes("fill in this package.json"))).toBe(
+      false,
+    );
+    // Original config preserved.
+    expect(g.getProjectConfig()!.testFramework).toBe("jest");
+  });
+
+  it("phase 0 failure fails the plan with phase='plan' and includes failedSpecs=[]", async () => {
+    const g = createDesignGraph();
+    const chat = async (prompt: string) => {
+      if (prompt.includes("fill in this package.json")) {
+        return "total garbage not JSON at all";
+      }
+      throw new Error("should not reach phase 1");
+    };
+    const report = await designPlan(g, "task", {
+      chat,
+      dispatch: async () => {
+        throw new Error("should not dispatch");
+      },
+      finalize: async () => {
+        throw new Error("should not finalize");
+      },
+    });
+    expect(report.ok).toBe(false);
+    expect(report.phase).toBe("plan");
+    // Consistency with phase-1 and phase-2 failure paths — report
+    // shape should include the failedSpecs field.
+    expect(report.failedSpecs).toEqual([]);
+  });
+
   it("phase 1 lists functions; phase 2 attaches specs; build runs", async () => {
     const g = createDesignGraph();
+    seedVitestProjectConfig(g);
     const chatCalls: string[] = [];
     const chat = async (prompt: string) => {
       chatCalls.push(prompt);
@@ -203,6 +494,7 @@ describe("designPlan", () => {
 
   it("resume — skips phase 1 when plan-origin fns exist", async () => {
     const g = createDesignGraph();
+    seedVitestProjectConfig(g);
     g.addFunction(
       "src/a.ts",
       "foo",
@@ -245,6 +537,7 @@ describe("designPlan", () => {
 
   it("resume — skips phase 2 when spec already attached", async () => {
     const g = createDesignGraph();
+    seedVitestProjectConfig(g);
     g.addFunction(
       "src/a.ts",
       "foo",
@@ -348,6 +641,7 @@ describe("designPlan", () => {
     // out at store time so the Implementer prompt doesn't advertise a
     // sibling that isn't wired.
     const g = createDesignGraph();
+    seedVitestProjectConfig(g);
     const chat = async (prompt: string) => {
       if (prompt.includes("list the top-level functions")) {
         return (
@@ -454,6 +748,119 @@ describe("designPlan", () => {
     expect(result.phase).toBe("plan");
   });
 
+  it("phase-2 prompt tells the LLM NOT to bloat dependencies", async () => {
+    const g = createDesignGraph();
+    seedVitestProjectConfig(g);
+    const prompts: string[] = [];
+    const chat = async (prompt: string) => {
+      prompts.push(prompt);
+      if (prompt.includes("list the top-level functions")) {
+        return (
+          "```json\n" +
+          JSON.stringify([
+            {
+              module: "src/a.ts",
+              name: "foo",
+              signature: { params: [], returnType: "void" },
+              description: "",
+            },
+          ]) +
+          "\n```"
+        );
+      }
+      return specResp;
+    };
+    await designPlan(g, "task", {
+      chat,
+      dispatch: async (_g, mod, name) => ({
+        module: mod,
+        name,
+        status: "tests-green",
+        implementation: "// ok",
+        attempts: 1,
+        testOutput: "",
+      }),
+      finalize: async () => ({
+        ok: true,
+        files: {},
+        unimplemented: [],
+        consistency: { ok: true, violations: [], advisories: [] },
+        testsPassed: 0,
+        testsFailed: 0,
+        testOutput: "",
+        typecheckOk: true,
+        typecheckOutput: "",
+      }),
+    });
+    const phase2Prompt = prompts.find(
+      (p) => p.includes("Fill in the SPEC") && p.includes("Function: foo"),
+    );
+    expect(phase2Prompt).toBeDefined();
+    // Must tell the LLM to list only deps it will DEFINITELY call.
+    expect(phase2Prompt).toMatch(/definitely|only.*actually|never-called|do not list/i);
+  });
+
+  it("phase-2 prompt emphasizes the exact inputs length + param names", async () => {
+    // Without this emphasis, models systematically emit inputs with
+    // length +1 (one extra entry), forcing a retry per spec.
+    const g = createDesignGraph();
+    seedVitestProjectConfig(g);
+    const prompts: string[] = [];
+    const chat = async (prompt: string) => {
+      prompts.push(prompt);
+      if (prompt.includes("list the top-level functions")) {
+        return (
+          "```json\n" +
+          JSON.stringify([
+            {
+              module: "src/a.ts",
+              name: "foo",
+              signature: {
+                params: [
+                  { name: "req", type: "IncomingMessage" },
+                  { name: "entries", type: "Entry[]" },
+                ],
+                returnType: "string",
+              },
+              description: "handles things",
+            },
+          ]) +
+          "\n```"
+        );
+      }
+      return specResp;
+    };
+    await designPlan(g, "task", {
+      chat,
+      dispatch: async (_g, mod, name) => ({
+        module: mod,
+        name,
+        status: "tests-green",
+        implementation: "// ok",
+        attempts: 1,
+        testOutput: "",
+      }),
+      finalize: async () => ({
+        ok: true,
+        files: {},
+        unimplemented: [],
+        consistency: { ok: true, violations: [], advisories: [] },
+        testsPassed: 0,
+        testsFailed: 0,
+        testOutput: "",
+        typecheckOk: true,
+        typecheckOutput: "",
+      }),
+    });
+    const phase2Prompt = prompts.find(
+      (p) => p.includes("Fill in the SPEC") && p.includes("Function: foo"),
+    );
+    expect(phase2Prompt).toBeDefined();
+    // The literal param count and names must appear prominently.
+    expect(phase2Prompt).toMatch(/EXACTLY 2 description strings?/);
+    expect(phase2Prompt).toMatch(/\breq\b.*\bentries\b/);
+  });
+
   it("decompose phase-2 sibling list includes top-level siblings and the parent", async () => {
     const g = createDesignGraph();
     g.addFunction(
@@ -514,7 +921,9 @@ describe("designPlan", () => {
     // Phase 1 declares `load` with isAsync:false but returnType Promise.
     // The graph normalizes at ingest. The phase-2 prompt must reflect
     // the normalized signature, not the LLM's original claim.
+    // (Seed the project config so phase 0 is skipped.)
     const g = createDesignGraph();
+    seedVitestProjectConfig(g);
     const prompts: string[] = [];
     const chat = async (prompt: string) => {
       prompts.push(prompt);
@@ -663,6 +1072,7 @@ describe("designPlan", () => {
 
   it("reports failedSpecs when phase 2 fails for a subset of functions", async () => {
     const g = createDesignGraph();
+    seedVitestProjectConfig(g);
     const chat = async (prompt: string) => {
       if (prompt.includes("list the top-level functions")) {
         return (

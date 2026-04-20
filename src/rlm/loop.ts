@@ -1663,7 +1663,7 @@ export async function runRLMLoop(options: RunRLMOptions): Promise<RLMResult> {
     sandboxTimeoutMs = 600_000,
     maxSubRLMDepth = 3,
     subRLMDepth = 0,
-    maxReviewCycles = 2,
+    maxReviewCycles = 3,
     signal: externalSignal,
     roleBinding,
     projectGraph,

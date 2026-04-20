@@ -21,7 +21,13 @@ import { debug } from "./debug.js";
 
 export interface BuildReport {
   ok: boolean;
-  phase: "plan" | "consistency" | "dispatch" | "finalize" | "done";
+  phase:
+    | "plan"
+    | "consistency"
+    | "dispatch"
+    | "project-tests"
+    | "finalize"
+    | "done";
   consistency: ConsistencyReport;
   dispatched: DispatchResult[];
   failed: DispatchResult[];

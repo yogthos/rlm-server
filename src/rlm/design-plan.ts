@@ -15,6 +15,7 @@
 import type {
   DesignGraph,
   FunctionSpec,
+  ProjectConfig,
   Signature,
   TestSpec,
 } from "./design-graph.js";
@@ -42,6 +43,51 @@ export interface PlannedFunction {
   description: string;
 }
 
+/**
+ * Parse the Architect's phase-0 package.json. Validates JSON shape,
+ * requires `devDependencies` with exactly ONE of `vitest` / `jest` —
+ * neither or both trips a retry with a clear error message.
+ */
+export function parsePackageJson(raw: string): ProjectConfig {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (e) {
+    throw new Error(
+      `package.json is not valid JSON: ${e instanceof Error ? e.message : String(e)}`,
+    );
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("package.json must be a JSON object");
+  }
+  const obj = parsed as Record<string, unknown>;
+  if (obj.type !== "module") {
+    throw new Error(
+      'package.json must set "type": "module" (the proc-ts emitter produces ESM code)',
+    );
+  }
+  const dev = obj.devDependencies;
+  if (!dev || typeof dev !== "object" || Array.isArray(dev)) {
+    throw new Error('package.json missing "devDependencies" object');
+  }
+  const hasVitest = "vitest" in (dev as Record<string, unknown>);
+  const hasJest = "jest" in (dev as Record<string, unknown>);
+  if (hasVitest && hasJest) {
+    throw new Error(
+      'devDependencies lists BOTH "vitest" and "jest" — pick exactly one test framework',
+    );
+  }
+  if (!hasVitest && !hasJest) {
+    throw new Error(
+      'devDependencies must include exactly one of "vitest" or "jest" as the test framework',
+    );
+  }
+  return {
+    packageJson: raw,
+    testFramework: hasVitest ? "vitest" : "jest",
+  };
+}
+
 /** Extract the first fenced JSON block, or parse the whole response. */
 export function extractJson(response: string): unknown {
   const fenced = response.match(/```(?:json)?\s*\r?\n([\s\S]*?)```/);
@@ -52,6 +98,26 @@ export function extractJson(response: string): unknown {
   } catch {
     return null;
   }
+}
+
+/**
+ * Return the raw (unparsed) body of the first fenced JSON block, or the
+ * whole response. Preserves formatting — needed for phase 0's
+ * package.json where we want to write the LLM's exact text to disk.
+ */
+function extractRawJson(response: string): string | null {
+  const fenced = response.match(/```(?:json)?\s*\r?\n([\s\S]*?)```/);
+  const body = fenced ? fenced[1].trim() : response.trim();
+  if (!body) return null;
+  // Validate shape without throwing — we just want to ensure the LLM
+  // at least emitted parseable JSON; full shape validation happens in
+  // parsePackageJson.
+  try {
+    JSON.parse(body);
+  } catch {
+    return null;
+  }
+  return body;
 }
 
 /**
@@ -90,6 +156,22 @@ export function parseFunctionList(
         : (() => {
             throw new Error(`entry ${i} missing "module"`);
           })());
+    // Module paths are project-relative. An empty string, an absolute
+    // path, or a `..` segment signals a malformed entry (typically
+    // an LLM hallucination). The override path comes from our own
+    // code and is trusted, so only validate when we're reading the
+    // LLM's emission.
+    if (moduleOverride === undefined) {
+      if (module.length === 0) {
+        throw new Error(`entry ${i} has empty "module"`);
+      }
+      if (module.startsWith("/")) {
+        throw new Error(`entry ${i} module path "${module}" is absolute — must be project-relative`);
+      }
+      if (module.split("/").includes("..")) {
+        throw new Error(`entry ${i} module path "${module}" escapes the project (contains ..)`);
+      }
+    }
     if (typeof r.name !== "string") throw new Error(`entry ${i} missing "name"`);
     if (!r.signature || typeof r.signature !== "object") {
       throw new Error(`entry ${i} missing "signature"`);
@@ -117,6 +199,22 @@ export function parseTestList(raw: unknown): TestSpec[] {
     if (typeof r.code !== "string") throw new Error(`test ${i} missing "code"`);
     return { name: r.name, code: r.code };
   });
+}
+
+/**
+ * Render an example value as a string. Plain strings pass through;
+ * objects/arrays/numbers/booleans are JSON-stringified so downstream
+ * prompts show meaningful content instead of "[object Object]".
+ */
+function stringifyExampleValue(v: unknown): string {
+  if (typeof v === "string") return v;
+  if (v === null || v === undefined) return "";
+  if (typeof v === "number" || typeof v === "boolean") return String(v);
+  try {
+    return JSON.stringify(v);
+  } catch {
+    return String(v);
+  }
 }
 
 /**
@@ -191,8 +289,8 @@ export function parseFunctionSpec(
       }
       const vi = v as Record<string, unknown>;
       return {
-        input: typeof vi.input === "string" ? vi.input : String(vi.input ?? ""),
-        output: typeof vi.output === "string" ? vi.output : String(vi.output ?? ""),
+        input: stringifyExampleValue(vi.input),
+        output: stringifyExampleValue(vi.output),
       };
     }),
   };
@@ -321,6 +419,14 @@ function buildPhase2Prompt(
       ? `Other functions in the project (this function MAY call any of these via ctx.fns; list them under "dependencies" if it does):\n${siblingList}`
       : "No sibling functions.",
     "",
+    `HARD REQUIREMENT — "inputs" MUST be EXACTLY ${fn.signature.params.length} description string${fn.signature.params.length === 1 ? "" : "s"}, aligned with this signature's parameters in order:`,
+    fn.signature.params.length === 0
+      ? `  (this function has ZERO parameters — emit "inputs": [])`
+      : fn.signature.params
+          .map((p, i) => `  index ${i}: ${p.name} (${p.type})`)
+          .join("\n"),
+    `Do NOT include ctx or any wrapping envelope — only the business parameters above. Extra or missing entries cause a schema error and a retry.`,
+    "",
     `Return ONLY a fenced JSON block with EXACTLY this shape. Every field`,
     `is required; arrays can be empty but must be present.`,
     "",
@@ -349,11 +455,92 @@ function buildPhase2Prompt(
     `  known from the signature; do NOT repeat it.`,
     `- Be concrete. "handles errors" is useless; "throws TypeError when path is not string"`,
     `  is testable.`,
-    `- List every sibling this function will call in "dependencies" — the Implementer`,
-    `  uses this to decide whether to write integration tests. Unknown names are dropped.`,
+    `- "dependencies" lists ONLY siblings this function will DEFINITELY call.`,
+    `  Do NOT list every sibling that MIGHT be useful — that bloats the`,
+    `  Implementer's prompt and will either trigger architect-review`,
+    `  feedback for "declared but never called" OR be auto-overwritten`,
+    `  when we reconcile from the observed ctx.fns call sites. Unknown`,
+    `  names are dropped at store time; if you're uncertain, omit.`,
     `- Write 2–6 edge cases and 1–4 examples.`,
     `- No prose outside the JSON block.`,
   ].join("\n");
+}
+
+function buildPhase0Prompt(task: string): string {
+  return [
+    `Phase 0 of the pipeline — project initialization.`,
+    "",
+    `Your job: fill in this package.json template for the project described`,
+    `in the task. The harness reads it to pick the test framework and to`,
+    `emit the file verbatim at materialize time.`,
+    "",
+    `Task:`,
+    task,
+    "",
+    `Fill in this package.json template. Rules:`,
+    `  - pick EXACTLY ONE test framework — add either "vitest" OR "jest"`,
+    `    to devDependencies. Never both; never neither.`,
+    `  - "scripts.test" must invoke the chosen framework ("vitest run" or`,
+    `    "jest").`,
+    `  - "type" must be "module".`,
+    `  - Fill runtime dependencies as needed for the project. Keep them`,
+    `    minimal — dev-only helpers go in devDependencies.`,
+    `  - "name" should be kebab-case, derived from the task.`,
+    "",
+    "Return ONLY a fenced JSON block with your filled-in package.json:",
+    "",
+    "```json",
+    "{",
+    '  "name": "<kebab-case>",',
+    '  "version": "0.1.0",',
+    '  "description": "<one-line purpose>",',
+    '  "type": "module",',
+    '  "scripts": {',
+    '    "test": "<test runner CLI>"',
+    "  },",
+    '  "dependencies": { },',
+    '  "devDependencies": { }',
+    "}",
+    "```",
+    "",
+    "No prose outside the fenced block.",
+  ].join("\n");
+}
+
+async function runPhase0(
+  chat: (p: string) => Promise<string>,
+  task: string,
+  maxRetries: number,
+): Promise<ProjectConfig | { error: string }> {
+  const basePrompt = buildPhase0Prompt(task);
+  let currentPrompt = basePrompt;
+  let lastError = "(no attempt made)";
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    debug("plan", `phase0-init attempt ${attempt + 1}/${maxRetries + 1}`);
+    let response: string;
+    try {
+      response = await chat(currentPrompt);
+    } catch (e) {
+      lastError = e instanceof Error ? e.message : String(e);
+      debug("plan", `phase0-init chat error: ${lastError}`);
+      break;
+    }
+    const raw = extractRawJson(response);
+    if (raw === null) {
+      lastError = "response did not contain a parseable JSON block";
+      currentPrompt = `${basePrompt}\n\nYour previous response was not valid JSON. Return ONLY a fenced JSON block this time.`;
+      debug("plan", `phase0-init no JSON extracted, retrying`);
+      continue;
+    }
+    try {
+      return parsePackageJson(raw);
+    } catch (e) {
+      lastError = e instanceof Error ? e.message : String(e);
+      currentPrompt = `${basePrompt}\n\nYour previous response had a package.json error: ${lastError}. Fix it and return ONLY a fenced JSON block.`;
+      debug("plan", `phase0-init package.json error: ${lastError}`);
+    }
+  }
+  return { error: lastError };
 }
 
 async function withJsonRetry<T>(
@@ -405,6 +592,47 @@ export async function designPlan(
     "progress",
     `plan: start (task ${task.length}ch)${parentName ? ` parent=${parentName}` : ""}`,
   );
+
+  // ── Phase 0: project init — Architect fills package.json ─────────
+  // Only at the root plan. Subtree plans (parentName set) inherit the
+  // project config from the parent graph. Skipped on resume if a
+  // config was already stored.
+  if (!parentName && graph.getProjectConfig() === null) {
+    debug("progress", `plan: phase 0 — asking for package.json`);
+    const phase0 = await runPhase0(options.chat, task, maxRetries);
+    if ("error" in phase0) {
+      debug("plan", `phase 0 failed: ${phase0.error}`);
+      debug("progress", `plan: phase 0 FAILED — ${phase0.error}`);
+      return {
+        ok: false,
+        phase: "plan",
+        consistency: { ok: false, violations: [], advisories: [] },
+        dispatched: [],
+        failed: [],
+        finalize: null,
+        files: {},
+        failedSpecs: [],
+      };
+    }
+    debug(
+      "plan",
+      `phase 0 ok — testFramework=${phase0.testFramework}`,
+    );
+    debug(
+      "progress",
+      `plan: phase 0 ok — test framework = ${phase0.testFramework}`,
+    );
+    graph.setProjectConfig(phase0);
+  } else if (!parentName) {
+    debug(
+      "plan",
+      `phase 0 SKIPPED (resume) — projectConfig already set: testFramework=${graph.getProjectConfig()!.testFramework}`,
+    );
+    debug(
+      "progress",
+      `plan: phase 0 skipped (resume) — framework = ${graph.getProjectConfig()!.testFramework}`,
+    );
+  }
 
   // ── Phase 1: list functions (skipped on resume) ─────────────────
   // For top-level plans: look for prior plan-origin ROOT functions.

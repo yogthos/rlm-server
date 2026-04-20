@@ -62,10 +62,18 @@ function reconcileSpecDependencies(
  * known sibling names. Returns a list of human-readable violation
  * messages (empty when clean). Used in two places: the regenerate
  * loop after extractBody, and the pre-test path for loaded bodies.
+ *
+ * When `requiredChildren` is non-empty, the body MUST contain a
+ * `ctx.fns.<child>(...)` call for each — this is the
+ * decomposition/recomposition check for branch functions. A parent
+ * whose `designPlan` decomposed into children must actually use those
+ * children in its assembly body; otherwise the decomposition was pure
+ * waste (orphaned children) and the call graph breaks.
  */
 function collectBodyViolations(
   analysis: BodyAnalysis,
   knownNames: Set<string>,
+  requiredChildren: readonly string[] = [],
 ): string[] {
   const violations: string[] = [];
   if (analysis.imports.length > 0) {
@@ -91,6 +99,15 @@ function collectBodyViolations(
     violations.push(
       `Call(s) to ctx.fns.<sibling> for functions NOT in the graph:\n${formatted}\nAvailable ctx.fns: ${available}.`,
     );
+  }
+  if (requiredChildren.length > 0) {
+    const calledNames = new Set(analysis.ctxFnsCalls.map((c) => c.name));
+    const missing = requiredChildren.filter((c) => !calledNames.has(c));
+    if (missing.length > 0) {
+      violations.push(
+        `This function was decomposed into children — your body MUST call every declared child via \`ctx.fns.<name>(ctx, ...)\`. Missing calls to: ${missing.map((m) => `ctx.fns.${m}`).join(", ")}. Decomposition without recomposition produces orphaned children and breaks the call graph.`,
+      );
+    }
   }
   return violations;
 }
@@ -146,8 +163,21 @@ export interface DispatchOptions {
    *  means the Implementer's own contract is satisfied; the Architect
    *  then checks that contract matches the original SPEC. On REVISE,
    *  the Implementer is re-dispatched with the feedback injected.
-   *  0 disables review (legacy behavior). Default 2. */
+   *  0 disables review (legacy behavior). Default 3. */
   maxReviewCycles?: number;
+  /** Dispatch mode:
+   *  - `"harden"` (default, legacy): run tests, architect review,
+   *    full review cycle. Body saved only when both green + approved.
+   *  - `"sketch"`: best-effort skeleton pass. Implementer writes a
+   *    body only (no tests). Body-analyzer still runs (rejects
+   *    imports / undeclared sibling calls). NO tests, NO architect
+   *    review. Body saved on first analyzer-clean response.
+   *
+   *  The sketch mode supports a two-pass workflow: first produce a
+   *  call-graph-consistent skeleton fast, then harden with tests and
+   *  review. Avoids the test-review feedback loops stalling initial
+   *  implementation. */
+  mode?: "sketch" | "harden";
 }
 
 /** Architect's post-green verdict on an Implementer's work. */
@@ -155,7 +185,34 @@ export interface ReviewVerdict {
   approved: boolean;
   /** Actionable feedback when `approved: false`. */
   feedback: string;
+  /** Which SPEC field the REVISE maps to (purpose / inputs / ...).
+   *  Enforced by the review prompt so critiques are traceable; if the
+   *  Architect can't cite a spec field, the concern is likely feature
+   *  creep and should have been APPROVE. */
+  specField?: string;
 }
+
+/**
+ * Format review feedback for the Implementer's retry prompt. When the
+ * verdict cites a spec field, lead with `[architect cited spec.<field>]`
+ * so the Implementer knows exactly which part of the SPEC to revisit.
+ */
+function formatArchitectFeedback(v: ReviewVerdict): string {
+  if (!v.specField) return v.feedback;
+  return `[architect cited spec.${v.specField}]\n${v.feedback}`;
+}
+
+/** Spec fields a REVISE verdict is allowed to cite. Matches the
+ *  `FunctionSpec` shape one-for-one so feedback is traceable. */
+const REVIEW_SPEC_FIELDS = [
+  "purpose",
+  "inputs",
+  "output",
+  "sideEffects",
+  "dependencies",
+  "edgeCases",
+  "examples",
+] as const;
 
 /**
  * Parse the Architect's review response. Expected shape:
@@ -191,9 +248,54 @@ export function parseReviewVerdict(response: string): ReviewVerdict {
     // to revise against. Fail open (approve) to avoid burning a cycle
     // on nothing.
     if (rest.length === 0) return { approved: true, feedback: "" };
-    return { approved: false, feedback: rest };
+    // Extract the optional spec-field tag. Expected first-line shapes:
+    //   "REVISE"           — no tag (back-compat)
+    //   "REVISE purpose"   — tag that matches an allowed spec field
+    //   "REVISE quality"   — unrecognized tag; treat as untagged so
+    //                        the Implementer doesn't get a misleading
+    //                        citation downstream.
+    const afterKeyword = firstLine
+      .replace(/^[\s*_#>\-]+/, "")
+      .replace(/[\s*_#>\-:.,;!?—]+$/, "")
+      .trim();
+    const parts = afterKeyword.split(/\s+/);
+    let specField: string | undefined;
+    if (parts.length >= 2) {
+      const tagLower = parts[1].toLowerCase();
+      // Canonical match is case-insensitive — `Purpose`, `PURPOSE`,
+      // `edgecases` all map to the spec-field casing the rest of the
+      // system uses.
+      const canonical = REVIEW_SPEC_FIELDS.find(
+        (f) => f.toLowerCase() === tagLower,
+      );
+      if (canonical) specField = canonical;
+    }
+    return { approved: false, feedback: rest, specField };
   }
   return { approved: true, feedback: "" };
+}
+
+/**
+ * Render the proc-ts signature line used in the Architect review so
+ * the reviewer sees `function foo(ctx: Ctx, n: number): string` rather
+ * than just the raw body statements. Without this, architects read a
+ * body starting with `const x = ...` and mistakenly flag "no ctx
+ * parameter" — ctx is supplied by the harness's wrapping signature.
+ */
+function renderReviewSignature(
+  fn: import("./design-graph.js").FunctionNode,
+): string {
+  const async = fn.signature.isAsync ? "async " : "";
+  const userParams = fn.signature.params
+    .map((p) => {
+      const q = p.optional ? "?" : "";
+      const def = p.defaultValue !== undefined ? ` = ${p.defaultValue}` : "";
+      return `${p.name}${q}: ${p.type}${def}`;
+    })
+    .join(", ");
+  const paramList =
+    userParams.length > 0 ? `ctx: Ctx, ${userParams}` : "ctx: Ctx";
+  return `export default ${async}function ${fn.name}(${paramList}): ${fn.signature.returnType}`;
 }
 
 function renderSpecForReview(
@@ -229,6 +331,7 @@ async function architectReview(
   graph: DesignGraph,
   body: string,
   testOutput: string,
+  priorCycleFeedback?: string,
 ): Promise<ReviewVerdict> {
   if (!fn.spec) {
     // No spec to review against — approve by default.
@@ -260,9 +363,12 @@ async function architectReview(
     renderSpecForReview(fn.spec),
     ...childLines,
     "",
-    "The Implementer's body:",
+    "The Implementer's full function (signature + body as it will",
+    "be emitted — note ctx is the harness-injected first parameter):",
     "```ts",
-    body,
+    `${renderReviewSignature(fn)} {`,
+    ...body.split("\n").map((l) => `  ${l}`),
+    "}",
     "```",
     "",
     testNames ? `Unit tests that passed:\n${testNames}` : "(no unit tests)",
@@ -278,28 +384,64 @@ async function architectReview(
     "```",
     "",
   );
+  // Cycle 2+ — include the prior cycle's feedback so the review can
+  // confirm its earlier critique was addressed instead of silently
+  // contradicting it with a new one.
+  if (priorCycleFeedback) {
+    sections.push(
+      "YOUR PREVIOUS CYCLE'S FEEDBACK on an earlier version of this body:",
+      "```",
+      priorCycleFeedback.slice(0, 1500),
+      "```",
+      "",
+      "Either (a) confirm that the Implementer addressed this by",
+      "APPROVING, or (b) REVISE again with a concern that is GENUINELY",
+      "DIFFERENT from the one above — do NOT contradict your earlier",
+      "feedback without explicitly noting why.",
+      "",
+    );
+  }
   const prompt = [
     ...sections,
-    "Evaluate CRITICALLY whether the implementation solves the SPEC:",
-    "- Does the body fulfill the stated purpose?",
-    "- Does it cover every edge case the spec listed?",
-    "- Does it produce the declared side effects (and no undeclared ones)?",
-    "- Does it call each declared dependency appropriately?",
+    "PROC-TS CONVENTIONS (do NOT flag these as bugs — they are required):",
+    "- Every function receives `ctx: Ctx` as its FIRST parameter.",
+    "- Sibling calls go through `ctx.fns.<name>(ctx, ...args)` — passing",
+    "  ctx to each sibling is correct and mandatory.",
+    "- No `import` statements at the top of function bodies. Node",
+    "  modules come in via dynamic `require(...)` or `await import(...)`.",
+    "",
+    "ANCHOR YOUR REVIEW TO THE SPEC. Evaluate ONLY what the SPEC asks for:",
+    "- Does the body fulfill the stated `purpose`?",
+    "- Does it cover every `edgeCase` the spec listed?",
+    "- Does it produce the declared `sideEffects` (and no undeclared ones)?",
+    "- Does it call each declared `dependency` appropriately?",
     "- Are the unit tests MEANINGFUL — not trivial tautologies like",
     "  `expect(true).toBe(true)` or assertions that just mirror the body?",
     "",
-    "Reply with EXACTLY one fenced code block:",
+    "DO NOT invent requirements outside the SPEC. If Content-Type",
+    "validation, response-already-sent guards, race-condition fixes, or",
+    "other hardening wasn't explicitly called out by the spec's purpose,",
+    "sideEffects, or edgeCases, do NOT reject over it — APPROVE. The",
+    "Architect (you) wrote the spec; hold the implementation to THAT bar,",
+    "not to a higher one.",
     "",
+    "",
+    "Reply with EXACTLY one fenced code block.",
+    "",
+    "APPROVE when the spec is satisfied:",
     "```",
     "APPROVE",
     "```",
     "",
-    "when the spec is satisfied, OR:",
+    "OR REVISE, citing EXACTLY ONE spec field your concern maps to.",
+    "Allowed fields: <purpose|inputs|output|sideEffects|dependencies|edgeCases|examples>.",
+    "If you CANNOT map your concern to one of those fields, your concern",
+    "is outside the spec — you must APPROVE instead.",
     "",
     "```",
-    "REVISE",
-    "<2–6 sentences of specific, actionable feedback — what the Implementer",
-    "must change to satisfy the spec. Be concrete, not vague.>",
+    "REVISE <field>",
+    "<2–6 sentences of specific, actionable feedback, traceable to the",
+    "cited <field>. Be concrete, not vague.>",
     "```",
     "",
     "No prose outside the fenced block.",
@@ -316,9 +458,42 @@ async function architectReview(
   }
 }
 
+/**
+ * Complexity floor: when the spec is clearly a leaf, skip the LLM
+ * decompose decision entirely. Saves an LLM turn AND prevents the
+ * "count concerns" framing from over-triggering on tight pipelines.
+ *
+ * A function is "obviously implementable" when ALL of:
+ *   - zero dependencies (pure leaf, no orchestration)
+ *   - ≤ 5 edge cases (simple enough for a 30-line body)
+ *   - ≤ 1 side effect (multiple side effects = multiple concerns)
+ *   - purpose ≤ 300 chars (long purpose is a proxy for scope)
+ *
+ * The `generateHtml` case from real runs (deps=0, edges=4, but
+ * purpose=399ch + large resulting body) was what motivated the
+ * purpose-length gate — a long purpose signals scope the other
+ * counts can miss.
+ *
+ * INVARIANT: zero dependencies ⇒ no orchestration. The Architect's
+ * phase-2 prompt asks for "dependencies: sibling function names this
+ * one calls via ctx.fns — empty if pure". If that schema ever
+ * changes, revisit this floor.
+ */
+function obviouslyImplementable(
+  spec: import("./design-graph.js").FunctionSpec,
+): boolean {
+  return (
+    spec.dependencies.length === 0 &&
+    spec.edgeCases.length <= 5 &&
+    spec.sideEffects.length <= 1 &&
+    spec.purpose.length <= 300
+  );
+}
+
 async function askDecompose(
   chat: ChatFn,
   fn: import("./design-graph.js").FunctionNode,
+  graph: DesignGraph,
 ): Promise<boolean> {
   const specLines: string[] = [];
   if (fn.spec) {
@@ -338,46 +513,59 @@ async function askDecompose(
   } else {
     specLines.push(`Purpose: ${fn.description}`);
   }
+  // Show siblings the LLM can REUSE via ctx.fns — with their purposes,
+  // not just names. Reuse is the cheapest way to avoid DECOMPOSE.
+  const reuseLines: string[] = [];
+  const others = graph
+    .listFunctions()
+    .filter((f) => f.name !== fn.name);
+  if (others.length > 0) {
+    reuseLines.push(
+      "",
+      "Existing functions you can call via `ctx.fns.<name>(ctx, ...)` —",
+      "REUSE THESE FIRST if any solves a sub-concern of this function:",
+    );
+    for (const o of others) {
+      const purpose = o.spec?.purpose ?? o.description ?? "";
+      const brief = purpose.length > 120 ? purpose.slice(0, 117) + "..." : purpose;
+      reuseLines.push(`  - ctx.fns.${o.name}(ctx, ...) — ${brief}`);
+    }
+  }
   const prompt = [
-    `You are deciding how to implement a function. Apply the`,
-    `**Single Responsibility Principle**: a function should do ONE thing.`,
+    `You are deciding how to implement a function. Default to IMPLEMENT.`,
+    `DECOMPOSE is EXPENSIVE — it adds another planning round and several`,
+    `LLM turns — so only pick it when the function truly cannot fit in`,
+    `**~30 lines** of straightforward code even after reusing available`,
+    `helpers.`,
     "",
     `Function: ${fn.name}`,
     `Signature: ${fn.signature.isAsync ? "async " : ""}function ${fn.name}(ctx: Ctx${fn.signature.params.length > 0 ? ", " + fn.signature.params.map((p) => `${p.name}: ${p.type}`).join(", ") : ""}): ${fn.signature.returnType}`,
     ...specLines,
+    ...reuseLines,
     "",
-    `THE ONE QUESTION: does this function do exactly ONE thing?`,
-    "",
-    `Read the purpose and spec carefully. Count the distinct concerns:`,
-    `  - Parsing input is one concern.`,
-    `  - Validating is another.`,
-    `  - Persisting is another.`,
-    `  - Transforming a value is one.`,
-    `  - Responding to an HTTP request that orchestrates several of the`,
-    `    above is MULTIPLE concerns.`,
-    "",
-    `If the function does ONE thing (pure transform, one I/O step, one`,
-    `validation rule, one render), answer:`,
-    "```",
-    "IMPLEMENT",
-    "```",
-    "",
-    `If the function orchestrates TWO OR MORE distinct concerns — if you`,
-    `could sensibly extract helpers that each own a single concern —`,
-    `answer:`,
-    "```",
-    "DECOMPOSE",
-    "```",
+    `Decision rules (apply in order):`,
+    `  1. If the body fits in ~30 lines of straightforward code,`,
+    `     **prefer IMPLEMENT**. Tight pipelines (load → transform → send)`,
+    `     count as ONE orchestration — do NOT split them.`,
+    `  2. If every sub-concern of this function is already covered by a`,
+    `     function in the "Existing functions" list above, answer IMPLEMENT`,
+    `     and call those via ctx.fns. Do NOT invent new helpers that`,
+    `     duplicate existing ones.`,
+    `  3. Only answer DECOMPOSE when BOTH of these hold:`,
+    `     (a) the function orchestrates ≥ 3 genuinely distinct concerns`,
+    `         that CANNOT be covered by existing ctx.fns helpers, AND`,
+    `     (b) the resulting body would be well over 30 lines even if you`,
+    `         reused everything available.`,
     "",
     `Examples:`,
-    `  - \`hashPassword(pw)\` → IMPLEMENT (one transform).`,
-    `  - \`parseFormBody(req)\` → IMPLEMENT (one parse).`,
-    `  - \`validateEmail(s)\` → IMPLEMENT (one validation).`,
-    `  - \`handleSignup(req, res)\` (parse + validate + hash + write + reply)`,
-    `    → DECOMPOSE (five concerns).`,
-    `  - \`startServer(port)\` that just calls one library API → IMPLEMENT.`,
-    `  - \`startServer(port)\` that builds routes, wires middleware, and`,
-    `    starts listening → DECOMPOSE.`,
+    `  - \`hashPassword(pw)\` → IMPLEMENT (one transform, few lines).`,
+    `  - \`handleGetApiEntries\` that loads entries, serializes, sends →`,
+    `    IMPLEMENT. It's a 15-line pipeline; even if it calls three`,
+    `    helpers via ctx.fns, that's reuse, not orchestration.`,
+    `  - \`renderPage(data)\` that builds an HTML string → IMPLEMENT.`,
+    `  - \`handleSignup(req,res)\` where parse/validate/hash/write/reply`,
+    `    aren't yet available as ctx.fns helpers AND the body would exceed`,
+    `    30 lines → DECOMPOSE.`,
     "",
     `Answer with EXACTLY one word (IMPLEMENT or DECOMPOSE) inside a fenced`,
     `code block. Nothing else.`,
@@ -480,8 +668,9 @@ export function createDesignDispatchBridge(
   chat: ChatFn,
   options: DispatchOptions = {},
 ): DesignDispatchBridge {
-  const maxAttempts = options.maxAttempts ?? 5;
-  const maxReviewCycles = options.maxReviewCycles ?? 2;
+  const maxAttempts = options.maxAttempts ?? 8;
+  const maxReviewCycles = options.maxReviewCycles ?? 3;
+  const mode = options.mode ?? "harden";
   const rawTestFn = options.runTests ?? runTests;
   const projectDir = options.projectDir;
   const testFn: TestFn = projectDir
@@ -510,7 +699,23 @@ export function createDesignDispatchBridge(
         fn.implementation === null &&
         fn.spec !== null
       ) {
-        const shouldDecompose = await askDecompose(chat, fn);
+        let shouldDecompose: boolean;
+        if (obviouslyImplementable(fn.spec)) {
+          // Skip the LLM — spec is clearly a leaf. Saves a ~60–120s
+          // turn on local inference AND prevents the askDecompose
+          // framing from over-triggering on tight leaf pipelines.
+          debug(
+            "dispatch",
+            `${key} complexity-floor: auto-IMPLEMENT (deps=0, edgeCases=${fn.spec.edgeCases.length} ≤ 4)`,
+          );
+          debug(
+            "progress",
+            `dispatch: ${key} complexity-floor → IMPLEMENT (no LLM call)`,
+          );
+          shouldDecompose = false;
+        } else {
+          shouldDecompose = await askDecompose(chat, fn, graph);
+        }
         debug(
           "dispatch",
           `${key} decision: ${shouldDecompose ? "DECOMPOSE" : "IMPLEMENT"}`,
@@ -567,6 +772,31 @@ export function createDesignDispatchBridge(
       let reviewCycles = 0;
       let pendingArchitectFeedback: string | null = null;
       let pendingAnalyzerFeedback: string | null = null;
+      let lastAllTestsFailed = false;
+      // Prior architect review feedback, carried forward to subsequent
+      // review cycles so the reviewer can see what it said last time
+      // and avoid contradicting itself.
+      let priorReviewFeedback: string | null = null;
+      // Stagnation detection: remember the last two bodies and their
+      // failure counts. If two consecutive bodies are near-identical
+      // (same length within a small delta) AND their failure counts
+      // match, we nudge the Implementer to try a different approach.
+      let lastFailedCount = -1;
+      let lastPassedCount = -1;
+      let priorBodyLength = -1;
+      let stagnating = false;
+      // Stagnation is a one-shot signal per dispatch. Nagging the
+      // Implementer on every attempt when conditions persist doesn't
+      // help — the hint hasn't made a difference the first time.
+      let stagnationFired = false;
+      // Track the MOST-RECENT tests-green body so we never regress to
+      // null on exhaustion. If the Implementer gets a green pass but
+      // the architect REVISE's indefinitely, keep the green body; on
+      // cap/exhaustion save it as architect-rejected rather than
+      // emitting a stub. Covers the handleRequest pattern: 9/0 GREEN
+      // → REVISE → 11/3 RED → ... → failed-with-null-impl, which is
+      // strictly worse than keeping the 9/0 body.
+      let lastGreenBody: { body: string; output: string } | null = null;
 
       // Pre-test: if an existing body is already in the graph (loaded
       // from disk, or carried over from a prior successful build),
@@ -581,6 +811,7 @@ export function createDesignDispatchBridge(
         const preViolations = collectBodyViolations(
           preAnalysis,
           preKnownNames,
+          fn.children,
         );
         if (preViolations.length > 0) {
           debug(
@@ -598,6 +829,23 @@ export function createDesignDispatchBridge(
           pendingAnalyzerFeedback = preViolations.join("\n\n");
           testOutput = "";
           // Fall through to the regenerate loop (no early return).
+        } else if (mode === "sketch") {
+          // Sketch mode + clean analyzer → keep the loaded body as-is.
+          // No tests, no review: that's the whole point of sketch.
+          reconcileSpecDependencies(graph, module, name, preAnalysis);
+          graph.setTestStatus(module, name, "tests-green", "");
+          debug(
+            "dispatch",
+            `pre-test sketch ${key} — keeping loaded body (no tests, no review)`,
+          );
+          return {
+            module,
+            name,
+            status: "tests-green",
+            implementation: fn.implementation,
+            attempts: 0,
+            testOutput: "",
+          };
         } else {
         const pre = await testFn(graph, { module, name, body: fn.implementation });
         debug(
@@ -630,8 +878,16 @@ export function createDesignDispatchBridge(
                 // a review cycle yet — the Implementer hasn't had a
                 // chance to respond. Prime the feedback for attempt 1.
                 previousBody = fn.implementation;
-                pendingArchitectFeedback = review.feedback;
+                pendingArchitectFeedback = formatArchitectFeedback(review);
                 testOutput = pre.output;
+                // Seed lastGreenBody with the pre-loaded body — it
+                // went tests-green, so if the regenerate loop never
+                // recovers another green, we restore this one rather
+                // than erasing it to null.
+                lastGreenBody = {
+                  body: fn.implementation,
+                  output: pre.output,
+                };
               }
             }
           }
@@ -675,12 +931,24 @@ export function createDesignDispatchBridge(
                 testOutput,
                 architectFeedback: pendingArchitectFeedback ?? undefined,
                 analyzerFeedback: pendingAnalyzerFeedback ?? undefined,
+                allTestsFailed: lastAllTestsFailed,
+                stagnating,
+                previousPassed: lastPassedCount >= 0 ? lastPassedCount : undefined,
+                previousFailed: lastFailedCount >= 0 ? lastFailedCount : undefined,
               },
+          { mode },
         );
         // Consumed — clear so a subsequent test-failure retry uses
-        // test output, not stale review/analyzer feedback.
+        // test output, not stale review/analyzer feedback. Same
+        // contract for `lastAllTestsFailed`: the flag reflects the
+        // IMMEDIATELY prior test run, so we reset here and let the
+        // next `testFn` result re-populate it. Paths that skip
+        // testFn (extraction fail, analyzer reject, architect
+        // REVISE-continue) leave it cleared.
         pendingArchitectFeedback = null;
         pendingAnalyzerFeedback = null;
+        lastAllTestsFailed = false;
+        stagnating = false;
 
         debug(
           "dispatch",
@@ -716,7 +984,11 @@ export function createDesignDispatchBridge(
         const knownNames = new Set(
           graph.listFunctions().map((f) => f.name),
         );
-        const violations = collectBodyViolations(analysis, knownNames);
+        const violations = collectBodyViolations(
+          analysis,
+          knownNames,
+          fn.children,
+        );
         if (violations.length > 0) {
           lastError = `body-analyzer rejected: ${violations.length} violation(s)`;
           previousBody = body;
@@ -786,6 +1058,33 @@ export function createDesignDispatchBridge(
           }
         }
 
+        // SKETCH MODE short-circuit: the body passed static analysis,
+        // that's enough. Save and return — no tests, no architect
+        // review. The hardening pass will add both later.
+        if (mode === "sketch") {
+          graph.setImplementation(module, name, body);
+          graph.setTestStatus(module, name, "tests-green", "");
+          // Reconcile dependencies from the observed call sites so the
+          // coherence pass (Phase 4) sees the actual call graph.
+          reconcileSpecDependencies(graph, module, name, analysis);
+          debug(
+            "dispatch",
+            `saved ${key} (sketch-mode, ${attempt + 1} attempts)`,
+          );
+          debug(
+            "progress",
+            `dispatch: ${key} SKETCH-SAVED (${attempt + 1} attempts)`,
+          );
+          return {
+            module,
+            name,
+            status: "tests-green",
+            implementation: body,
+            attempts: attempt + 1,
+            testOutput: "",
+          };
+        }
+
         // No tests to run yet — the Implementer must emit at least one
         // unit test before we can evaluate the body. Treat as a retry
         // with explicit feedback.
@@ -801,14 +1100,47 @@ export function createDesignDispatchBridge(
         }
 
         const tr = await testFn(graph, { module, name, body });
+        // Stagnation detection: if this attempt's body is within 5% of
+        // the previous attempt's length AND the failure count matches,
+        // the Implementer is spinning on cosmetic tweaks. Flag the
+        // NEXT attempt so the Implementer is nudged to rethink.
+        // Only meaningful in the test-failing regime — review-driven
+        // iterations (tr.failed === 0, architect REVISE) are not
+        // cosmetic tweaks; the Implementer is responding to reviewer
+        // concerns.
+        if (
+          tr.failed > 0 &&
+          priorBodyLength >= 0 &&
+          lastFailedCount >= 0 &&
+          !stagnationFired
+        ) {
+          const lenDiff = Math.abs(body.length - priorBodyLength);
+          const lenRatio = lenDiff / Math.max(priorBodyLength, 1);
+          if (lenRatio < 0.05 && tr.failed === lastFailedCount) {
+            stagnating = true;
+            stagnationFired = true;
+          }
+        }
+        priorBodyLength = body.length;
+        lastFailedCount = tr.failed;
+        lastPassedCount = tr.passed;
+
         previousBody = body;
         testOutput = tr.output;
+        // Set (or reset) the all-tests-failed flag for the NEXT attempt.
+        // Always updated per test run so the flag can't go stale across
+        // architect-REVISE continues or extraction-fail continues.
+        lastAllTestsFailed = tr.failed > 0 && tr.passed === 0;
         debug(
           "dispatch",
           `test ${key} ok=${tr.ok} passed=${tr.passed} failed=${tr.failed}`,
         );
 
         if (tr.ok) {
+          // Remember this green body BEFORE review — on exhaustion
+          // we'll prefer keeping it (as architect-rejected) over
+          // returning a null implementation.
+          lastGreenBody = { body, output: tr.output };
           // Architect review gate. The Implementer's body passed the
           // Implementer's own tests — now the Architect checks that
           // the body actually satisfies the SPEC (the original
@@ -837,6 +1169,7 @@ export function createDesignDispatchBridge(
               graph,
               body,
               tr.output,
+              priorReviewFeedback ?? undefined,
             );
             if (!review.approved) {
               reviewCycles++;
@@ -849,6 +1182,10 @@ export function createDesignDispatchBridge(
                 `dispatch: ${key} architect REVISE (${reviewCycles}/${maxReviewCycles})`,
               );
               if (reviewCycles >= maxReviewCycles) {
+                // Preserve the (green) body instead of dropping to
+                // null — architect-rejected but functionally working
+                // code beats a stub downstream.
+                graph.setImplementation(module, name, body);
                 graph.setTestStatus(
                   module,
                   name,
@@ -859,14 +1196,18 @@ export function createDesignDispatchBridge(
                   module,
                   name,
                   status: "failed",
-                  implementation: null,
+                  implementation: body,
                   attempts: attempt + 1,
                   testOutput: tr.output,
                   error: `architect rejected after ${reviewCycles} review cycle(s): ${review.feedback.slice(0, 300)}`,
                 };
               }
               previousBody = body;
-              pendingArchitectFeedback = review.feedback;
+              pendingArchitectFeedback = formatArchitectFeedback(review);
+              // Remember this cycle's feedback for the NEXT review so
+              // the architect can see what it already said and not
+              // contradict itself on cycle 2+.
+              priorReviewFeedback = review.feedback;
               // Keep testOutput as the (passing) test output for
               // reference, but the prompt builder will surface the
               // architect feedback under its own section instead.
@@ -903,6 +1244,36 @@ export function createDesignDispatchBridge(
         "dispatch",
         `exhausted ${key} attempts=${maxAttempts} lastError=${lastError}`,
       );
+
+      // Recovery: if any attempt went tests-green during this dispatch
+      // (even if the architect kept REVISE'ing after), preserve that
+      // body rather than dropping to null. Downstream finalize would
+      // otherwise emit a stub, which is strictly worse than a green
+      // body with architect concerns — regressing to red while chasing
+      // architect feedback is the handleRequest failure mode this
+      // fallback fixes.
+      if (lastGreenBody) {
+        graph.setImplementation(module, name, lastGreenBody.body);
+        graph.setTestStatus(
+          module,
+          name,
+          "architect-rejected",
+          lastGreenBody.output,
+        );
+        debug(
+          "dispatch",
+          `preserved last-green body for ${key} (exhausted without approval)`,
+        );
+        return {
+          module,
+          name,
+          status: "failed",
+          implementation: lastGreenBody.body,
+          attempts: maxAttempts,
+          testOutput: lastGreenBody.output,
+          error: `exhausted ${maxAttempts} attempts; preserving last tests-green body (architect concerns unresolved). ${lastError ?? ""}`.trim(),
+        };
+      }
 
       graph.setTestStatus(module, name, "tests-red", testOutput);
       return {

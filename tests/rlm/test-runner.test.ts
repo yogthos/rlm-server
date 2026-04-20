@@ -3,6 +3,7 @@ import { createDesignGraph } from "../../src/rlm/design-graph.js";
 import {
   materializeWithOverride,
   runTests,
+  buildTestOutput,
 } from "../../src/rlm/test-runner.js";
 
 describe("materializeWithOverride", () => {
@@ -305,4 +306,135 @@ describe("runTests — end-to-end via vitest", () => {
     expect(result.failed).toBeGreaterThanOrEqual(1);
     expect(result.output.length).toBeGreaterThan(0);
   }, 30_000);
+});
+
+describe("createProjectDir scaffolding — framework-aware", () => {
+  it("emits jest.config.js when projectConfig picks jest", async () => {
+    const { createDesignGraph } = await import(
+      "../../src/rlm/design-graph.js"
+    );
+    const { createProjectDir } = await import("../../src/rlm/test-runner.js");
+    const fs = await import("node:fs/promises");
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "foo", { params: [], returnType: "void" });
+    g.setProjectConfig({
+      packageJson:
+        '{"name":"p","type":"module","devDependencies":{"jest":"^29.0.0"}}',
+      testFramework: "jest",
+    });
+    const dir = await createProjectDir(g);
+    try {
+      const config = await fs.readFile(`${dir.path}/jest.config.js`, "utf8");
+      expect(config).toMatch(/testMatch/);
+    } finally {
+      await dir.dispose();
+    }
+  });
+
+  it("does NOT emit jest.config.js when framework is vitest", async () => {
+    const { createDesignGraph } = await import(
+      "../../src/rlm/design-graph.js"
+    );
+    const { createProjectDir } = await import("../../src/rlm/test-runner.js");
+    const fs = await import("node:fs/promises");
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "foo", { params: [], returnType: "void" });
+    g.setProjectConfig({
+      packageJson:
+        '{"name":"p","type":"module","devDependencies":{"vitest":"^2.0.0"}}',
+      testFramework: "vitest",
+    });
+    const dir = await createProjectDir(g);
+    try {
+      await expect(
+        fs.access(`${dir.path}/jest.config.js`),
+      ).rejects.toThrow();
+    } finally {
+      await dir.dispose();
+    }
+  });
+});
+
+describe("buildTestOutput — 0/0 load-failure signal", () => {
+  it("leads with a clear banner when 0/0 and hasTests=true (file failed to load)", () => {
+    const out = buildTestOutput(
+      { passed: 0, failed: 0, failureDigest: "" },
+      "SyntaxError: Unexpected token '}'\n    at Parser.js:42",
+      true,
+    );
+    // First line tells the Implementer the test file didn't load —
+    // distinct from "tests ran and some failed".
+    expect(out.split("\n")[0]).toMatch(/TEST FILE DID NOT LOAD/);
+    // stderr tail must be prominent so the syntax error is visible.
+    expect(out).toContain("SyntaxError");
+  });
+
+  it("no banner when hasTests=false and 0/0 (legitimate no-tests case)", () => {
+    const out = buildTestOutput(
+      { passed: 0, failed: 0, failureDigest: "" },
+      "",
+      false,
+    );
+    expect(out).not.toMatch(/TEST FILE DID NOT LOAD/);
+  });
+
+  it("no banner when tests actually ran (passed>0 or failed>0)", () => {
+    const outPassed = buildTestOutput(
+      { passed: 3, failed: 0, failureDigest: "" },
+      "",
+      true,
+    );
+    expect(outPassed).not.toMatch(/TEST FILE DID NOT LOAD/);
+    const outFailed = buildTestOutput(
+      {
+        passed: 2,
+        failed: 1,
+        failureDigest: "✗ adds: expected 3 to be 4",
+      },
+      "",
+      true,
+    );
+    expect(outFailed).not.toMatch(/TEST FILE DID NOT LOAD/);
+    expect(outFailed).toContain("expected 3 to be 4");
+  });
+
+  it("falls back to stdout+stderr when parsed is null (JSON parse failed)", () => {
+    const out = buildTestOutput(null, "kaboom", true);
+    expect(out).toContain("kaboom");
+  });
+
+  it("extracts a SyntaxError line from stderr even when buried in noise", () => {
+    // Simulate vitest stderr where a giant deprecation warning + stack
+    // push the key diagnostic out of the last-800 window.
+    const noise = "x".repeat(1500);
+    const stderr =
+      noise +
+      "\n(node:123) DeprecationWarning: foo\n" +
+      "SyntaxError: Unexpected token '}' at src/foo.ts:12\n" +
+      "x".repeat(1000);
+    const out = buildTestOutput(
+      { passed: 0, failed: 0, failureDigest: "" },
+      stderr,
+      true,
+    );
+    // The extracted diagnostic surfaces the SyntaxError regardless of
+    // where it sits in the stderr.
+    expect(out).toMatch(/SyntaxError: Unexpected token '\}' at src\/foo\.ts:12/);
+    // And it appears near the top (in a "key error" section), not only
+    // in the tail.
+    const bannerEnd = out.indexOf("----- stderr tail -----");
+    expect(bannerEnd).toBeGreaterThan(-1);
+    const before = out.slice(0, bannerEnd);
+    expect(before).toMatch(/SyntaxError/);
+  });
+
+  it("extracts other Error subclasses too (TypeError, ReferenceError)", () => {
+    const stderr = "noise\nTypeError: foo is not a function\nmore noise";
+    const out = buildTestOutput(
+      { passed: 0, failed: 0, failureDigest: "" },
+      stderr,
+      true,
+    );
+    expect(out).toMatch(/TypeError: foo is not a function/);
+  });
 });

@@ -125,7 +125,7 @@ export function loadConfig(overrides?: Partial<ServerConfig>): ServerConfig {
     maxReviewCycles:
       num(process.env.RLM_MAX_REVIEW_CYCLES) ??
       overrides?.maxReviewCycles ??
-      2,
+      3,
   };
 }
 

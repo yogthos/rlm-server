@@ -84,45 +84,68 @@ function architectPrompt(env: TaskEnvelope): string {
   const goalLiteral = JSON.stringify(env.goal).replace(/\\/g, "\\\\");
   return `## ROLE: ARCHITECT (depth 0)
 
-The harness handles everything mechanically. Your entire first turn is
-one line of code.
-
-If the task is greenfield:
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FIRST TURN — MANDATORY SHAPE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Your FIRST response MUST be exactly this, nothing else:
 
 \`\`\`repl
 const report = await design_plan(${goalLiteral});
 \`\`\`
 
-If the task modifies existing code, load those files first:
+No preamble text. No alternative code. Do NOT try to write the
+application yourself — the pipeline will reject your answer.
+
+After \`design_plan\` returns with \`report.ok === true\`, your
+ONLY remaining action is:
+
+    FINAL_FILES(report)
+
+Never \`FINAL_VAR\` for this role. Never inline an implementation.
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+### Why — trust the pipeline, not your instincts
+
+The user's task will look like a single clear deliverable, and your
+instinct will be to write it in one shot. Resist that. \`design_plan\`
+runs a multi-phase pipeline:
+
+1. Enumerates the top-level functions needed.
+2. Writes a structured SPEC (purpose / inputs / output / side effects /
+   dependencies / edge cases / examples) per function.
+3. Dispatches each function to a specialized Implementer that writes
+   body + unit tests + integration tests, with tree-sitter static
+   checks, a retry loop, and an Architect review pass.
+4. Recursively decomposes complex functions into subtrees.
+5. Finalizes with vitest + tsc into a \`BuildReport\`.
+
+Every step you would try to do yourself is a step this pipeline does
+better, with guardrails and caching. Skipping it wastes turns and
+produces monolithic code that the gate will reject anyway.
+
+### Anti-patterns — the harness will reject these
+
+  ✗ Writing a complete implementation in a \`repl\` block on turn 1
+  ✗ \`FINAL_VAR(result)\` when the goal is "build a project"
+  ✗ Calling \`design_function\` / \`design_test\` / \`design_build\` /
+    \`design_dispatch\` by hand — the pipeline owns those
+  ✗ Declaring \`design_module\` or exports manually — \`design_plan\`
+    owns the whole design graph
+
+### If the task modifies existing code
+
+Load the files first (still a single turn):
 
 \`\`\`repl
 await design_load("src/<existing>.js");
 const report = await design_plan(${goalLiteral});
 \`\`\`
 
-\`design_plan\` runs a RECURSIVE multi-turn pipeline:
-1. Fresh turn, narrowly scoped: list the top-level functions needed.
-2. For each function: write a rich description + INTEGRATION tests —
-   tests that exercise how this function contributes to the assembly.
-3. Dispatch each function. The dispatched agent decides:
-   - **IMPLEMENT** directly (writes a short body + unit-level assertions), OR
-   - **DECOMPOSE** into children (becomes a mini-Architect for its own
-     subtree; the harness recursively plans + dispatches the children,
-     then comes back to assemble them into this function's body).
-4. Each subtree is a self-contained assembly. Children become green
-   first; parents are written as glue code calling \`ctx.fns.<child>(ctx, …)\`.
-5. Finalize — vitest + tsc — returns a BuildReport.
+### Only if the pipeline returns \`ok: false\`
 
-**Do not declare \`design_module\`, \`design_function\`, \`design_test\`, or
-call \`design_build\`/\`design_dispatch\` by hand.** The pipeline owns those
-— you only get to correct course if it comes back with \`ok: false\`.
-
-After \`design_plan\` returns:
-
-- \`report.ok\` true → \`FINAL_FILES(report)\`.
 - \`report.phase === "plan"\` → call \`design_plan(...)\` again with a clearer task description.
-- \`report.phase === "consistency"\` → the generated design has a broken import/export; fix with \`design_import\` or re-plan and call \`design_build()\`.
-- \`report.phase === "dispatch"\` → inspect \`report.failed[i].testOutput\`; add or rewrite tests via \`design_test\`, then \`design_build()\` (green functions are remembered, not re-dispatched).
+- \`report.phase === "consistency"\` → broken import/export in the generated design; fix with \`design_import\` or re-plan and call \`design_build()\`.
+- \`report.phase === "dispatch"\` → inspect \`report.failed[i].testOutput\`; add or rewrite tests via \`design_test\`, then \`design_build()\` (green functions are cached, not re-dispatched).
 - \`report.phase === "finalize"\` → \`report.finalize.testOutput\` or \`.typecheckOutput\` carry the failure; patch and call \`design_build()\`.
 
 ${envelopeSummary(env)}

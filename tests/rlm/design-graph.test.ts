@@ -230,6 +230,51 @@ describe("DesignGraph — consistency validator (proc-ts)", () => {
   });
 });
 
+describe("DesignGraph — projectConfig (package.json + test framework)", () => {
+  it("getProjectConfig returns null before setProjectConfig is called", () => {
+    const g = createDesignGraph();
+    expect(g.getProjectConfig()).toBeNull();
+  });
+
+  it("setProjectConfig stores the config and getProjectConfig returns a copy", () => {
+    const g = createDesignGraph();
+    const cfg = {
+      packageJson: '{"name":"x","devDependencies":{"vitest":"^2.0.0"}}',
+      testFramework: "vitest" as const,
+    };
+    g.setProjectConfig(cfg);
+    const out = g.getProjectConfig();
+    expect(out).toEqual(cfg);
+  });
+
+  it("materialize emits package.json at the root when projectConfig is set", () => {
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "foo", sig([]));
+    const raw = '{"name":"proj","type":"module","devDependencies":{"vitest":"^2.0.0"}}';
+    g.setProjectConfig({ packageJson: raw, testFramework: "vitest" });
+    const files = g.materialize();
+    expect(files["package.json"]).toBe(raw);
+  });
+
+  it("materialize omits package.json when projectConfig is not set", () => {
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "foo", sig([]));
+    const files = g.materialize();
+    expect(files["package.json"]).toBeUndefined();
+  });
+
+  it("snapshot preserves projectConfig", () => {
+    const g = createDesignGraph();
+    const cfg = {
+      packageJson: '{"name":"y","devDependencies":{"jest":"^29.0.0"}}',
+      testFramework: "jest" as const,
+    };
+    g.setProjectConfig(cfg);
+    const snap = g.snapshot();
+    expect(snap.projectConfig).toEqual(cfg);
+  });
+});
+
 describe("DesignGraph — architect-rejected status", () => {
   it("accepts 'architect-rejected' as a valid setTestStatus value", () => {
     const g = createDesignGraph();
