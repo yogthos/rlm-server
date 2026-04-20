@@ -52,20 +52,29 @@ export interface CleanupReport {
 async function collectObservedCalls(
   graph: DesignGraph,
 ): Promise<Map<string, Set<string>>> {
+  const candidates = graph
+    .listFunctions()
+    .filter((fn) => fn.implementation !== null);
+  // Parallelize body analysis — tree-sitter parses are CPU-bound but
+  // analyzeBody is async so they naturally interleave. For graphs of
+  // ~20 functions, serial takes ~20× a single parse; Promise.all
+  // flattens that.
+  const results = await Promise.all(
+    candidates.map(async (fn) => {
+      try {
+        const analysis = await analyzeBody(fn.implementation!);
+        return { name: fn.name, calls: new Set(analysis.ctxFnsCalls.map((c) => c.name)) };
+      } catch (e) {
+        debug(
+          "cleanup",
+          `body-analyze threw for ${fn.name} (${e instanceof Error ? e.message : String(e)}); treating as leaf`,
+        );
+        return { name: fn.name, calls: new Set<string>() };
+      }
+    }),
+  );
   const calls = new Map<string, Set<string>>();
-  for (const fn of graph.listFunctions()) {
-    if (fn.implementation === null) continue;
-    try {
-      const analysis = await analyzeBody(fn.implementation);
-      calls.set(fn.name, new Set(analysis.ctxFnsCalls.map((c) => c.name)));
-    } catch (e) {
-      debug(
-        "cleanup",
-        `body-analyze threw for ${fn.name} (${e instanceof Error ? e.message : String(e)}); treating as leaf`,
-      );
-      calls.set(fn.name, new Set());
-    }
-  }
+  for (const r of results) calls.set(r.name, r.calls);
   return calls;
 }
 
