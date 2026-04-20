@@ -148,6 +148,66 @@ describe("designLeafUpBuild", () => {
     expect(report.blocked.sort()).toEqual(["leaf", "root"]);
   });
 
+  it("dispatches same-level functions CONCURRENTLY (overlapping awaits)", async () => {
+    const g = createDesignGraph();
+    for (const n of ["a", "b", "c", "d"]) {
+      g.addFunction("src/a.ts", n, sig());
+      g.setSpec("src/a.ts", n, spec());
+    }
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const dispatch = async (_g: any, mod: string, name: string) => {
+      inFlight++;
+      if (inFlight > maxInFlight) maxInFlight = inFlight;
+      // Yield for a tick so parallel dispatches actually overlap.
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      inFlight--;
+      _g.setImplementation(mod, name, "// ok");
+      _g.setTestStatus(mod, name, "tests-green", "");
+      return {
+        module: mod,
+        name,
+        status: "tests-green" as const,
+        implementation: "// ok",
+        attempts: 1,
+        testOutput: "",
+      };
+    };
+    await designLeafUpBuild(g, { dispatch, maxConcurrent: 4 });
+    // With 4 independent L0 functions and maxConcurrent=4, all should
+    // have been in flight simultaneously at some point.
+    expect(maxInFlight).toBe(4);
+  });
+
+  it("respects maxConcurrent cap — never dispatches more than N at once", async () => {
+    const g = createDesignGraph();
+    for (const n of ["a", "b", "c", "d", "e", "f"]) {
+      g.addFunction("src/a.ts", n, sig());
+      g.setSpec("src/a.ts", n, spec());
+    }
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const dispatch = async (_g: any, mod: string, name: string) => {
+      inFlight++;
+      if (inFlight > maxInFlight) maxInFlight = inFlight;
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      inFlight--;
+      _g.setImplementation(mod, name, "// ok");
+      _g.setTestStatus(mod, name, "tests-green", "");
+      return {
+        module: mod,
+        name,
+        status: "tests-green" as const,
+        implementation: "// ok",
+        attempts: 1,
+        testOutput: "",
+      };
+    };
+    await designLeafUpBuild(g, { dispatch, maxConcurrent: 2 });
+    // 6 functions, concurrency cap 2 → at most 2 in flight simultaneously.
+    expect(maxInFlight).toBe(2);
+  });
+
   it("dispatches same-level functions in alphabetical order (deterministic)", async () => {
     const g = createDesignGraph();
     g.addFunction("src/a.ts", "zeta", sig());

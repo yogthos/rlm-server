@@ -50,6 +50,13 @@ export interface LeafUpBuildOptions {
    *  function gets decomposed into children before retrying. If
    *  omitted, stagnation falls through to blocked. */
   decompose?: DecomposeCallback;
+  /** Max concurrent dispatches per batch. Functions at the same
+   *  dependency level (or below) are inherently independent — their
+   *  specs don't reference each other — so it's safe to run them in
+   *  parallel. Each dispatch uses its own tmp project dir, so there's
+   *  no file-system contention. Default 4; reduce if the LLM backend
+   *  rate-limits. */
+  maxConcurrent?: number;
 }
 
 export interface LeafUpBuildReport {
@@ -128,24 +135,21 @@ export function computeDependencyLevels(
   return level;
 }
 
-function pickReady(
+function pickReadyBatch(
   graph: DesignGraph,
   green: Set<string>,
   blocked: Set<string>,
   levels: Map<string, number>,
-): { module: string; name: string } | null {
+  max: number,
+): Array<{ module: string; name: string }> {
   const candidates: Array<{ module: string; name: string; level: number }> = [];
   const names = new Set(graph.listFunctions().map((f) => f.name));
   for (const f of graph.listFunctions()) {
     if (green.has(f.name) || blocked.has(f.name)) continue;
     if (f.spec === null) continue;
-    // All deps (spec + decomposition children) must be green.
     const specDeps = f.spec.dependencies.filter((d) => names.has(d));
     const treeDeps = f.children.filter((d) => names.has(d));
     const allDeps = [...new Set<string>([...specDeps, ...treeDeps])];
-    // Cascade block FIRST — otherwise a parent of a blocked child
-    // just hangs in "not ready" until post-loop sweep, wasting
-    // iterations. Check blocked before green so cascading is immediate.
     if (allDeps.some((d) => blocked.has(d))) {
       blocked.add(f.name);
       continue;
@@ -154,9 +158,11 @@ function pickReady(
     const L = levels.get(f.name) ?? Number.MAX_SAFE_INTEGER;
     candidates.push({ module: f.module, name: f.name, level: L });
   }
-  if (candidates.length === 0) return null;
+  // Sort by level (leaves first) then alphabetical for deterministic
+  // order within a batch — important because Promise.all preserves
+  // input order in its results array.
   candidates.sort((a, b) => a.level - b.level || a.name.localeCompare(b.name));
-  return { module: candidates[0].module, name: candidates[0].name };
+  return candidates.slice(0, max).map((c) => ({ module: c.module, name: c.name }));
 }
 
 export async function designLeafUpBuild(
@@ -196,6 +202,7 @@ export async function designLeafUpBuild(
   // rounds without risking infinite spin.
   const startSize = graph.listFunctions().length;
   const MAX_ITERATIONS = Math.max(startSize * 3, 30);
+  const maxConcurrent = options.maxConcurrent ?? 4;
   let iter = 0;
   while (iter++ < MAX_ITERATIONS) {
     let levels: Map<string, number>;
@@ -210,86 +217,100 @@ export async function designLeafUpBuild(
         error: e instanceof Error ? e.message : String(e),
       };
     }
-    const pick = pickReady(graph, green, blocked, levels);
-    if (!pick) break;
-    const { module, name } = pick;
+    const batch = pickReadyBatch(
+      graph,
+      green,
+      blocked,
+      levels,
+      maxConcurrent,
+    );
+    if (batch.length === 0) break;
     debug(
       "leaf-up-build",
-      `dispatch ${name} (level ${levels.get(name) ?? "?"})`,
+      `batch: dispatching ${batch.length} function(s) concurrently [${batch.map((p) => p.name).join(", ")}]`,
     );
-    dispatched.push(name);
-    let result: DispatchResult;
-    try {
-      result = await options.dispatch(graph, module, name, {
-        projectDir: options.projectDir,
-      });
-    } catch (e) {
+    for (const p of batch) dispatched.push(p.name);
+    // Functions in a batch are inherently independent (deps all green,
+    // so they don't call each other's unfinished work). Safe to run
+    // LLM calls + tests in parallel. Each dispatch uses its own fresh
+    // tmp dir inside test-runner, so no file-system contention.
+    const results = await Promise.all(
+      batch.map(async (p) => {
+        try {
+          const r = await options.dispatch(graph, p.module, p.name, {
+            projectDir: options.projectDir,
+          });
+          return { pick: p, result: r, error: null as unknown };
+        } catch (e) {
+          return { pick: p, result: null, error: e };
+        }
+      }),
+    );
+    // Process results SEQUENTIALLY — decompose mutates graph structure
+    // (adds children, clears bodies) and concurrent writes would race.
+    for (const { pick, result, error } of results) {
+      const { module, name } = pick;
+      if (error) {
+        debug(
+          "leaf-up-build",
+          `${name} threw: ${error instanceof Error ? error.message : String(error)}`,
+        );
+        blocked.add(name);
+        continue;
+      }
+      if (!result) {
+        blocked.add(name);
+        continue;
+      }
+      if (result.status === "tests-green") {
+        green.add(name);
+        continue;
+      }
+      if (result.status === "stagnated" && options.decompose) {
+        if (decomposedOnce.has(name)) {
+          debug(
+            "leaf-up-build",
+            `${name} STAGNATED AGAIN after prior decompose — blocking`,
+          );
+          blocked.add(name);
+          continue;
+        }
+        debug(
+          "leaf-up-build",
+          `${name} STAGNATED — clearing body + decomposing`,
+        );
+        const childrenBefore = graph.listChildren(name).length;
+        graph.clearImplementation(module, name);
+        let ok: boolean;
+        try {
+          ok = await options.decompose(graph, name);
+        } catch (e) {
+          debug(
+            "leaf-up-build",
+            `${name} decompose threw: ${e instanceof Error ? e.message : String(e)}`,
+          );
+          blocked.add(name);
+          continue;
+        }
+        const childrenAfter = graph.listChildren(name).length;
+        if (!ok || childrenAfter <= childrenBefore) {
+          debug(
+            "leaf-up-build",
+            `${name} decompose failed (ok=${ok}, children ${childrenBefore}→${childrenAfter}) — blocking`,
+          );
+          blocked.add(name);
+          continue;
+        }
+        decomposedOnce.add(name);
+        decomposed.push(name);
+        continue;
+      }
       debug(
         "leaf-up-build",
-        `${name} threw: ${e instanceof Error ? e.message : String(e)}`,
+        `${name} not green (${result.status}) — blocking parents`,
       );
       blocked.add(name);
-      continue;
     }
-
-    if (result.status === "tests-green") {
-      green.add(name);
-      continue;
-    }
-
-    if (result.status === "stagnated" && options.decompose) {
-      // Bug-fix: don't re-decompose a function we already split once.
-      // A repeated stagnation means decomposition didn't help, so
-      // further re-planning is no-op waste (designPlan's resume
-      // logic skips phase-1 if children already exist).
-      if (decomposedOnce.has(name)) {
-        debug(
-          "leaf-up-build",
-          `${name} STAGNATED AGAIN after prior decompose — blocking`,
-        );
-        blocked.add(name);
-        continue;
-      }
-      debug(
-        "leaf-up-build",
-        `${name} STAGNATED — clearing body + decomposing`,
-      );
-      const childrenBefore = graph.listChildren(name).length;
-      graph.clearImplementation(module, name);
-      let ok: boolean;
-      try {
-        ok = await options.decompose(graph, name);
-      } catch (e) {
-        debug(
-          "leaf-up-build",
-          `${name} decompose threw: ${e instanceof Error ? e.message : String(e)}`,
-        );
-        blocked.add(name);
-        continue;
-      }
-      const childrenAfter = graph.listChildren(name).length;
-      // Bug-fix: if decompose "succeeded" but added no children, we'd
-      // re-dispatch the parent against the same deps and immediately
-      // stagnate again. Treat as a failed split.
-      if (!ok || childrenAfter <= childrenBefore) {
-        debug(
-          "leaf-up-build",
-          `${name} decompose failed (ok=${ok}, children ${childrenBefore}→${childrenAfter}) — blocking`,
-        );
-        blocked.add(name);
-        continue;
-      }
-      decomposedOnce.add(name);
-      decomposed.push(name);
-      continue;
-    }
-
-    // status in { "failed", "stagnated" without decompose, other } — block.
-    debug(
-      "leaf-up-build",
-      `${name} not green (${result.status}) — blocking parents`,
-    );
-    blocked.add(name);
   }
   if (iter >= MAX_ITERATIONS) {
     debug(
