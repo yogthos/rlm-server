@@ -201,62 +201,72 @@ export function createIntegrationRunner(
         owned = true;
       }
       await writeProjectFiles(graph, dir);
-      const vitest = await shellOut(
-        "npx",
-        ["vitest", "run", "--reporter=json", "--root", dir],
-        dir,
-        timeoutMs,
-      );
+      // Run vitest and tsc in PARALLEL — they're independent
+      // processes, no file contention (both read the same static
+      // snapshot), so serializing just doubles wall time.
+      const [vitest, tsc] = await Promise.all([
+        shellOut(
+          "npx",
+          ["vitest", "run", "--reporter=json", "--root", dir],
+          dir,
+          timeoutMs,
+        ),
+        shellOut(
+          "npx",
+          ["tsc", "--noEmit", "-p", dir],
+          dir,
+          timeoutMs,
+        ),
+      ]);
       const vitestFailures = parseVitestFailures(vitest.stdout);
+      const tscFailures = parseTscErrors(tsc.stdout);
       debug(
         "integration-loop",
         `ran vitest — exit=${vitest.exitCode} failures=${vitestFailures.length}`,
       );
-      // Run tsc in parallel with the integration test signal. Type
-      // errors flow through the same fix-dispatch channel as test
-      // failures — each tsc error becomes an IntegrationFailure whose
-      // stack trace points at the offending file:line so attribution
-      // maps it to a function just like a vitest frame.
-      const tsc = await shellOut(
-        "npx",
-        ["tsc", "--noEmit", "-p", dir],
-        dir,
-        timeoutMs,
-      );
-      const tscFailures = parseTscErrors(tsc.stdout);
       debug(
         "integration-loop",
         `ran tsc — exit=${tsc.exitCode} errors=${tscFailures.length}`,
       );
-      const failures = [...vitestFailures, ...tscFailures];
-      // If vitest crashed / was SIGKILL'd and stdout has no parseable
-      // failures, we'd silently return `ok:false, failures:[]` and the
-      // integration loop would bail with "no failures attributable."
-      // Synthesize a diagnostic failure so the loop / user knows the
-      // runner itself went sideways.
-      if (vitest.exitCode !== 0 && failures.length === 0) {
+      const failures: IntegrationFailure[] = [
+        ...vitestFailures,
+        ...tscFailures,
+      ];
+      // Synthetic failure for vitest-crash: gated on vitestFailures
+      // (NOT combined). If tsc found errors in the same run, we still
+      // want to surface the vitest crash signal too — the errors may
+      // be complementary (type error caused by the same missing
+      // import that broke vitest load).
+      if (vitest.exitCode !== 0 && vitestFailures.length === 0) {
         const stderrTail = vitest.stderr.slice(-2000);
         const stdoutTail = vitest.stdout.slice(-800);
-        // Log a short excerpt of stderr prominently — when this
-        // happens, the real error (syntax error in the test file,
-        // missing import, etc.) is almost always in stderr. Without
-        // visibility here, the integration loop just spins dispatching
-        // function fixes that can't resolve a test-file problem.
         const stderrHead = stderrTail.split("\n").slice(0, 4).join(" | ");
         debug(
           "integration-loop",
-          `RUNNER CRASH exit=${vitest.exitCode} stderr[head]: ${stderrHead.slice(0, 400)}`,
+          `VITEST CRASH exit=${vitest.exitCode} stderr[head]: ${stderrHead.slice(0, 400)}`,
         );
-        return {
-          ok: false,
-          failures: [
-            {
-              testName: "project.runner",
-              message: `vitest exited ${vitest.exitCode} with no parseable test results (timeout ${timeoutMs}ms may have fired). First stderr lines: ${stderrHead.slice(0, 500)}`,
-              stackTrace: `stderr (last 2000 chars):\n${stderrTail}\n\nstdout (last 800 chars):\n${stdoutTail}`,
-            },
-          ],
-        };
+        failures.push({
+          testName: "project.runner",
+          message: `vitest exited ${vitest.exitCode} with no parseable test results. First stderr lines: ${stderrHead.slice(0, 500)}`,
+          stackTrace: `stderr (last 2000 chars):\n${stderrTail}\n\nstdout (last 800 chars):\n${stdoutTail}`,
+        });
+      }
+      // Symmetric synthetic for tsc-crash: when tsc exits non-zero
+      // but our regex captured nothing (e.g., tsc itself blew up or
+      // printed in an unexpected format), we still need SOMETHING
+      // the loop can act on.
+      if (tsc.exitCode !== 0 && tscFailures.length === 0) {
+        const tscStderrTail = tsc.stderr.slice(-2000);
+        const tscStdoutTail = tsc.stdout.slice(-800);
+        debug(
+          "integration-loop",
+          `TSC CRASH exit=${tsc.exitCode} stderr[head]: ${tscStderrTail.split("\n").slice(0, 4).join(" | ").slice(0, 400)}`,
+        );
+        failures.push({
+          testName: "project.typecheck",
+          message: `tsc exited ${tsc.exitCode} with no parseable errors (format change or tsc itself crashed).`,
+          stackTrace: `stderr (last 2000 chars):\n${tscStderrTail}\n\nstdout (last 800 chars):\n${tscStdoutTail}`,
+        });
       }
       return {
         ok:
