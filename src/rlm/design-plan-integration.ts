@@ -61,11 +61,13 @@ export type FinalizeFn = (
 
 export interface IntegrationPlanOptions {
   chat: (prompt: string) => Promise<string>;
-  /** Full harden dispatch — generates body + unit tests + runs them
-   *  + architect review. Called once per function during leaf-up. */
-  hardenDispatch: DispatchFn;
+  /** Pure-TDD dispatch used in pass 2 (leaf-up build). Writes body +
+   *  unit tests, iterates until green. Architect is NOT involved at
+   *  the per-function level — callers must configure the dispatcher
+   *  with `maxReviewCycles: 0` and no `decompose`. */
+  leafDispatch: DispatchFn;
   /** Fix dispatch called by the integration loop. Typically the same
-   *  as hardenDispatch with a feedback channel. */
+   *  as leafDispatch with failure feedback plumbed through. */
   fixDispatch: FixDispatch;
   integrationRunner: IntegrationRunner;
   finalize: FinalizeFn;
@@ -155,7 +157,7 @@ export async function designPlanIntegration(
   debug("plan-integration", "phase 4: leaf-up build");
   const buildReport = await designLeafUpBuild(graph, {
     dispatch: async (g, mod, name, opts) =>
-      options.hardenDispatch(g, mod, name, opts),
+      options.leafDispatch(g, mod, name, opts),
   });
   if (!buildReport.ok && buildReport.error) {
     // Hard structural error (e.g., cycle caught by computeDependencyLevels).

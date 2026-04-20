@@ -67,7 +67,7 @@ describe("designPlanIntegration — happy path", () => {
       return specResp;
     };
 
-    const hardenDispatch = async (_g: any, mod: string, name: string) => {
+    const leafDispatch = async (_g: any, mod: string, name: string) => {
       events.push(`harden:${name}`);
       _g.setImplementation(mod, name, "// hardened");
       _g.setTestStatus(mod, name, "tests-green", "");
@@ -98,7 +98,7 @@ describe("designPlanIntegration — happy path", () => {
 
     const report = await designPlanIntegration(g, "build a guestbook", {
       chat,
-      hardenDispatch,
+      leafDispatch,
       fixDispatch,
       integrationRunner,
       finalize: okFinalize(),
@@ -147,7 +147,7 @@ describe("designPlanIntegration — bottom-up gating", () => {
     g.setSpec("src/a.ts", "parent", specWithDeps(["child"]));
 
     const hardenCalls: string[] = [];
-    const hardenDispatch = async (_g: any, mod: string, name: string) => {
+    const leafDispatch = async (_g: any, mod: string, name: string) => {
       hardenCalls.push(name);
       return {
         module: mod,
@@ -170,8 +170,8 @@ describe("designPlanIntegration — bottom-up gating", () => {
     };
     await designPlanIntegration(g, "task", {
       chat,
-      hardenDispatch,
-      fixDispatch: hardenDispatch,
+      leafDispatch,
+      fixDispatch: leafDispatch,
       integrationRunner: async () => ({ ok: true, failures: [] }),
       finalize: okFinalize(),
       useProjectDir: false,
@@ -223,7 +223,7 @@ describe("designPlanIntegration — integration loop fires on red", () => {
     };
     const report = await designPlanIntegration(g, "task", {
       chat,
-      hardenDispatch: okDispatch,
+      leafDispatch: okDispatch,
       fixDispatch,
       integrationRunner: async () => {
         runCount++;
@@ -281,7 +281,7 @@ describe("designPlanIntegration — surfaces integration loop failure", () => {
     };
     const report = await designPlanIntegration(g, "task", {
       chat,
-      hardenDispatch: okDispatch,
+      leafDispatch: okDispatch,
       fixDispatch: async (_g, mod, name) => ({
         module: mod,
         name,
