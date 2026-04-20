@@ -186,6 +186,99 @@ describe("designLeafUpBuild", () => {
     expect(report.error).toMatch(/cycle/i);
   });
 
+  it("stagnated dispatch triggers decompose; parent re-dispatches after children green", async () => {
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "complex", sig());
+    g.setSpec("src/a.ts", "complex", spec());
+    const order: string[] = [];
+    const decomposeOrder: string[] = [];
+    // Dispatch returns "stagnated" for complex on FIRST call.
+    // After decompose adds 2 children, next complex dispatch goes green.
+    let complexCalls = 0;
+    const dispatch = async (_g: any, mod: string, name: string) => {
+      order.push(name);
+      if (name === "complex") {
+        complexCalls++;
+        if (complexCalls === 1) {
+          return {
+            module: mod,
+            name,
+            status: "stagnated" as const,
+            implementation: "// bad",
+            attempts: 4,
+            testOutput: "",
+            error: "stagnation: identical failing-test set across attempts",
+          };
+        }
+      }
+      _g.setImplementation(mod, name, "// ok");
+      return {
+        module: mod,
+        name,
+        status: "tests-green" as const,
+        implementation: "// ok",
+        attempts: 1,
+        testOutput: "",
+      };
+    };
+    const decompose = async (gg: any, fnName: string) => {
+      decomposeOrder.push(fnName);
+      // Add 2 children to the function.
+      gg.addFunctionChild(fnName, "src/a.ts", "c1", sig());
+      gg.setSpec("src/a.ts", "c1", spec());
+      gg.addFunctionChild(fnName, "src/a.ts", "c2", sig());
+      gg.setSpec("src/a.ts", "c2", spec());
+      return true;
+    };
+    const report = await designLeafUpBuild(g, { dispatch, decompose });
+    expect(report.ok).toBe(true);
+    expect(report.decomposed).toEqual(["complex"]);
+    // Expected order: complex (stagnated) → c1 + c2 (children green) →
+    // complex (re-dispatched, now green).
+    expect(order[0]).toBe("complex");
+    expect(order).toContain("c1");
+    expect(order).toContain("c2");
+    expect(order[order.length - 1]).toBe("complex"); // re-dispatched last
+    expect(report.blocked).toEqual([]);
+  });
+
+  it("stagnation with no decompose callback blocks the function", async () => {
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "stuck", sig());
+    g.setSpec("src/a.ts", "stuck", spec());
+    const dispatch = async (_g: any, mod: string, name: string) => ({
+      module: mod,
+      name,
+      status: "stagnated" as const,
+      implementation: "// red",
+      attempts: 4,
+      testOutput: "",
+      error: "stagnation",
+    });
+    const report = await designLeafUpBuild(g, { dispatch });
+    expect(report.ok).toBe(false);
+    expect(report.blocked).toContain("stuck");
+    expect(report.decomposed).toEqual([]);
+  });
+
+  it("failed decompose blocks the function (no infinite retry)", async () => {
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "unfixable", sig());
+    g.setSpec("src/a.ts", "unfixable", spec());
+    const dispatch = async (_g: any, mod: string, name: string) => ({
+      module: mod,
+      name,
+      status: "stagnated" as const,
+      implementation: "// red",
+      attempts: 4,
+      testOutput: "",
+    });
+    const decompose = async () => false; // refuses to split
+    const report = await designLeafUpBuild(g, { dispatch, decompose });
+    expect(report.ok).toBe(false);
+    expect(report.blocked).toContain("unfixable");
+  });
+
   it("reports specless functions as blocked without dispatch (structure check)", async () => {
     const g = createDesignGraph();
     g.addFunction("src/a.ts", "noSpec", sig()); // no setSpec call

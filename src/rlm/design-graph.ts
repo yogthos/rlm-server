@@ -210,6 +210,12 @@ export interface DesignGraph {
   /** Attach the Architect's spec (contract) to a function. */
   setSpec(module: string, name: string, spec: FunctionSpec): void;
   setImplementation(module: string, name: string, source: string): void;
+  /** Wipe the stored body + test status, resetting the function to
+   *  "declared" (planned but not yet implemented). Used by the
+   *  split-on-stagnation recovery path: before we re-plan a function
+   *  into sub-children, we erase the Implementer's failed work so
+   *  downstream materialization doesn't embed the broken body. */
+  clearImplementation(module: string, name: string): void;
   setTestStatus(
     module: string,
     name: string,
@@ -785,6 +791,15 @@ export function createDesignGraph(): DesignGraph {
       const fn = requireFunction(module, name);
       fn.implementation = source;
       fn.status = "implemented";
+      fn.lastTestOutput = null;
+    },
+
+    clearImplementation(module, name) {
+      const fn = requireFunction(module, name);
+      fn.implementation = null;
+      fn.tests = [];
+      fn.integrationTests = [];
+      fn.status = "declared";
       fn.lastTestOutput = null;
     },
 

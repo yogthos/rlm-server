@@ -115,7 +115,12 @@ function collectBodyViolations(
 export interface DispatchResult {
   module: string;
   name: string;
-  status: FunctionStatus | "failed";
+  /** "stagnated" = the semantic failing-test SET repeated across
+   *  attempts, so the Implementer is not making progress. Signals the
+   *  orchestrator to decompose (if it has that capability) rather than
+   *  spending more attempts. Distinct from "failed" which covers other
+   *  error paths (exhaustion without stagnation, chat errors, etc.). */
+  status: FunctionStatus | "failed" | "stagnated";
   implementation: string | null;
   attempts: number;
   /** Last test output — present whether we finished green or red. */
@@ -1176,13 +1181,19 @@ export function createDesignDispatchBridge(
         lastFailedCount = tr.failed;
         lastPassedCount = tr.passed;
 
-        // Bail on repeated identical failure signatures. We hash
-        // failed/passed counts AND the first 300 chars of output so a
-        // cosmetic rewording doesn't count as the same run, but a
-        // genuine no-op iteration does. Only counts test-red runs —
-        // a green run (even with architect REVISE) is progress.
+        // Bail on repeated identical failure SETS. The signature is the
+        // sorted list of failing test names — semantic identity, not
+        // output-text identity. Oscillation ("fix one, break another")
+        // shows up as a CHANGING set even if counts stay the same;
+        // true stagnation ("same tests keep failing") shows up as an
+        // UNCHANGED set. Falls back to count-based signature when
+        // runner doesn't supply names (test fixtures).
         if (!tr.ok && tr.failed > 0) {
-          const sig = `${tr.failed}/${tr.passed}|${(tr.output ?? "").slice(0, 300)}`;
+          const names = tr.failingTestNames;
+          const sig =
+            names && names.length > 0
+              ? `names:${names.join("||")}`
+              : `counts:${tr.failed}/${tr.passed}|${(tr.output ?? "").slice(0, 300)}`;
           if (sig === lastFailureSignature) {
             identicalFailureStreak++;
           } else {
@@ -1200,7 +1211,9 @@ export function createDesignDispatchBridge(
             );
             // Preserve best-attempt body if we ever saw green; otherwise
             // save the current (failing) body so something lands in the
-            // graph for downstream passes.
+            // graph. Status is "stagnated" (not "failed") so the
+            // orchestrator can recognize the recoverable case and
+            // trigger decomposition rather than just marking blocked.
             if (lastGreenBody) {
               graph.setImplementation(module, name, lastGreenBody.body);
               graph.setTestStatus(
@@ -1212,11 +1225,11 @@ export function createDesignDispatchBridge(
               return {
                 module,
                 name,
-                status: "failed",
+                status: "stagnated",
                 implementation: lastGreenBody.body,
-                attempts: attempt + 1,
+                attempts: actualAttempts,
                 testOutput: lastGreenBody.output,
-                error: "stagnation: identical failures across attempts",
+                error: "stagnation: identical failing-test set across attempts",
               };
             }
             graph.setImplementation(module, name, body);
@@ -1224,11 +1237,11 @@ export function createDesignDispatchBridge(
             return {
               module,
               name,
-              status: "failed",
+              status: "stagnated",
               implementation: body,
-              attempts: attempt + 1,
+              attempts: actualAttempts,
               testOutput: tr.output,
-              error: "stagnation: identical failures across attempts",
+              error: "stagnation: identical failing-test set across attempts",
             };
           }
         } else {

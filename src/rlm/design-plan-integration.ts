@@ -66,6 +66,15 @@ export interface IntegrationPlanOptions {
    *  the per-function level — callers must configure the dispatcher
    *  with `maxReviewCycles: 0` and no `decompose`. */
   leafDispatch: DispatchFn;
+  /** Split-on-stagnation recovery. When a leaf-up dispatch returns
+   *  status="stagnated" (Implementer couldn't converge), leaf-up
+   *  clears the function's failed work and calls this to re-plan it
+   *  into smaller children. Returns true on success. Typically wired
+   *  to designPlan(graph, ..., { parent: fnName }). */
+  decompose?: (
+    graph: DesignGraph,
+    fnName: string,
+  ) => Promise<boolean>;
   /** Fix dispatch called by the integration loop. Typically the same
    *  as leafDispatch with failure feedback plumbed through. */
   fixDispatch: FixDispatch;
@@ -158,6 +167,7 @@ export async function designPlanIntegration(
   const buildReport = await designLeafUpBuild(graph, {
     dispatch: async (g, mod, name, opts) =>
       options.leafDispatch(g, mod, name, opts),
+    decompose: options.decompose,
   });
   if (!buildReport.ok && buildReport.error) {
     // Hard structural error (e.g., cycle caught by computeDependencyLevels).

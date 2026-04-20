@@ -549,15 +549,15 @@ async function initHandler(ctx: RLMContext): Promise<RLMContext> {
       },
       __designPlanBridge: (task: string) => {
         debug("bridge", `design_plan invoked task=${task.slice(0, 60)}...`);
-        const { finalize } = buildBridgeHelpers(ctx);
+        const { decompose, finalize } = buildBridgeHelpers(ctx);
         const chat = buildChat(ctx);
         // Pass 2 (leaf-up) and Pass 3 (integration fix) are pure-TDD:
-        // the Implementer writes body + tests, runs them, iterates.
-        // Architect is NOT involved at the per-function level:
-        //   - `maxReviewCycles: 0` disables post-test architect review.
-        //   - No `decompose` wired — pass 1 already chose the structure;
-        //     pass 2 must not second-guess it via askDecompose. Every
-        //     function goes straight to IMPLEMENT.
+        // Implementer writes body + tests, runs them, iterates.
+        // Architect is NOT involved per-function for CODE review, but
+        // is allowed for STRUCTURAL recovery — when the Implementer
+        // stagnates (can't converge), leaf-up calls the architect via
+        // `decompose` to split the function into smaller children,
+        // then retries once the children land green.
         const leafDispatch = (
           g: RLMContext["designGraph"],
           module: string,
@@ -574,6 +574,7 @@ async function initHandler(ctx: RLMContext): Promise<RLMContext> {
           chat,
           leafDispatch,
           fixDispatch: leafDispatch,
+          decompose,
           integrationRunner: createIntegrationRunner(),
           finalize,
         });

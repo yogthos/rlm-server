@@ -2040,8 +2040,8 @@ describe("createDesignDispatchBridge", () => {
     // The dispatcher used to spin through all maxAttempts even when the
     // test output plateaued at an unchanging failure. After Round 13,
     // a streak of identical failure signatures halts the loop and
-    // returns status=failed with error="stagnation: ..." so the
-    // orchestrator can move on to the next function.
+    // returns status=stagnated with error="stagnation: ..." so the
+    // orchestrator can decompose the function rather than spin.
     const g = createDesignGraph();
     g.addFunction("src/a.ts", "foo", { params: [], returnType: "number" });
     let attempts = 0;
@@ -2066,7 +2066,7 @@ describe("createDesignDispatchBridge", () => {
       },
     );
     const result = await b.dispatch("src/a.ts", "foo");
-    expect(result.status).toBe("failed");
+    expect(result.status).toBe("stagnated");
     expect(result.error).toMatch(/stagnation/i);
     // 2-streak threshold → bail fires on the 2nd red run. Some additional
     // attempts happen before tests are parsed (pre-test path etc.), so we
@@ -2197,7 +2197,8 @@ describe("createDesignDispatchBridge", () => {
     const result = await b.dispatch("src/a.ts", "foo", {
       externalFeedback: "integration test red",
     });
-    expect(result.status).toBe("failed");
+    // "stagnated" is a non-green terminal status.
+    expect(result.status).toMatch(/stagnated|failed/);
     // The pre-existing body is preserved — exhaustion kept it.
     expect(g.getFunction("src/a.ts", "foo")!.implementation).toBe("return 1;");
   });

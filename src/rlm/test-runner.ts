@@ -28,6 +28,12 @@ export interface TestRunResult {
   passed: number;
   failed: number;
   output: string;
+  /** Stable, sorted list of fully-qualified failing test names. Used by
+   *  the dispatcher to detect semantic stagnation — when the SAME set
+   *  of tests fails across attempts, the Implementer isn't converging
+   *  even if the error text wording differs. Optional for back-compat
+   *  with older mocks; absent means "unknown." */
+  failingTestNames?: string[];
 }
 
 export function materializeWithOverride(
@@ -281,6 +287,7 @@ function invokeTestRunner(
         passed: parsed?.passed ?? 0,
         failed: parsed?.failed ?? 0,
         output: output.slice(-4000),
+        failingTestNames: parsed?.failingTestNames ?? [],
       });
     });
   });
@@ -371,6 +378,8 @@ export interface VitestCounts {
   failed: number;
   /** First-line assertion errors per failing test, joined for prompt feedback. */
   failureDigest: string;
+  /** Fully-qualified names of failing tests (sorted, deduped). */
+  failingTestNames: string[];
 }
 
 function parseVitestJson(stdout: string): VitestCounts | null {
@@ -381,6 +390,7 @@ function parseVitestJson(stdout: string): VitestCounts | null {
     let passed = 0;
     let failed = 0;
     const failures: string[] = [];
+    const failingNames = new Set<string>();
     const results = Array.isArray(json.testResults) ? json.testResults : [];
     for (const file of results) {
       for (const t of file.assertionResults ?? []) {
@@ -389,6 +399,7 @@ function parseVitestJson(stdout: string): VitestCounts | null {
           failed++;
           const title =
             t.fullName ?? t.title ?? t.ancestorTitles?.join(" > ") ?? "(test)";
+          failingNames.add(String(title));
           const msgs = Array.isArray(t.failureMessages) ? t.failureMessages : [];
           const firstLine = (msgs[0] ?? "").split("\n")[0].slice(0, 240);
           failures.push(`✗ ${title}: ${firstLine || "(no failure message)"}`);
@@ -401,6 +412,7 @@ function parseVitestJson(stdout: string): VitestCounts | null {
       passed,
       failed,
       failureDigest: failures.slice(0, 20).join("\n"),
+      failingTestNames: [...failingNames].sort(),
     };
   } catch {
     return null;
