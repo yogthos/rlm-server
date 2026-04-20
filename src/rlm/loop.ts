@@ -31,6 +31,7 @@ import { renderFileSet } from "./final-files.js";
 import { designBuild } from "./design-build.js";
 import { designLoad } from "./design-load.js";
 import { designPlan } from "./design-plan.js";
+import { designPlanThreePass } from "./design-plan-three-pass.js";
 
 import type { RLMContext, RLMResult, LLMClient, ChatMessage } from "./types.js";
 import { createHandleStore } from "./handles.js";
@@ -547,9 +548,38 @@ async function initHandler(ctx: RLMContext): Promise<RLMContext> {
       },
       __designPlanBridge: (task: string) => {
         debug("bridge", `design_plan invoked task=${task.slice(0, 60)}...`);
-        const { dispatch, finalize } = buildBridgeHelpers(ctx);
+        const { decompose, finalize } = buildBridgeHelpers(ctx);
         const chat = buildChat(ctx);
-        return designPlan(ctx.designGraph, task, { chat, dispatch, finalize });
+        const sketchDispatch = (
+          g: RLMContext["designGraph"],
+          module: string,
+          name: string,
+          opts?: { projectDir?: string; feedback?: string },
+        ) =>
+          createDesignDispatchBridge(g, chat, {
+            projectDir: opts?.projectDir,
+            decompose,
+            maxReviewCycles: ctx.maxReviewCycles,
+            mode: "sketch",
+          }).dispatch(module, name);
+        const hardenDispatch = (
+          g: RLMContext["designGraph"],
+          module: string,
+          name: string,
+          opts?: { projectDir?: string; feedback?: string },
+        ) =>
+          createDesignDispatchBridge(g, chat, {
+            projectDir: opts?.projectDir,
+            decompose,
+            maxReviewCycles: ctx.maxReviewCycles,
+            mode: "harden",
+          }).dispatch(module, name);
+        return designPlanThreePass(ctx.designGraph, task, {
+          chat,
+          sketchDispatch,
+          hardenDispatch,
+          finalize,
+        });
       },
       __designBuildBridge: () => {
         debug("bridge", `design_build invoked`);
