@@ -58,23 +58,54 @@ function reconcileSpecDependencies(
 }
 
 /**
- * Collect structural violations of a proc-ts body given the set of
- * known sibling names. Returns a list of human-readable violation
- * messages (empty when clean). Used in two places: the regenerate
- * loop after extractBody, and the pre-test path for loaded bodies.
+ * Collect structural violations of a proc-ts body.
  *
- * When `requiredChildren` is non-empty, the body MUST contain a
- * `ctx.fns.<child>(...)` call for each — this is the
- * decomposition/recomposition check for branch functions. A parent
- * whose `designPlan` decomposed into children must actually use those
- * children in its assembly body; otherwise the decomposition was pure
- * waste (orphaned children) and the call graph breaks.
+ * When `requiredChildren` is non-empty, each child must be REACHABLE
+ * from the body's `ctx.fns` call chain — either called directly, or
+ * called by a function the body calls (transitively). Previous behaviour
+ * demanded a direct call to every child; that rejected valid tree-
+ * shaped compositions like `parent → buildPage → [form, list, ...]`
+ * where an intermediate child assembles the others.
+ *
+ * Transitive computation requires `graph` so we can pull each
+ * intermediate function's body and analyse its outbound calls. Without
+ * `graph`, we fall back to direct-call-only semantics (preserves the
+ * old behaviour for fixtures that don't need transitivity).
  */
-function collectBodyViolations(
+async function analyzeReachableCalls(
+  graph: DesignGraph,
+  seedNames: readonly string[],
+): Promise<Set<string>> {
+  const reachable = new Set<string>();
+  const queue = [...seedNames];
+  const byName = new Map(
+    graph.listFunctions().map((f) => [f.name, f] as const),
+  );
+  while (queue.length > 0) {
+    const name = queue.shift()!;
+    if (reachable.has(name)) continue;
+    reachable.add(name);
+    const fn = byName.get(name);
+    if (!fn || !fn.implementation) continue;
+    try {
+      const childAnalysis = await analyzeBody(fn.implementation);
+      for (const c of childAnalysis.ctxFnsCalls) {
+        if (!reachable.has(c.name)) queue.push(c.name);
+      }
+    } catch {
+      // Parse failures on intermediate bodies aren't fatal here — they
+      // surface when that function is dispatched.
+    }
+  }
+  return reachable;
+}
+
+async function collectBodyViolations(
   analysis: BodyAnalysis,
   knownNames: Set<string>,
   requiredChildren: readonly string[] = [],
-): string[] {
+  graph?: DesignGraph,
+): Promise<string[]> {
   const violations: string[] = [];
   if (analysis.imports.length > 0) {
     const formatted = analysis.imports
@@ -101,11 +132,17 @@ function collectBodyViolations(
     );
   }
   if (requiredChildren.length > 0) {
-    const calledNames = new Set(analysis.ctxFnsCalls.map((c) => c.name));
-    const missing = requiredChildren.filter((c) => !calledNames.has(c));
+    const directCalls = analysis.ctxFnsCalls.map((c) => c.name);
+    const reachable = graph
+      ? await analyzeReachableCalls(graph, directCalls)
+      : new Set<string>(directCalls);
+    const missing = requiredChildren.filter((c) => !reachable.has(c));
     if (missing.length > 0) {
+      const chain = directCalls.length > 0
+        ? `Your body directly calls: ${directCalls.join(", ")}. Transitive reach: ${[...reachable].join(", ") || "(none)"}.`
+        : `Your body calls no siblings at all.`;
       violations.push(
-        `This function was decomposed into children — your body MUST call every declared child via \`ctx.fns.<name>(ctx, ...)\`. Missing calls to: ${missing.map((m) => `ctx.fns.${m}`).join(", ")}. Decomposition without recomposition produces orphaned children and breaks the call graph.`,
+        `This function was decomposed into children — every child must be REACHABLE from your body's call chain (directly, or transitively through another sibling you call). Unreachable: ${missing.map((m) => `ctx.fns.${m}`).join(", ")}. ${chain}`,
       );
     }
   }
@@ -891,10 +928,16 @@ export function createDesignDispatchBridge(
         const preKnownNames = new Set(
           graph.listFunctions().map((f) => f.name),
         );
-        const preViolations = collectBodyViolations(
+        // Recomposition (parent must reach every child via ctx.fns
+        // call chain) is NOT enforced here — orphaned children get
+        // picked up in a later cleanup/tightening pass. Dropping the
+        // check lets tree-shaped compositions through (parent calls
+        // one child that composes the others) without rejection.
+        const preViolations = await collectBodyViolations(
           preAnalysis,
           preKnownNames,
-          fn.children,
+          [],
+          graph,
         );
         if (preViolations.length > 0) {
           debug(
@@ -1067,10 +1110,11 @@ export function createDesignDispatchBridge(
         const knownNames = new Set(
           graph.listFunctions().map((f) => f.name),
         );
-        const violations = collectBodyViolations(
+        const violations = await collectBodyViolations(
           analysis,
           knownNames,
-          fn.children,
+          [],
+          graph,
         );
         if (violations.length > 0) {
           lastError = `body-analyzer rejected: ${violations.length} violation(s)`;

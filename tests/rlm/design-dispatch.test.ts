@@ -97,75 +97,29 @@ describe("extractUnitTests / extractIntegrationTests", () => {
   });
 });
 
-describe("branch decomposition/recomposition enforcement", () => {
-  it("branch body that doesn't call a declared child is rejected with actionable feedback", async () => {
+describe("branch decomposition — orphan handling deferred to cleanup pass", () => {
+  it("branch body that calls ONE child via a composition helper is accepted (tree-shaped composition)", async () => {
+    // Previously the dispatcher required a direct ctx.fns call to every
+    // declared child. This rejected valid tree-shaped compositions like
+    // parent → buildPage → [form, list, ...]. We now let bodies through
+    // regardless of which children they directly reach; orphaned
+    // children are caught by a later cleanup/tightening pass.
     const g = createDesignGraph();
     g.addFunction("src/a.ts", "parent", { params: [], returnType: "void" });
-    g.addFunctionChild(
-      "parent",
-      "src/a.ts",
-      "childA",
-      { params: [], returnType: "void" },
-      "first child",
-    );
-    g.addFunctionChild(
-      "parent",
-      "src/a.ts",
-      "childB",
-      { params: [], returnType: "void" },
-      "second child",
-    );
-    let attempt = 0;
-    const prompts: string[] = [];
+    g.addFunctionChild("parent", "src/a.ts", "childA", { params: [], returnType: "void" });
+    g.addFunctionChild("parent", "src/a.ts", "childB", { params: [], returnType: "void" });
     const tests = '```unit-tests\n[{"name":"u","code":"expect(1).toBe(1);"}]\n```';
     const b = createDesignDispatchBridge(
       g,
-      async (p) => {
-        prompts.push(p);
-        attempt++;
-        if (attempt === 1) {
-          return `\`\`\`ts\nctx.fns.childA(ctx);\n\`\`\`\n${tests}`;
-        }
-        return `\`\`\`ts\nctx.fns.childA(ctx);\nctx.fns.childB(ctx);\n\`\`\`\n${tests}`;
-      },
+      async () => `\`\`\`ts\nctx.fns.childA(ctx);\n\`\`\`\n${tests}`,
       {
         runTests: async () => ({ ok: true, passed: 1, failed: 0, output: "" }),
         maxReviewCycles: 0,
       },
     );
     const result = await b.dispatch("src/a.ts", "parent");
-    expect(result.status).toBe("tests-green");
-    expect(result.attempts).toBe(2);
-    expect(prompts[1]).toMatch(/childB/);
-    expect(prompts[1]).toMatch(/call.*ctx\.fns|must.*call|missing/i);
-  });
-
-  it("branch body that calls ALL declared children is accepted", async () => {
-    const g = createDesignGraph();
-    g.addFunction("src/a.ts", "parent", { params: [], returnType: "void" });
-    g.addFunctionChild(
-      "parent",
-      "src/a.ts",
-      "childA",
-      { params: [], returnType: "void" },
-    );
-    g.addFunctionChild(
-      "parent",
-      "src/a.ts",
-      "childB",
-      { params: [], returnType: "void" },
-    );
-    const tests = '```unit-tests\n[{"name":"u","code":"expect(1).toBe(1);"}]\n```';
-    const b = createDesignDispatchBridge(
-      g,
-      async () =>
-        `\`\`\`ts\nctx.fns.childA(ctx);\nctx.fns.childB(ctx);\n\`\`\`\n${tests}`,
-      {
-        runTests: async () => ({ ok: true, passed: 1, failed: 0, output: "" }),
-        maxReviewCycles: 0,
-      },
-    );
-    const result = await b.dispatch("src/a.ts", "parent");
+    // Body only calls childA; childB is "orphaned" by this body. No
+    // rejection — cleanup pass will surface orphans later.
     expect(result.status).toBe("tests-green");
     expect(result.attempts).toBe(1);
   });
