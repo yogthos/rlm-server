@@ -1100,7 +1100,19 @@ export function createDesignDispatchBridge(
           debug("dispatch", `no fenced body extracted ${key}; retrying`);
           continue;
         }
-        debug("dispatch", `body extracted ${key} len=${body.length}ch`);
+        // Short hash so consecutive logs reveal whether the Implementer
+        // is actually changing the body or just resubmitting (a lazy
+        // "fix" is one of the failure modes that masquerades as
+        // real iteration).
+        const bodyTag = (() => {
+          let h = 0;
+          for (let i = 0; i < body.length; i++) h = ((h << 5) - h + body.charCodeAt(i)) | 0;
+          return (h >>> 0).toString(16).slice(0, 8);
+        })();
+        debug(
+          "dispatch",
+          `body extracted ${key} len=${body.length}ch hash=${bodyTag}`,
+        );
 
         // Static analysis: run tree-sitter over the body BEFORE the
         // test run. Catches proc-ts violations (top-level imports, calls
@@ -1304,6 +1316,25 @@ export function createDesignDispatchBridge(
           "dispatch",
           `test ${key} ok=${tr.ok} passed=${tr.passed} failed=${tr.failed}`,
         );
+        // Diagnostic: on red, dump the failing test names AND the first
+        // line of the output (contains the failure digest) so we can
+        // reconstruct what the Implementer was working against without
+        // reading the prompt verbatim. Enables post-mortem diagnosis
+        // of stagnation cases.
+        if (!tr.ok && tr.failed > 0) {
+          const names =
+            tr.failingTestNames && tr.failingTestNames.length > 0
+              ? tr.failingTestNames.join("; ")
+              : "(no names captured)";
+          const digestLine =
+            (tr.output ?? "")
+              .split("\n")
+              .find((l) => l.startsWith("✗"))?.slice(0, 240) ?? "";
+          debug(
+            "dispatch",
+            `test ${key} FAILING: ${names}${digestLine ? ` | first: ${digestLine}` : ""}`,
+          );
+        }
 
         if (tr.ok) {
           // Remember this green body BEFORE review — on exhaustion
