@@ -203,6 +203,10 @@ export async function runDispatchAgent(
   const key = `${module}#${name}`;
   let turn = 0;
   let phase: "dispatch" | "review" = "dispatch";
+  debug(
+    "dispatch-agent",
+    `${key} session START budget=${budget}${options.externalFeedback ? " (with externalFeedback)" : ""}`,
+  );
   const history: Array<{ toolCall: ToolCall; result: string }> = [];
   const session: AgentSession = createAgentSession(graph, module, name, {
     task: options.task,
@@ -346,11 +350,23 @@ export async function runDispatchAgent(
     }
     const result = await runTool(session, call.name, call.args);
     history.push({ toolCall: call, result });
+    // Per-turn debug: which tool the agent called and a short preview
+    // of what came back. Essential for diagnosing "why didn't this
+    // function converge" — without it, 15 turns of chat calls are
+    // opaque.
+    debug(
+      "dispatch-agent",
+      `${key} turn ${turn}/${budget} phase=${phase} tool=${call.name} result_head=${result.slice(0, 120).replace(/\n/g, " ")}`,
+    );
     // If run_tests flipped us green, advance to review — the next
     // turn's prompt will be the review prompt, and the model's only
     // legal moves will be approve / revise / give_up.
     if (session.lastTestsGreen) {
       phase = "review";
+      debug(
+        "dispatch-agent",
+        `${key} → REVIEW phase at turn ${turn}`,
+      );
     }
   }
   debug(
