@@ -57,20 +57,18 @@ describe("renderAgentPrompt", () => {
     expect(p).toMatch(/Available tools/i);
     expect(p).toContain("get_spec");
     expect(p).toContain("run_tests");
-    expect(p).toContain("done");
     expect(p).toContain("give_up");
   });
 
-  it("includes the STOPPING RULE — call done immediately on green", () => {
-    // Fix for the go-green-then-regress failure mode observed in
-    // early scenarios. The prompt must make "done() on next turn
-    // after ok:true" a hard rule, not a suggestion.
+  it("dispatch prompt explains the auto-transition to review on green", () => {
+    // After the state-machine refactor: model doesn't call done; the
+    // harness flips to review on run_tests ok:true. The prompt must
+    // say so, otherwise the model will hunt for a 'done' tool.
     const g = seed();
     const s = createAgentSession(g, "src/a.ts", "add");
     const p = renderAgentPrompt(s, []);
-    expect(p).toMatch(/STOPPING RULE/);
-    expect(p).toMatch(/done/i);
-    expect(p).toMatch(/regress/i);
+    expect(p).toMatch(/REVIEW/);
+    expect(p).toMatch(/auto|automatic/i);
   });
 
   it("surfaces externalFeedback (upstream failure context) when present", () => {
@@ -115,7 +113,7 @@ describe("renderAgentPrompt", () => {
 });
 
 describe("runDispatchAgent — full TDD flow (stubbed runner)", () => {
-  it("runs an end-to-end TDD sequence and returns green", async () => {
+  it("runs an end-to-end TDD sequence with auto-review + approve", async () => {
     const g = seed();
     let turn = 0;
     const chat = async () => {
@@ -144,7 +142,9 @@ describe("runDispatchAgent — full TDD flow (stubbed runner)", () => {
         case 5:
           return '```tool-call\n{"name": "run_tests"}\n```';
         case 6:
-          return '```tool-call\n{"name": "done"}\n```';
+          // Auto-transitioned to review after green at turn 5.
+          // Model sees review prompt and approves.
+          return '```tool-call\n{"name": "approve"}\n```';
         default:
           return '```tool-call\n{"name": "give_up", "args": {"reason": "unexpected turn"}}\n```';
       }
@@ -210,14 +210,14 @@ describe("runDispatchAgent — full TDD flow (stubbed runner)", () => {
     const chat = async () => {
       turn++;
       if (turn === 1) return "```tool-call\n{this is not json\n```";
-      return '```tool-call\n{"name": "done"}\n```';
+      return '```tool-call\n{"name": "give_up", "args": {"reason": "oh well"}}\n```';
     };
     const result = await runDispatchAgent(g, "src/a.ts", "add", {
       chat,
       turnBudget: 5,
     });
-    // First turn's parse error didn't terminate; second turn's done did.
-    expect(result.status).toBe("tests-green");
+    // First turn's parse error didn't terminate; second turn's give_up did.
+    expect(result.status).toBe("stagnated");
     expect(result.attempts).toBe(2);
   });
 
@@ -249,14 +249,154 @@ describe("runDispatchAgent — full TDD flow (stubbed runner)", () => {
     const chat = async () => {
       turn++;
       if (turn === 1) return '```tool-call\n{"name": "frobnicate"}\n```';
-      return '```tool-call\n{"name": "done"}\n```';
+      return '```tool-call\n{"name": "give_up", "args": {"reason": "test"}}\n```';
     };
     const result = await runDispatchAgent(g, "src/a.ts", "add", {
       chat,
       turnBudget: 5,
     });
-    // Turn 1 = bad tool (harness tells model the valid set), turn 2 = done.
+    // Turn 1 = bad tool (harness tells model the valid set), turn 2 = give_up.
+    expect(result.status).toBe("stagnated");
+    expect(result.attempts).toBe(2);
+  });
+});
+
+describe("runDispatchAgent — REVIEW phase state machine", () => {
+  it("auto-transitions to review on green run_tests; approve ends as tests-green", async () => {
+    const g = seed();
+    let turn = 0;
+    const chat = async () => {
+      turn++;
+      if (turn === 1) return '```tool-call\n{"name": "run_tests"}\n```';
+      // After green, next prompt is the REVIEW prompt. Model approves.
+      return '```tool-call\n{"name": "approve"}\n```';
+    };
+    const result = await runDispatchAgent(g, "src/a.ts", "add", {
+      chat,
+      runTests: async () => ({
+        ok: true,
+        passed: 1,
+        failed: 0,
+        output: "tap",
+        failingTestNames: [],
+        fullFailureMessages: new Map(),
+      }),
+      turnBudget: 5,
+    });
     expect(result.status).toBe("tests-green");
     expect(result.attempts).toBe(2);
+  });
+
+  it("revise({reason}) from review returns to dispatch with reason in history", async () => {
+    const g = seed();
+    let turn = 0;
+    const calls: string[] = [];
+    const chat = async (prompt: string) => {
+      turn++;
+      calls.push(prompt);
+      if (turn === 1) return '```tool-call\n{"name": "run_tests"}\n```';
+      if (turn === 2) {
+        return '```tool-call\n{"name": "revise", "args": {"reason": "spec edge case X not tested"}}\n```';
+      }
+      // After revise, we're back in dispatch. Give up to end.
+      return '```tool-call\n{"name": "give_up", "args": {"reason": "ok"}}\n```';
+    };
+    let testCallCount = 0;
+    const result = await runDispatchAgent(g, "src/a.ts", "add", {
+      chat,
+      runTests: async () => {
+        testCallCount++;
+        return {
+          ok: true,
+          passed: 1,
+          failed: 0,
+          output: "tap",
+          failingTestNames: [],
+          fullFailureMessages: new Map(),
+        };
+      },
+      turnBudget: 6,
+    });
+    expect(result.status).toBe("stagnated");
+    // Turn 3 should have seen the dispatch prompt (back from review).
+    expect(calls[2]).not.toMatch(/REVIEW PHASE/);
+    expect(calls[2]).toMatch(/Goal: tests for this function must PASS/);
+  });
+
+  it("review rejects non-approve/revise tools with a nudge", async () => {
+    const g = seed();
+    let turn = 0;
+    const chat = async () => {
+      turn++;
+      if (turn === 1) return '```tool-call\n{"name": "run_tests"}\n```';
+      if (turn === 2) return '```tool-call\n{"name": "get_spec"}\n```';
+      return '```tool-call\n{"name": "approve"}\n```';
+    };
+    const result = await runDispatchAgent(g, "src/a.ts", "add", {
+      chat,
+      runTests: async () => ({
+        ok: true,
+        passed: 1,
+        failed: 0,
+        output: "tap",
+        failingTestNames: [],
+        fullFailureMessages: new Map(),
+      }),
+      turnBudget: 5,
+    });
+    // Turn 2 tried get_spec → rejected with a nudge; turn 3 approves.
+    expect(result.status).toBe("tests-green");
+    expect(result.attempts).toBe(3);
+  });
+
+  it("dispatch phase: `done` returns not-valid-here and keeps running", async () => {
+    const g = seed();
+    let turn = 0;
+    const chat = async () => {
+      turn++;
+      if (turn === 1) return '```tool-call\n{"name": "done"}\n```';
+      return '```tool-call\n{"name": "give_up", "args": {"reason": "ok"}}\n```';
+    };
+    const result = await runDispatchAgent(g, "src/a.ts", "add", {
+      chat,
+      turnBudget: 5,
+    });
+    // Turn 1 done → rejected. Turn 2 give_up → stagnated.
+    expect(result.status).toBe("stagnated");
+    expect(result.attempts).toBe(2);
+  });
+
+  it("restores green snapshot on approve (defends against mid-review state drift)", async () => {
+    const g = seed();
+    let turn = 0;
+    // After turn 1 (run_tests), the harness snapshots the body.
+    // We pretend the graph body matches the test stub shape already
+    // via the stub runTests below.
+    g.setImplementation(
+      "src/a.ts",
+      "add",
+      "export default function add(x: number, y: number): number { return x + y; }",
+    );
+    const chat = async () => {
+      turn++;
+      if (turn === 1) return '```tool-call\n{"name": "run_tests"}\n```';
+      return '```tool-call\n{"name": "approve"}\n```';
+    };
+    await runDispatchAgent(g, "src/a.ts", "add", {
+      chat,
+      runTests: async () => ({
+        ok: true,
+        passed: 1,
+        failed: 0,
+        output: "tap",
+        failingTestNames: [],
+        fullFailureMessages: new Map(),
+      }),
+      turnBudget: 5,
+    });
+    // Body still carries the implementation we wrote.
+    expect(g.getFunction("src/a.ts", "add")!.implementation).toContain(
+      "return x + y;",
+    );
   });
 });

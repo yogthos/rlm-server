@@ -86,6 +86,18 @@ export interface AgentSession {
   runTests?: AgentTestFn;
   runTypecheck?: AgentTypecheckFn;
   projectDir?: string;
+  /** Set to true by the `run_tests` tool when its latest invocation
+   *  returned ok:true with passing tests. The main loop reads this
+   *  after each tool call; if set, dispatch phase ends and the REVIEW
+   *  phase begins. Consumed (reset) by the loop so subsequent red
+   *  runs don't accidentally re-trigger review. */
+  lastTestsGreen: boolean;
+  /** Snapshot of the body + test file at the moment tests went green.
+   *  The review phase shows these to the model so it reviews the
+   *  actual green artifact, not a later edit. Also restored as the
+   *  shipped implementation on approve. */
+  greenBody: string | null;
+  greenTestFile: string | null;
 }
 
 export function createAgentSession(
@@ -109,6 +121,9 @@ export function createAgentSession(
     runTests: options.runTests,
     runTypecheck: options.runTypecheck,
     projectDir: options.projectDir,
+    lastTestsGreen: false,
+    greenBody: null,
+    greenTestFile: null,
   };
 }
 
@@ -163,10 +178,20 @@ function resolveTurnBudget(opt?: number): number {
 }
 
 /**
- * Run the interactive dispatch loop for one function. In P1 this is
- * a thin skeleton: it handles the control tools (`done`, `give_up`)
- * and the turn budget, but every other tool name just comes back as
- * a "not yet implemented" tool-result. P2 wires the real backends.
+ * Run the interactive dispatch loop for one function.
+ *
+ * Two-phase state machine:
+ *   DISPATCH — model inspects context, writes tests + body, runs tests.
+ *     Transitions to REVIEW automatically the moment `run_tests`
+ *     returns ok:true with passing assertions. The model does NOT
+ *     get a choice here — the harness locks in the green artifact.
+ *   REVIEW  — model sees the final body + tests + spec and picks:
+ *     approve() → exit tests-green (ship)
+ *     revise({reason}) → back to DISPATCH with reason as feedback
+ *     give_up({reason}) → exit stagnated
+ *
+ * Turn budget applies across both phases. Exhaustion in either phase
+ * exits as stagnated so the outer reflect/decompose path can take over.
  */
 export async function runDispatchAgent(
   graph: DesignGraph,
@@ -177,9 +202,7 @@ export async function runDispatchAgent(
   const budget = resolveTurnBudget(options.turnBudget);
   const key = `${module}#${name}`;
   let turn = 0;
-  // Conversation history is built fresh each turn from the accumulated
-  // tool-call + result records; see P3 for the real prompt assembler.
-  // For P1 we pass a stub prompt so the chat function can be exercised.
+  let phase: "dispatch" | "review" = "dispatch";
   const history: Array<{ toolCall: ToolCall; result: string }> = [];
   const session: AgentSession = createAgentSession(graph, module, name, {
     task: options.task,
@@ -188,9 +211,37 @@ export async function runDispatchAgent(
     runTypecheck: options.runTypecheck,
     projectDir: options.projectDir,
   });
+
+  const finalizeGreen = (reason?: string): DispatchResult => {
+    // On approve, restore the graph body/tests to the GREEN snapshot
+    // — just in case the review-phase transition somehow left a stale
+    // edit (shouldn't happen; defensive).
+    if (session.greenBody !== null) {
+      graph.setImplementation(module, name, session.greenBody);
+    }
+    if (session.greenTestFile !== null) {
+      graph.setUnitTestFile(module, name, session.greenTestFile);
+    }
+    debug(
+      "dispatch-agent",
+      `${key} approved at turn ${turn}${reason ? ` — ${reason}` : ""}`,
+    );
+    return {
+      module,
+      name,
+      status: "tests-green",
+      implementation: graph.getFunction(module, name)?.implementation ?? null,
+      attempts: turn,
+      testOutput: "",
+    };
+  };
+
   while (turn < budget) {
     turn++;
-    const prompt = renderAgentPrompt(session, history);
+    const prompt =
+      phase === "review"
+        ? renderReviewPrompt(session, history)
+        : renderAgentPrompt(session, history);
     let response: string;
     try {
       response = await options.chat(prompt);
@@ -211,9 +262,6 @@ export async function runDispatchAgent(
     }
     const call = parseToolCall(response);
     if (!call) {
-      // No tool call emitted this turn. Treat as a wasted turn and
-      // let the budget run down; don't terminate immediately — the
-      // model might correct course on the next turn.
       history.push({
         toolCall: { name: "__no_call__", args: {} },
         result:
@@ -228,17 +276,8 @@ export async function runDispatchAgent(
       });
       continue;
     }
-    if (call.name === "done") {
-      debug("dispatch-agent", `${key} done at turn ${turn}`);
-      return {
-        module,
-        name,
-        status: "tests-green",
-        implementation: graph.getFunction(module, name)?.implementation ?? null,
-        attempts: turn,
-        testOutput: "",
-      };
-    }
+
+    // ── Control tools common to both phases ──
     if (call.name === "give_up") {
       const reason =
         typeof call.args.reason === "string"
@@ -255,11 +294,64 @@ export async function runDispatchAgent(
         error: reason,
       };
     }
-    // Route through the P2 tool registry. Unknown tools come back with
-    // a clear error listing valid names, so the model can correct on
-    // the next turn instead of spinning.
+
+    // ── REVIEW phase ──
+    if (phase === "review") {
+      if (call.name === "approve" || call.name === "done") {
+        return finalizeGreen();
+      }
+      if (call.name === "revise") {
+        const reason =
+          typeof call.args.reason === "string" && call.args.reason.length > 0
+            ? call.args.reason
+            : "(no reason given)";
+        debug(
+          "dispatch-agent",
+          `${key} review → revise at turn ${turn}: ${reason.slice(0, 120)}`,
+        );
+        // Drop green state so the next dispatch run actually re-runs
+        // tests; otherwise the model could "revise" then immediately
+        // re-enter review without re-proving.
+        session.lastTestsGreen = false;
+        session.greenBody = null;
+        session.greenTestFile = null;
+        phase = "dispatch";
+        history.push({
+          toolCall: call,
+          result: `Back to dispatch phase. Address this concern before the next green: ${reason}`,
+        });
+        continue;
+      }
+      // Anything else in review: nudge the model to pick one of the
+      // three legal verbs. Don't run arbitrary tools here — the
+      // point of review is to gate edits.
+      history.push({
+        toolCall: call,
+        result:
+          "In REVIEW phase only `approve`, `revise({reason})`, or `give_up({reason})` are valid. All other tools are disabled until you choose one of these.",
+      });
+      continue;
+    }
+
+    // ── DISPATCH phase ──
+    // `done` is no longer a valid dispatch tool — tests must pass to
+    // exit. Tell the model so it doesn't waste turns.
+    if (call.name === "done" || call.name === "approve") {
+      history.push({
+        toolCall: call,
+        result:
+          "`done`/`approve` are only valid in REVIEW phase, which starts after run_tests returns ok:true. Run the tests first.",
+      });
+      continue;
+    }
     const result = await runTool(session, call.name, call.args);
     history.push({ toolCall: call, result });
+    // If run_tests flipped us green, advance to review — the next
+    // turn's prompt will be the review prompt, and the model's only
+    // legal moves will be approve / revise / give_up.
+    if (session.lastTestsGreen) {
+      phase = "review";
+    }
   }
   debug(
     "dispatch-agent",
@@ -471,16 +563,21 @@ async function toolRunTests(session: AgentSession): Promise<string> {
     `failed: ${result.failed}`,
   ];
   if (result.ok && result.passed > 0) {
-    // Tests are green. The correct next move is ALWAYS done() — not
-    // another edit, not another inspection. Additional tweaks after
-    // green risk regressing. Make this the loudest signal in the
-    // response so the model doesn't miss it.
+    // Tests are green. The main loop will read `session.lastTestsGreen`
+    // after this call returns and automatically transition to the
+    // REVIEW phase — the model does NOT get another dispatch turn to
+    // "polish" the body. Snapshot current body + test file so review
+    // sees the actual green artifact.
+    session.lastTestsGreen = true;
+    const fn = session.graph.getFunction(session.module, session.name);
+    session.greenBody = fn?.implementation ?? null;
+    session.greenTestFile = fn?.unitTestFile ?? null;
     lines.push(
       "",
-      "✓ TESTS GREEN — CALL done() NEXT. Do NOT make further edits.",
-      "The function has satisfied its contract. Any further change",
-      "risks regressing. If you think the body could be cleaner, that",
-      "is out of scope — `done` ends the session and locks your work.",
+      "✓ TESTS GREEN. The session will now enter REVIEW. You cannot",
+      "make further edits in dispatch phase; on your next turn you'll",
+      "see the final body + tests + spec and must call approve() or",
+      "revise({reason}).",
     );
   }
   if (result.loadFailure) {
@@ -564,6 +661,82 @@ export async function runTool(
  * model's attention goes to the latest tool result, not a wall of
  * advisory blocks.
  */
+/**
+ * Review-phase prompt. Fires after `run_tests` returns green. The
+ * model's ONLY available moves are `approve()`, `revise({reason})`,
+ * or `give_up({reason})` — no more edits, no more tool exploration.
+ * Keeps the model from the go-green-then-regress failure mode while
+ * still giving it a chance to catch tests-encode-wrong-contract bugs.
+ */
+export function renderReviewPrompt(
+  session: AgentSession,
+  history: Array<{ toolCall: ToolCall; result: string }>,
+): string {
+  const fn = session.graph.getFunction(session.module, session.name);
+  const sig = fn
+    ? renderSignature(fn.name, fn.signature)
+    : `${session.name} (signature unavailable)`;
+  const lines: string[] = [
+    "REVIEW PHASE — tests just went green.",
+    "",
+    `Target: ${session.module}#${session.name}`,
+    `Signature: ${sig}`,
+    "",
+    "Your unit tests pass against your body. Before the harness ships",
+    "this, one sanity check: do the tests+body TOGETHER satisfy the",
+    "SPEC? Common failure modes to catch:",
+    "  - tests pass because the TESTS encode the wrong contract (e.g.",
+    "    you invented an easier contract than the spec requires)",
+    "  - tests pass because they accidentally mock away the real",
+    "    behavior you needed to verify",
+    "  - spec edge cases not covered by any test",
+    "",
+    "SPEC:",
+    "```json",
+    fn?.spec ? JSON.stringify(fn.spec, null, 2) : "(no spec on graph)",
+    "```",
+    "",
+    "Final body:",
+    "```ts",
+    session.greenBody ?? "(no body on graph — bug?)",
+    "```",
+    "",
+    "Final test file:",
+    "```ts",
+    session.greenTestFile ?? "(no test file on graph)",
+    "```",
+    "",
+    "Emit ONE tool call:",
+    "",
+    "  approve()   — ship it; ends the session as tests-green.",
+    "  revise({reason: string})   — revise before shipping. You'll",
+    "      go back to dispatch phase with your reason as context.",
+    "      Use this if the SPEC has an edge case the tests miss, or",
+    "      the body is clearly wrong despite tests passing.",
+    "  give_up({reason: string})  — abandon. Use only if this",
+    "      function is genuinely unimplementable.",
+    "",
+    "Default to approve. Revise only when you spot a concrete",
+    "spec-vs-tests mismatch. Do NOT revise for cosmetic reasons",
+    "(renaming, comments, restructuring).",
+  ];
+  if (history.length > 0) {
+    const last = history[history.length - 1];
+    lines.push(
+      "",
+      "Last tool call:",
+      "```json",
+      JSON.stringify(last.toolCall, null, 2),
+      "```",
+      "Result:",
+      "```",
+      last.result.length > 1500 ? last.result.slice(0, 1500) + "\n…" : last.result,
+      "```",
+    );
+  }
+  return lines.join("\n");
+}
+
 export function renderAgentPrompt(
   session: AgentSession,
   history: Array<{ toolCall: ToolCall; result: string }>,
@@ -643,7 +816,6 @@ export function renderAgentPrompt(
     "    run_tests()  run the unit test file for this function",
     "",
     "  CONTROL",
-    "    done()                 tests are green — end the session",
     "    give_up({reason})      you can't solve this — end with a reason",
     "",
     "Recommended TDD flow:",
@@ -651,17 +823,12 @@ export function renderAgentPrompt(
     "  2. `write_test_file` with tests that encode the spec's edge cases.",
     "  3. `run_tests` — expect failures (body is stub/empty).",
     "  4. `write_body` (or `patch_body`) to make the tests pass.",
-    "  5. `run_tests` — **AS SOON AS ok:true, call `done` IMMEDIATELY**.",
+    "  5. `run_tests` — the harness AUTOMATICALLY transitions to REVIEW",
+    "     the instant ok:true. You do not call `done`; you cannot edit",
+    "     further in dispatch once green. In REVIEW you'll see the body",
+    "     + tests + spec and call `approve` or `revise`.",
     "  If a test file fails to COMPILE (TS error), `typecheck` will",
     "  surface the exact TSxxxx diagnostic.",
-    "",
-    "**STOPPING RULE — non-negotiable:** the session ends at `done`, NOT",
-    "when you think the code is polished. If `run_tests` returns",
-    "`ok: true`, your next tool call MUST be `done`. Do not clean up, do",
-    "not rename variables, do not add comments, do not run another",
-    "`run_tests` to double-check, do not inspect anything else. Call",
-    "`done` on the very next turn. Any edit after green risks regressing",
-    "and has burned a function that was already working.",
   );
   // Conversation history: most recent turns last, same order they
   // happened. Keep the full rolling window so the model sees what

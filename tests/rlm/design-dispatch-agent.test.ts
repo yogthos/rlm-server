@@ -94,22 +94,24 @@ describe("runDispatchAgent — basic loop shape", () => {
     expect(result.error).toMatch(/no tool call|turn budget/i);
   });
 
-  it("terminates when model calls done() (green)", async () => {
+  it("done() in dispatch phase is rejected — tests must pass first", async () => {
+    // Since the two-phase state machine: `done` is only valid in the
+    // review phase (which the harness auto-enters on green tests).
+    // In dispatch phase, `done` gets a "not valid here" tool result
+    // and the model keeps going until run_tests is green OR the
+    // turn budget exhausts.
     const g = seedFn();
     let turn = 0;
     const chat = async () => {
       turn++;
-      if (turn === 1) {
-        return '```tool-call\n{"name": "done"}\n```';
-      }
-      return "unused";
+      return '```tool-call\n{"name": "done"}\n```';
     };
     const result = await runDispatchAgent(g, "src/a.ts", "foo", {
       chat,
-      turnBudget: 5,
+      turnBudget: 3,
     });
-    expect(result.status).toBe("tests-green");
-    expect(turn).toBe(1);
+    expect(result.status).toBe("stagnated");
+    expect(turn).toBe(3);
   });
 
   it("terminates when model calls give_up(reason)", async () => {
@@ -163,7 +165,8 @@ describe("runDispatchAgent — basic loop shape", () => {
 
   it("returns DispatchResult shape compatible with the existing dispatcher", async () => {
     const g = seedFn();
-    const chat = async () => '```tool-call\n{"name": "done"}\n```';
+    const chat = async () =>
+      '```tool-call\n{"name": "give_up", "args": {"reason": "shape test"}}\n```';
     const result = await runDispatchAgent(g, "src/a.ts", "foo", {
       chat,
       turnBudget: 5,

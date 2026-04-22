@@ -282,10 +282,12 @@ describe("exec tools (injected backends)", () => {
     expect(r).toMatch(/passed/i);
   });
 
-  it("run_tests response includes a STOP-AND-CALL-done banner when tests are green", async () => {
+  it("run_tests response signals TESTS GREEN + REVIEW transition", async () => {
     // Critical signal — the dominant failure mode in early scenarios
     // was the model continuing to edit after green and regressing.
-    // The tool response must make "call done NEXT" unmissable.
+    // The harness now auto-transitions to REVIEW; the tool response
+    // tells the model it's locked out of further edits + names the
+    // verbs it gets in review (approve / revise).
     const g = seed();
     const session = createAgentSession(g, "src/db.ts", "initDatabase", {
       runTests: async () => ({
@@ -299,8 +301,13 @@ describe("exec tools (injected backends)", () => {
     });
     const r = await runTool(session, "run_tests", {});
     expect(r).toMatch(/TESTS GREEN/);
-    expect(r).toMatch(/done\(\)/);
-    expect(r).toMatch(/do not make further edits|no further edits/i);
+    expect(r).toMatch(/REVIEW/);
+    expect(r).toMatch(/approve/);
+    expect(r).toMatch(/revise/);
+    // Side effect: session is flagged green so the main loop can
+    // flip to review without re-parsing the tool text.
+    expect(session.lastTestsGreen).toBe(true);
+    expect(session.greenBody).toBeDefined();
   });
 
   it("typecheck delegates to the injected tsc runner", async () => {
