@@ -78,23 +78,28 @@ async function runTscCheck(
         resolve({ ran: true, ok: true, diagnostics: "" });
         return;
       }
-      // Keep lines that reference THIS candidate's files so the model
-      // isn't drowning in errors from siblings (which usually resolve
-      // themselves once the model fixes its own file).
+      // Scope to errors in THIS candidate's files only. Sibling stubs
+      // (written by the harness at materialize time) have unresolved
+      // types until the model implements them — every tsc run against
+      // the whole project exits non-zero, but that's not the current
+      // candidate's problem. Reporting sibling errors would block
+      // dispatches on issues the model can't fix from inside its own
+      // file.
       const candidatePattern = new RegExp(
         `\\b${escapeRegex(candidateName)}(?:\\.test|\\.integration\\.test)?\\.ts\\b`,
       );
       const ownLines: string[] = [];
-      const otherLines: string[] = [];
       for (const line of combined.split("\n")) {
         if (candidatePattern.test(line)) ownLines.push(line);
-        else if (/\berror TS\d+:/i.test(line)) otherLines.push(line);
       }
-      // Prefer own-file errors; fall back to sibling errors if none.
-      const kept = ownLines.length > 0 ? ownLines : otherLines.slice(0, 10);
-      const rendered =
-        kept.length > 0 ? kept.join("\n") : combined.slice(-1500);
-      resolve({ ran: true, ok: false, diagnostics: rendered });
+      if (ownLines.length === 0) {
+        // No errors in candidate's own files → treat tsc as passing
+        // from this candidate's perspective. Siblings will be caught
+        // by their own dispatches.
+        resolve({ ran: true, ok: true, diagnostics: "" });
+        return;
+      }
+      resolve({ ran: true, ok: false, diagnostics: ownLines.join("\n") });
     });
   });
 }
