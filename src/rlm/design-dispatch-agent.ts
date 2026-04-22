@@ -29,8 +29,7 @@
  */
 
 import type { DesignGraph } from "./design-graph.js";
-import type { DispatchResult } from "./design-dispatch.js";
-import type { ChatFn } from "./design-dispatch.js";
+import type { DispatchResult, ChatFn } from "./dispatch-types.js";
 import type { TestRunResult, CandidateBody } from "./test-runner.js";
 import { debug } from "./debug.js";
 

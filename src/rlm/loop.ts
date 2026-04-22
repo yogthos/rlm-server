@@ -23,7 +23,6 @@ import {
   TEST_RUN_IMPL,
 } from "../builtins/index.js";
 import { createDesignBridge } from "./design-bridge.js";
-import { createDesignDispatchBridge } from "./design-dispatch.js";
 import { runDispatchAgent } from "./design-dispatch-agent.js";
 import { runTests, runTscCheck } from "./test-runner.js";
 import { finalizeProject } from "./finalize.js";
@@ -278,11 +277,16 @@ function buildBridgeHelpers(ctx: RLMContext) {
       nm: string,
       pd?: string,
     ) =>
-      createDesignDispatchBridge(gg, chat, {
+      runDispatchAgent(gg, mod, nm, {
+        chat,
         projectDir: pd,
-        decompose,
-        maxReviewCycles: ctx.maxReviewCycles,
-      }).dispatch(mod, nm);
+        runTests: pd
+          ? (g2, candidate) => runTests(g2, candidate, { projectDir: pd })
+          : runTests,
+        runTypecheck: pd
+          ? async (_g2, candidate) => runTscCheck(pd, candidate.name)
+          : async () => ({ ran: false, ok: true, diagnostics: "" }),
+      });
     const subFinalize = (
       gg: RLMContext["designGraph"],
       opts?: FinalizeOptions,
@@ -307,11 +311,17 @@ function buildBridgeHelpers(ctx: RLMContext) {
     name: string,
     projectDir?: string,
   ) =>
-    createDesignDispatchBridge(graph, chat, {
+    runDispatchAgent(graph, module, name, {
+      chat,
       projectDir,
-      decompose,
-      maxReviewCycles: ctx.maxReviewCycles,
-    }).dispatch(module, name);
+      runTests: projectDir
+        ? (g2, candidate) =>
+            runTests(g2, candidate, { projectDir })
+        : runTests,
+      runTypecheck: projectDir
+        ? async (_g2, candidate) => runTscCheck(projectDir, candidate.name)
+        : async () => ({ ran: false, ok: true, diagnostics: "" }),
+    });
   const reflect = async (
     graph: RLMContext["designGraph"],
     module: string,
@@ -555,10 +565,7 @@ async function initHandler(ctx: RLMContext): Promise<RLMContext> {
           );
           return resp.content;
         };
-        return createDesignDispatchBridge(ctx.designGraph, chat).dispatch(
-          module,
-          name,
-        );
+        return runDispatchAgent(ctx.designGraph, module, name, { chat });
       },
       __testRunBridge: (module: string, name: string, body: string) =>
         runTests(ctx.designGraph, { module, name, body }),
@@ -579,41 +586,29 @@ async function initHandler(ctx: RLMContext): Promise<RLMContext> {
         // stagnates (can't converge), leaf-up calls the architect via
         // `decompose` to split the function into smaller children,
         // then retries once the children land green.
-        // USE_AGENT_DISPATCH flag selects the tool-use agent dispatcher
-        // (P1-P4) over the legacy single-shot dispatcher. Default OFF;
-        // flip to "1" to exercise the agent path across a full scenario.
-        const useAgent =
-          process.env.USE_AGENT_DISPATCH === "1" ||
-          process.env.USE_AGENT_DISPATCH === "true";
+        // Per-function implementation runs the tool-use agent: each
+        // function becomes a short TDD conversation where the model
+        // emits one tool call per turn (get_spec / write_test_file /
+        // run_tests / done / ...). The harness is purely a dispatch
+        // layer; intelligence lives entirely in the model + tools.
         const leafDispatch = (
           g: RLMContext["designGraph"],
           module: string,
           name: string,
           opts?: { projectDir?: string; feedback?: string },
         ) => {
-          if (useAgent) {
-            const projectDir = opts?.projectDir;
-            return runDispatchAgent(g, module, name, {
-              chat,
-              task,
-              externalFeedback: opts?.feedback,
-              projectDir,
-              // Real backends — the agent's run_tests / typecheck tools
-              // call straight into the same helpers the legacy path uses.
-              runTests: projectDir
-                ? (gg, candidate) => runTests(gg, candidate, { projectDir })
-                : runTests,
-              runTypecheck: projectDir
-                ? async (_gg, candidate) => runTscCheck(projectDir, candidate.name)
-                : async () => ({ ran: false, ok: true, diagnostics: "" }),
-            });
-          }
-          return createDesignDispatchBridge(g, chat, {
-            projectDir: opts?.projectDir,
-            maxReviewCycles: 0,
-          }).dispatch(module, name, {
-            externalFeedback: opts?.feedback,
+          const projectDir = opts?.projectDir;
+          return runDispatchAgent(g, module, name, {
+            chat,
             task,
+            externalFeedback: opts?.feedback,
+            projectDir,
+            runTests: projectDir
+              ? (gg, candidate) => runTests(gg, candidate, { projectDir })
+              : runTests,
+            runTypecheck: projectDir
+              ? async (_gg, candidate) => runTscCheck(projectDir, candidate.name)
+              : async () => ({ ran: false, ok: true, diagnostics: "" }),
           });
         };
         return designPlanIntegration(ctx.designGraph, task, {

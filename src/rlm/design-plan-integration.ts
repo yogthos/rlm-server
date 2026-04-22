@@ -24,7 +24,7 @@
  */
 
 import type { DesignGraph } from "./design-graph.js";
-import type { DispatchResult } from "./design-dispatch.js";
+import type { DispatchResult } from "./dispatch-types.js";
 import type { FinalizeReport, FinalizeOptions } from "./finalize.js";
 import type { BuildReport } from "./design-build.js";
 import { designPlan } from "./design-plan.js";

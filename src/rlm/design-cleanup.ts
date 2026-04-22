@@ -33,7 +33,7 @@
  */
 
 import type { DesignGraph } from "./design-graph.js";
-import type { DispatchResult } from "./design-dispatch.js";
+import type { DispatchResult } from "./dispatch-types.js";
 import { analyzeSource } from "./body-analyzer.js";
 import { debug } from "./debug.js";
 

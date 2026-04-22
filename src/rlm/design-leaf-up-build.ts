@@ -23,7 +23,7 @@
  */
 
 import type { DesignGraph } from "./design-graph.js";
-import type { DispatchResult } from "./design-dispatch.js";
+import type { DispatchResult } from "./dispatch-types.js";
 import { debug } from "./debug.js";
 import { mkdir, symlink, copyFile, rm } from "node:fs/promises";
 import path from "node:path";

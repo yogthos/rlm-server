@@ -46,11 +46,13 @@ describe("renderDecompositionHints — short form for binary gates", () => {
 });
 
 describe("decomposition rules are wired into every decomposition site", () => {
-  // Ensures a future refactor doesn't disconnect one of the four
+  // Ensures a future refactor doesn't disconnect one of the
   // decomposition decision points from the shared rules.
+  // The legacy in-dispatch IMPLEMENT-vs-DECOMPOSE gate moved out when
+  // the tool-use agent replaced the single-shot dispatcher; decomposition
+  // is now driven entirely by the outer leaf-up + reflect flow.
   const sites = [
     "src/rlm/design-plan.ts",      // phase-1 top-level + parent split
-    "src/rlm/design-dispatch.ts",  // IMPLEMENT-vs-DECOMPOSE gate
     "src/rlm/design-reflect.ts",   // reflect decompose choice
   ];
 

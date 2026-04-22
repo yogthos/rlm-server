@@ -14,7 +14,7 @@ import type {
   FunctionNode,
   ConsistencyReport,
 } from "./design-graph.js";
-import type { DispatchResult } from "./design-dispatch.js";
+import type { DispatchResult } from "./dispatch-types.js";
 import type { FinalizeReport, FinalizeOptions } from "./finalize.js";
 import { createProjectDir, type ProjectDir } from "./test-runner.js";
 import { debug } from "./debug.js";

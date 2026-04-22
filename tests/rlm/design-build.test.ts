@@ -223,46 +223,11 @@ describe("designBuild", () => {
     );
   });
 
-  it("decompose callback returning false marks the parent failed", async () => {
-    // Host's decompose may refuse (e.g. depth limit, sub-plan failed).
-    // dispatch.ts translates `false` into a failed result; the outer
-    // build should record the failure instead of spinning.
-    const { createDesignDispatchBridge } = await import(
-      "../../src/rlm/design-dispatch.js"
-    );
-    const g = createDesignGraph();
-    g.addFunction(
-      "src/a.ts",
-      "tooDeep",
-      { params: [], returnType: "void" },
-      "x",
-    );
-    // A spec gates the IMPLEMENT-vs-DECOMPOSE decision; without it
-    // dispatch skips straight to body generation.
-    // Include dependencies + 5 edge cases so the spec defeats the
-    // complexity floor and the decompose-decision LLM call actually runs.
-    g.setSpec("src/a.ts", "tooDeep", {
-      purpose: "x",
-      inputs: [],
-      output: { type: "void", description: "" },
-      sideEffects: ["writes", "reads"],
-      dependencies: ["a", "b"],
-      edgeCases: ["e1", "e2", "e3", "e4", "e5"],
-      examples: [],
-    });
-
-    const bridge = createDesignDispatchBridge(
-      g,
-      async () => "```\nDECOMPOSE\n```",
-      {
-        decompose: async () => false,
-        runTests: async () => ({ ok: true, passed: 1, failed: 0, output: "" }),
-      },
-    );
-    const result = await bridge.dispatch("src/a.ts", "tooDeep");
-    expect(result.status).toBe("failed");
-    expect(result.error).toMatch(/sub-plan failed/);
-  });
+  // (Legacy "decompose callback returning false marks the parent
+  // failed" test deleted: the in-dispatch IMPLEMENT-vs-DECOMPOSE gate
+  // went away with the legacy single-shot dispatcher. Decomposition
+  // is now driven by the outer leaf-up + reflect flow; a decompose
+  // callback returning false is handled there, not in dispatch.)
 
   it("recursive build: children dispatched before parent when decompose returns children", async () => {
     const g = createDesignGraph();
