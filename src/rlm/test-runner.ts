@@ -44,13 +44,13 @@ import { debug } from "./debug.js";
  * tsconfig.json doesn't exist in `dir` (non-TS runtime), or the
  * project config marks `(none)` package manager.
  */
-interface TscCheckResult {
+export interface TscCheckResult {
   ran: boolean;
   ok: boolean;
   diagnostics: string;
 }
 
-async function runTscCheck(
+export async function runTscCheck(
   dir: string,
   candidateName: string,
   timeoutMs: number = 45_000,

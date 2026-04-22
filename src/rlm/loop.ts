@@ -24,7 +24,8 @@ import {
 } from "../builtins/index.js";
 import { createDesignBridge } from "./design-bridge.js";
 import { createDesignDispatchBridge } from "./design-dispatch.js";
-import { runTests } from "./test-runner.js";
+import { runDispatchAgent } from "./design-dispatch-agent.js";
+import { runTests, runTscCheck } from "./test-runner.js";
 import { finalizeProject } from "./finalize.js";
 import type { FinalizeOptions } from "./finalize.js";
 import { renderFileSet } from "./final-files.js";
@@ -578,19 +579,43 @@ async function initHandler(ctx: RLMContext): Promise<RLMContext> {
         // stagnates (can't converge), leaf-up calls the architect via
         // `decompose` to split the function into smaller children,
         // then retries once the children land green.
+        // USE_AGENT_DISPATCH flag selects the tool-use agent dispatcher
+        // (P1-P4) over the legacy single-shot dispatcher. Default OFF;
+        // flip to "1" to exercise the agent path across a full scenario.
+        const useAgent =
+          process.env.USE_AGENT_DISPATCH === "1" ||
+          process.env.USE_AGENT_DISPATCH === "true";
         const leafDispatch = (
           g: RLMContext["designGraph"],
           module: string,
           name: string,
           opts?: { projectDir?: string; feedback?: string },
-        ) =>
-          createDesignDispatchBridge(g, chat, {
+        ) => {
+          if (useAgent) {
+            const projectDir = opts?.projectDir;
+            return runDispatchAgent(g, module, name, {
+              chat,
+              task,
+              externalFeedback: opts?.feedback,
+              projectDir,
+              // Real backends — the agent's run_tests / typecheck tools
+              // call straight into the same helpers the legacy path uses.
+              runTests: projectDir
+                ? (gg, candidate) => runTests(gg, candidate, { projectDir })
+                : runTests,
+              runTypecheck: projectDir
+                ? async (_gg, candidate) => runTscCheck(projectDir, candidate.name)
+                : async () => ({ ran: false, ok: true, diagnostics: "" }),
+            });
+          }
+          return createDesignDispatchBridge(g, chat, {
             projectDir: opts?.projectDir,
             maxReviewCycles: 0,
           }).dispatch(module, name, {
             externalFeedback: opts?.feedback,
             task,
           });
+        };
         return designPlanIntegration(ctx.designGraph, task, {
           chat,
           leafDispatch,
