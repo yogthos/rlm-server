@@ -282,6 +282,27 @@ describe("exec tools (injected backends)", () => {
     expect(r).toMatch(/passed/i);
   });
 
+  it("run_tests response includes a STOP-AND-CALL-done banner when tests are green", async () => {
+    // Critical signal — the dominant failure mode in early scenarios
+    // was the model continuing to edit after green and regressing.
+    // The tool response must make "call done NEXT" unmissable.
+    const g = seed();
+    const session = createAgentSession(g, "src/db.ts", "initDatabase", {
+      runTests: async () => ({
+        ok: true,
+        passed: 5,
+        failed: 0,
+        output: "TAP ok",
+        failingTestNames: [],
+        fullFailureMessages: new Map(),
+      }),
+    });
+    const r = await runTool(session, "run_tests", {});
+    expect(r).toMatch(/TESTS GREEN/);
+    expect(r).toMatch(/done\(\)/);
+    expect(r).toMatch(/do not make further edits|no further edits/i);
+  });
+
   it("typecheck delegates to the injected tsc runner", async () => {
     const g = seed();
     g.setImplementation(

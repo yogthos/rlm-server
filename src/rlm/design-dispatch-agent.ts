@@ -470,6 +470,19 @@ async function toolRunTests(session: AgentSession): Promise<string> {
     `passed: ${result.passed}`,
     `failed: ${result.failed}`,
   ];
+  if (result.ok && result.passed > 0) {
+    // Tests are green. The correct next move is ALWAYS done() — not
+    // another edit, not another inspection. Additional tweaks after
+    // green risk regressing. Make this the loudest signal in the
+    // response so the model doesn't miss it.
+    lines.push(
+      "",
+      "✓ TESTS GREEN — CALL done() NEXT. Do NOT make further edits.",
+      "The function has satisfied its contract. Any further change",
+      "risks regressing. If you think the body could be cleaner, that",
+      "is out of scope — `done` ends the session and locks your work.",
+    );
+  }
   if (result.loadFailure) {
     lines.push("loadFailure: true (compile/import error — no assertions ran)");
   }
@@ -638,9 +651,17 @@ export function renderAgentPrompt(
     "  2. `write_test_file` with tests that encode the spec's edge cases.",
     "  3. `run_tests` — expect failures (body is stub/empty).",
     "  4. `write_body` (or `patch_body`) to make the tests pass.",
-    "  5. `run_tests` — on green, call `done`.",
+    "  5. `run_tests` — **AS SOON AS ok:true, call `done` IMMEDIATELY**.",
     "  If a test file fails to COMPILE (TS error), `typecheck` will",
     "  surface the exact TSxxxx diagnostic.",
+    "",
+    "**STOPPING RULE — non-negotiable:** the session ends at `done`, NOT",
+    "when you think the code is polished. If `run_tests` returns",
+    "`ok: true`, your next tool call MUST be `done`. Do not clean up, do",
+    "not rename variables, do not add comments, do not run another",
+    "`run_tests` to double-check, do not inspect anything else. Call",
+    "`done` on the very next turn. Any edit after green risks regressing",
+    "and has burned a function that was already working.",
   );
   // Conversation history: most recent turns last, same order they
   // happened. Keep the full rolling window so the model sees what

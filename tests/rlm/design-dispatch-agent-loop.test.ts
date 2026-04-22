@@ -61,6 +61,18 @@ describe("renderAgentPrompt", () => {
     expect(p).toContain("give_up");
   });
 
+  it("includes the STOPPING RULE — call done immediately on green", () => {
+    // Fix for the go-green-then-regress failure mode observed in
+    // early scenarios. The prompt must make "done() on next turn
+    // after ok:true" a hard rule, not a suggestion.
+    const g = seed();
+    const s = createAgentSession(g, "src/a.ts", "add");
+    const p = renderAgentPrompt(s, []);
+    expect(p).toMatch(/STOPPING RULE/);
+    expect(p).toMatch(/done/i);
+    expect(p).toMatch(/regress/i);
+  });
+
   it("surfaces externalFeedback (upstream failure context) when present", () => {
     const g = seed();
     const s = createAgentSession(g, "src/a.ts", "add", {
