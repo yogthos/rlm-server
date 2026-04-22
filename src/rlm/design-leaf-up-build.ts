@@ -25,7 +25,7 @@
 import type { DesignGraph } from "./design-graph.js";
 import type { DispatchResult } from "./design-dispatch.js";
 import { debug } from "./debug.js";
-import { mkdir, symlink, copyFile } from "node:fs/promises";
+import { mkdir, symlink, copyFile, rm } from "node:fs/promises";
 import path from "node:path";
 import { randomBytes } from "node:crypto";
 
@@ -344,6 +344,25 @@ export async function designLeafUpBuild(
           return { pick: p, result: r, error: null as unknown };
         } catch (e) {
           return { pick: p, result: null, error: e };
+        }
+      }),
+    );
+    // Phase H2b — delete overlay subdirs as soon as their dispatch
+    // completes. Leaving them around causes later phases (integration
+    // tests, fix-dispatches) to discover stale `<fn>.test.ts` copies
+    // under `.rlm-overlays/*/`, triple-counting the same failures and
+    // burning attribution cycles on ghosts. Only overlays — never the
+    // parent projectDir — get removed.
+    await Promise.all(
+      dispatchDirs.map(async (d) => {
+        if (!d || d === options.projectDir) return;
+        try {
+          await rm(d, { recursive: true, force: true });
+        } catch (e) {
+          debug(
+            "leaf-up-build",
+            `overlay cleanup failed for ${d}: ${e instanceof Error ? e.message : String(e)}`,
+          );
         }
       }),
     );

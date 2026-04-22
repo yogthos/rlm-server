@@ -206,8 +206,13 @@ describe("designLeafUpBuild", () => {
         inFlight++;
         if (inFlight > maxInFlight) maxInFlight = inFlight;
         // Each dispatch must receive its OWN projectDir (an overlay),
-        // not the shared one.
-        if (opts?.projectDir) projectDirsSeen.add(opts.projectDir);
+        // not the shared one. Verify the overlay exists on disk WHILE
+        // dispatch is running (it'll be cleaned up after — H2b).
+        if (opts?.projectDir) {
+          projectDirsSeen.add(opts.projectDir);
+          const s = await stat(opts.projectDir);
+          expect(s.isDirectory()).toBe(true);
+        }
         // Yield so parallel dispatches actually overlap.
         await new Promise((resolve) => setTimeout(resolve, 5));
         inFlight--;
@@ -236,9 +241,62 @@ describe("designLeafUpBuild", () => {
         // Overlays should be subdirs of projectDir (so node_modules
         // resolution walks up to find the installed deps).
         expect(d.startsWith(projectDir)).toBe(true);
-        // Overlay dir must exist on disk during dispatch.
-        const s = await stat(d);
-        expect(s.isDirectory()).toBe(true);
+      }
+    } finally {
+      await rm(projectDir, { recursive: true, force: true });
+    }
+  });
+
+  // Phase H2b — overlay subdirs must be cleaned up after each batch.
+  // If left around, later phases (integration tests, fix-dispatches)
+  // discover stale `<fn>.test.ts` copies under `.rlm-overlays/*/` via
+  // their default test glob and triple-count the same failures.
+  it("cleans up overlay subdirs after each dispatch batch (H2b)", async () => {
+    const { mkdtemp, rm, stat, readdir } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+    const path = await import("node:path");
+    const projectDir = await mkdtemp(path.join(tmpdir(), "rlm-h2b-"));
+    try {
+      const g = createDesignGraph();
+      for (const n of ["a", "b"]) {
+        g.addFunction("src/a.ts", n, sig());
+        g.setSpec("src/a.ts", n, spec());
+      }
+      const dispatch = async (
+        _g: any,
+        mod: string,
+        name: string,
+        opts?: { projectDir?: string },
+      ) => {
+        // The overlay must exist during dispatch.
+        if (opts?.projectDir) {
+          const s = await stat(opts.projectDir);
+          expect(s.isDirectory()).toBe(true);
+        }
+        _g.setImplementation(mod, name, "// ok");
+        _g.setTestStatus(mod, name, "tests-green", "");
+        return {
+          module: mod,
+          name,
+          status: "tests-green" as const,
+          implementation: "// ok",
+          attempts: 1,
+          testOutput: "",
+        };
+      };
+      await designLeafUpBuild(g, {
+        dispatch,
+        projectDir,
+        maxConcurrent: 4,
+      });
+      // After the batch finishes, the .rlm-overlays dir should be empty
+      // (or not exist at all).
+      const overlayRoot = path.join(projectDir, ".rlm-overlays");
+      try {
+        const entries = await readdir(overlayRoot);
+        expect(entries).toEqual([]);
+      } catch {
+        // ENOENT is fine too — means nothing was left behind.
       }
     } finally {
       await rm(projectDir, { recursive: true, force: true });
