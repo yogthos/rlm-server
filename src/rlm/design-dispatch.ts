@@ -18,7 +18,12 @@ import type {
 import { buildImplementerPrompt } from "./implementer-prompt.js";
 import { runTests, type TestRunResult } from "./test-runner.js";
 import { debug } from "./debug.js";
-import { analyzeBody, type BodyAnalysis } from "./body-analyzer.js";
+import {
+  analyzeSource,
+  collectNaturalViolations,
+} from "./body-analyzer.js";
+import { validateFunctionFile } from "./file-validator.js";
+import { renderDecompositionHints } from "./decomposition-rules.js";
 import {
   extractRequestInfo,
   resolveRequests,
@@ -35,7 +40,7 @@ function reconcileSpecDependencies(
   graph: DesignGraph,
   module: string,
   name: string,
-  analysis: BodyAnalysis,
+  observedSiblingCallees: readonly string[],
 ): void {
   const fn = graph.getFunction(module, name);
   if (!fn?.spec) {
@@ -45,9 +50,7 @@ function reconcileSpecDependencies(
     );
     return;
   }
-  const observed = Array.from(
-    new Set(analysis.ctxFnsCalls.map((c) => c.name)),
-  ).sort();
+  const observed = [...new Set(observedSiblingCallees)].sort();
   const current = [...fn.spec.dependencies].sort();
   if (
     current.length === observed.length &&
@@ -63,95 +66,44 @@ function reconcileSpecDependencies(
 }
 
 /**
- * Collect structural violations of a proc-ts body.
- *
- * When `requiredChildren` is non-empty, each child must be REACHABLE
- * from the body's `ctx.fns` call chain — either called directly, or
- * called by a function the body calls (transitively). Previous behaviour
- * demanded a direct call to every child; that rejected valid tree-
- * shaped compositions like `parent → buildPage → [form, list, ...]`
- * where an intermediate child assembles the others.
- *
- * Transitive computation requires `graph` so we can pull each
- * intermediate function's body and analyse its outbound calls. Without
- * `graph`, we fall back to direct-call-only semantics (preserves the
- * old behaviour for fixtures that don't need transitivity).
+ * Phase N4 — run natural-mode analysis on a saved body and write both
+ * the call-graph edges (`setAnalyzedEdges`) and the reconciled
+ * `spec.dependencies` back to the graph. Returns the observed sibling
+ * callees so the caller can log them.
  */
-async function analyzeReachableCalls(
+async function ingestBodyEdges(
   graph: DesignGraph,
-  seedNames: readonly string[],
-): Promise<Set<string>> {
-  const reachable = new Set<string>();
-  const queue = [...seedNames];
-  const byName = new Map(
-    graph.listFunctions().map((f) => [f.name, f] as const),
-  );
-  while (queue.length > 0) {
-    const name = queue.shift()!;
-    if (reachable.has(name)) continue;
-    reachable.add(name);
-    const fn = byName.get(name);
-    if (!fn || !fn.implementation) continue;
-    try {
-      const childAnalysis = await analyzeBody(fn.implementation);
-      for (const c of childAnalysis.ctxFnsCalls) {
-        if (!reachable.has(c.name)) queue.push(c.name);
-      }
-    } catch {
-      // Parse failures on intermediate bodies aren't fatal here — they
-      // surface when that function is dispatched.
-    }
-  }
-  return reachable;
-}
-
-async function collectBodyViolations(
-  analysis: BodyAnalysis,
-  knownNames: Set<string>,
-  requiredChildren: readonly string[] = [],
-  graph?: DesignGraph,
+  module: string,
+  name: string,
+  body: string,
 ): Promise<string[]> {
-  const violations: string[] = [];
-  if (analysis.imports.length > 0) {
-    const formatted = analysis.imports
-      .map((imp) => `  line ${imp.line}: import from "${imp.source}"`)
-      .join("\n");
-    violations.push(
-      `Top-level \`import\` statements are forbidden in proc-ts bodies:\n${formatted}\nUse dynamic \`require(...)\` or \`await import(...)\` inside the body instead.`,
-    );
+  let analysis;
+  try {
+    analysis = await analyzeSource(body);
+  } catch {
+    return [];
   }
-  const seenUndeclared = new Map<string, number>();
-  for (const c of analysis.ctxFnsCalls) {
-    if (!knownNames.has(c.name) && !seenUndeclared.has(c.name)) {
-      seenUndeclared.set(c.name, c.line);
+  const knownSiblings = new Set(graph.listFunctions().map((f) => f.name));
+  // Map imported local binding → sibling module name, so renames like
+  // `import { foo as other } from "./foo.js"` still resolve.
+  const bindingToSibling = new Map<string, string>();
+  for (const imp of analysis.imports) {
+    const m = imp.source.match(/^\.\/(.+?)(?:\.js|\.ts)?$/);
+    if (m && knownSiblings.has(m[1])) {
+      bindingToSibling.set(imp.name, m[1]);
     }
   }
-  if (seenUndeclared.size > 0) {
-    const formatted = Array.from(seenUndeclared)
-      .map(([n, line]) => `  line ${line}: ctx.fns.${n}`)
-      .join("\n");
-    const available =
-      Array.from(knownNames).sort().join(", ") || "(none)";
-    violations.push(
-      `Call(s) to ctx.fns.<sibling> for functions NOT in the graph:\n${formatted}\nAvailable ctx.fns: ${available}.`,
-    );
+  const siblingCallees = new Set<string>();
+  for (const callee of analysis.callees) {
+    const sibling = bindingToSibling.get(callee);
+    if (sibling) siblingCallees.add(sibling);
   }
-  if (requiredChildren.length > 0) {
-    const directCalls = analysis.ctxFnsCalls.map((c) => c.name);
-    const reachable = graph
-      ? await analyzeReachableCalls(graph, directCalls)
-      : new Set<string>(directCalls);
-    const missing = requiredChildren.filter((c) => !reachable.has(c));
-    if (missing.length > 0) {
-      const chain = directCalls.length > 0
-        ? `Your body directly calls: ${directCalls.join(", ")}. Transitive reach: ${[...reachable].join(", ") || "(none)"}.`
-        : `Your body calls no siblings at all.`;
-      violations.push(
-        `This function was decomposed into children — every child must be REACHABLE from your body's call chain (directly, or transitively through another sibling you call). Unreachable: ${missing.map((m) => `ctx.fns.${m}`).join(", ")}. ${chain}`,
-      );
-    }
-  }
-  return violations;
+  graph.setAnalyzedEdges(module, name, {
+    imports: analysis.imports,
+    callees: [...siblingCallees].sort(),
+  });
+  reconcileSpecDependencies(graph, module, name, [...siblingCallees]);
+  return [...siblingCallees].sort();
 }
 
 export interface DispatchResult {
@@ -279,14 +231,22 @@ export interface ReviewVerdict {
  * Format review feedback for the Implementer's retry prompt. When the
  * verdict cites a spec field, lead with `[architect cited spec.<field>]`
  * so the Implementer knows exactly which part of the SPEC to revisit.
+ * When the verdict cites `tests`, lead with a test-rewrite directive —
+ * the body may be fine and the test suite is the actual bug.
  */
 function formatArchitectFeedback(v: ReviewVerdict): string {
   if (!v.specField) return v.feedback;
+  if (v.specField === "tests") {
+    return `[architect flagged the TEST SUITE — the body may be correct; rewrite the unit tests so they assert the spec's actual contract, not a stricter one]\n${v.feedback}`;
+  }
   return `[architect cited spec.${v.specField}]\n${v.feedback}`;
 }
 
-/** Spec fields a REVISE verdict is allowed to cite. Matches the
- *  `FunctionSpec` shape one-for-one so feedback is traceable. */
+/** Targets a REVISE verdict is allowed to cite. Spec fields match the
+ *  `FunctionSpec` shape one-for-one so feedback is traceable. `tests`
+ *  is added for B2 — the architect may judge the body is fine but the
+ *  TESTS encode the wrong contract, in which case the implementer
+ *  should rewrite the test suite on retry. */
 const REVIEW_SPEC_FIELDS = [
   "purpose",
   "inputs",
@@ -295,6 +255,7 @@ const REVIEW_SPEC_FIELDS = [
   "dependencies",
   "edgeCases",
   "examples",
+  "tests",
 ] as const;
 
 /**
@@ -493,13 +454,21 @@ async function architectReview(
     "- No `import` statements at the top of function bodies. Node",
     "  modules come in via dynamic `require(...)` or `await import(...)`.",
     "",
-    "ANCHOR YOUR REVIEW TO THE SPEC. Evaluate ONLY what the SPEC asks for:",
-    "- Does the body fulfill the stated `purpose`?",
-    "- Does it cover every `edgeCase` the spec listed?",
-    "- Does it produce the declared `sideEffects` (and no undeclared ones)?",
-    "- Does it call each declared `dependency` appropriately?",
-    "- Are the unit tests MEANINGFUL — not trivial tautologies like",
+    "ANCHOR YOUR REVIEW TO THE SPEC — specifically to PURPOSE + OUTPUT.",
+    "Those two are the hard contract. Evaluate:",
+    "- Does the body fulfill the stated `purpose`? (highest bar)",
+    "- Does it produce the declared output shape/semantics?",
+    "- Does it produce the `sideEffects` the spec calls out?",
+    "- Are the unit tests MEANINGFUL — not tautologies like",
     "  `expect(true).toBe(true)` or assertions that just mirror the body?",
+    "",
+    "edgeCases are SUGGESTIONS. If the body/tests don't cover an edge",
+    "case the spec listed, that ALONE is not grounds for REVISE —",
+    "especially if the case is tangential to the purpose or the tests",
+    "already cover the important invariants. The implementer has full",
+    "context; trust their judgment on which cases are load-bearing.",
+    "Only REVISE <edgeCases> when a listed case is CENTRAL to the",
+    "purpose AND is genuinely uncovered.",
     "",
     "DO NOT invent requirements outside the SPEC. If Content-Type",
     "validation, response-already-sent guards, race-condition fixes, or",
@@ -507,6 +476,11 @@ async function architectReview(
     "sideEffects, or edgeCases, do NOT reject over it — APPROVE. The",
     "Architect (you) wrote the spec; hold the implementation to THAT bar,",
     "not to a higher one.",
+    "",
+    "DO NOT prescribe implementation details. If the body uses a Map",
+    "where you'd have used an object, or a for-loop where you'd have",
+    "used reduce, or extracts a helper you wouldn't have — that's the",
+    "implementer's call. The spec is a CONTRACT, not a recipe.",
     "",
     "",
     "Reply with EXACTLY one fenced code block.",
@@ -516,15 +490,20 @@ async function architectReview(
     "APPROVE",
     "```",
     "",
-    "OR REVISE, citing EXACTLY ONE spec field your concern maps to.",
-    "Allowed fields: <purpose|inputs|output|sideEffects|dependencies|edgeCases|examples>.",
-    "If you CANNOT map your concern to one of those fields, your concern",
-    "is outside the spec — you must APPROVE instead.",
+    "OR REVISE, citing EXACTLY ONE target your concern maps to.",
+    "Allowed targets:",
+    "  <purpose|inputs|output|sideEffects|dependencies|edgeCases|examples>",
+    "  tests — when the body satisfies the spec but the TESTS assert",
+    "          something stricter than the spec (wrong contract in the",
+    "          test suite). The Implementer will rewrite the tests on",
+    "          retry; they can revise the body too if needed.",
+    "If you CANNOT map your concern to one of those targets, your concern",
+    "is outside scope — you must APPROVE instead.",
     "",
     "```",
-    "REVISE <field>",
+    "REVISE <target>",
     "<2–6 sentences of specific, actionable feedback, traceable to the",
-    "cited <field>. Be concrete, not vague.>",
+    "cited <target>. Be concrete, not vague.>",
     "```",
     "",
     "No prose outside the fenced block.",
@@ -596,7 +575,7 @@ async function askDecompose(
   } else {
     specLines.push(`Purpose: ${fn.description}`);
   }
-  // Show siblings the LLM can REUSE via ctx.fns — with their purposes,
+  // Show siblings the LLM can REUSE by importing — with their purposes,
   // not just names. Reuse is the cheapest way to avoid DECOMPOSE.
   const reuseLines: string[] = [];
   const others = graph
@@ -605,15 +584,18 @@ async function askDecompose(
   if (others.length > 0) {
     reuseLines.push(
       "",
-      "Existing functions you can call via `ctx.fns.<name>(ctx, ...)` —",
+      "Existing functions you can import and call directly —",
       "REUSE THESE FIRST if any solves a sub-concern of this function:",
     );
     for (const o of others) {
       const purpose = o.spec?.purpose ?? o.description ?? "";
       const brief = purpose.length > 120 ? purpose.slice(0, 117) + "..." : purpose;
-      reuseLines.push(`  - ctx.fns.${o.name}(ctx, ...) — ${brief}`);
+      reuseLines.push(`  - import ${o.name} from "./${o.name}.js" — ${brief}`);
     }
   }
+  const userParams = fn.signature.params
+    .map((p) => `${p.name}: ${p.type}`)
+    .join(", ");
   const prompt = [
     `You are deciding how to implement a function. Default to IMPLEMENT.`,
     `DECOMPOSE is EXPENSIVE — it adds another planning round and several`,
@@ -622,9 +604,11 @@ async function askDecompose(
     `helpers.`,
     "",
     `Function: ${fn.name}`,
-    `Signature: ${fn.signature.isAsync ? "async " : ""}function ${fn.name}(ctx: Ctx${fn.signature.params.length > 0 ? ", " + fn.signature.params.map((p) => `${p.name}: ${p.type}`).join(", ") : ""}): ${fn.signature.returnType}`,
+    `Signature: ${fn.signature.isAsync ? "async " : ""}function ${fn.name}(${userParams}): ${fn.signature.returnType}`,
     ...specLines,
     ...reuseLines,
+    "",
+    ...renderDecompositionHints(),
     "",
     `Decision rules (apply in order):`,
     `  1. If the body fits in ~30 lines of straightforward code,`,
@@ -632,11 +616,11 @@ async function askDecompose(
     `     count as ONE orchestration — do NOT split them.`,
     `  2. If every sub-concern of this function is already covered by a`,
     `     function in the "Existing functions" list above, answer IMPLEMENT`,
-    `     and call those via ctx.fns. Do NOT invent new helpers that`,
+    `     and import those directly. Do NOT invent new helpers that`,
     `     duplicate existing ones.`,
     `  3. Only answer DECOMPOSE when BOTH of these hold:`,
     `     (a) the function orchestrates ≥ 3 genuinely distinct concerns`,
-    `         that CANNOT be covered by existing ctx.fns helpers, AND`,
+    `         that CANNOT be covered by existing helpers, AND`,
     `     (b) the resulting body would be well over 30 lines even if you`,
     `         reused everything available.`,
     "",
@@ -644,10 +628,10 @@ async function askDecompose(
     `  - \`hashPassword(pw)\` → IMPLEMENT (one transform, few lines).`,
     `  - \`handleGetApiEntries\` that loads entries, serializes, sends →`,
     `    IMPLEMENT. It's a 15-line pipeline; even if it calls three`,
-    `    helpers via ctx.fns, that's reuse, not orchestration.`,
+    `    imported helpers, that's reuse, not orchestration.`,
     `  - \`renderPage(data)\` that builds an HTML string → IMPLEMENT.`,
     `  - \`handleSignup(req,res)\` where parse/validate/hash/write/reply`,
-    `    aren't yet available as ctx.fns helpers AND the body would exceed`,
+    `    aren't yet available as helpers AND the body would exceed`,
     `    30 lines → DECOMPOSE.`,
     "",
     `Answer with EXACTLY one word (IMPLEMENT or DECOMPOSE) inside a fenced`,
@@ -673,6 +657,9 @@ const TEST_FENCE_TAGS = new Set([
   "tests",
   "unit-tests",
   "integration-tests",
+  // Phase C2 — wrapper-kill fences. Raw TS content.
+  "unit-test-file",
+  "integration-test-file",
 ]);
 
 /** Fence tags that are NEVER a body — they're meta-channels owned by
@@ -682,6 +669,10 @@ const TEST_FENCE_TAGS = new Set([
 const NON_BODY_FENCE_TAGS = new Set([
   ...TEST_FENCE_TAGS,
   "request-info",
+  // Phase G — asset revision fences (`file:package.json`,
+  // `file:tsconfig.json`, `file:scripts/seed.sql`, …). Must not be
+  // confused with the body fence.
+  "file",
 ]);
 
 export function extractBody(response: string): string | null {
@@ -747,6 +738,60 @@ export function extractUnitTests(response: string): TestSpec[] | null {
 /** Extract the ```integration-tests JSON array, if present. */
 export function extractIntegrationTests(response: string): TestSpec[] | null {
   return extractFencedTests(response, "integration-tests");
+}
+
+/**
+ * Phase C2 — wrapper-kill for tests. Extract raw file content from a
+ * ```unit-test-file or ```integration-test-file fence. The model owns
+ * the entire test file: imports, ctx wiring, describe/it, assertions.
+ * Returns null when the fence is absent; empty string when present but
+ * blank (caller decides how to treat).
+ */
+function extractFencedTestFile(
+  response: string,
+  tag: string,
+): string | null {
+  const re = new RegExp(
+    "```" + escapeRegex(tag) + "(?::[^\\s]*)?[^\\S\\n]*\\r?\\n([\\s\\S]*?)```",
+  );
+  const m = response.match(re);
+  if (!m) return null;
+  return m[1].replace(/\r\n/g, "\n");
+}
+
+export function extractUnitTestFile(response: string): string | null {
+  return extractFencedTestFile(response, "unit-test-file");
+}
+
+export function extractIntegrationTestFile(response: string): string | null {
+  return extractFencedTestFile(response, "integration-test-file");
+}
+
+/**
+ * Phase G — asset revision. Extract every `file:<path>` fenced block
+ * from the response. The implementer can revise any asset (package.json,
+ * tsconfig.json, custom configs, seed data) by emitting:
+ *
+ *   ```file:package.json
+ *   { …updated contents… }
+ *   ```
+ *
+ * Returns a `{ path → content }` map (may be empty). Content preserves
+ * internal whitespace; trailing newline before the closing fence is
+ * stripped so the round-trip matches what the model typed.
+ */
+export function extractFileAssets(response: string): Map<string, string> {
+  const out = new Map<string, string>();
+  const re =
+    /```file:([^\s`]+)[^\S\n]*\r?\n([\s\S]*?)```/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(response)) !== null) {
+    const path = m[1].trim();
+    if (!path) continue;
+    const content = m[2].replace(/\r\n/g, "\n").replace(/\n$/, "");
+    out.set(path, content);
+  }
+  return out;
 }
 
 /**
@@ -888,9 +933,13 @@ export function createDesignDispatchBridge(
       // Prime the first prompt with external feedback if the caller
       // supplied it (integration-loop failure context). Formatted like
       // a reviewer critique so the Implementer reads it as actionable.
-      let pendingExternalFeedback: string | null = externalFeedback
-        ? `[integration-loop feedback]\n${externalFeedback}`
-        : null;
+      // `externalFeedback` arrives already tagged by its source —
+      // integration-loop passes a `[integration-loop feedback] ...`
+      // prefix; reflect passes `[reflect: retry|rewrite-tests|...]`;
+      // parent revision requests pass `[parent <name> requests
+      // revision]`. We don't wrap further — the caller's tag is
+      // more informative than a fixed "integration-loop" label.
+      let pendingExternalFeedback: string | null = externalFeedback ?? null;
       let lastAllTestsFailed = false;
       // Prior architect review feedback, carried forward to subsequent
       // review cycles so the reviewer can see what it said last time
@@ -943,21 +992,18 @@ export function createDesignDispatchBridge(
         lastGreenBody = { body: fn.implementation, output: "" };
       }
       if (fn.implementation !== null && externalFeedback === null) {
-        const preAnalysis = await analyzeBody(fn.implementation);
         const preKnownNames = new Set(
           graph.listFunctions().map((f) => f.name),
         );
-        // Recomposition (parent must reach every child via ctx.fns
-        // call chain) is NOT enforced here — orphaned children get
-        // picked up in a later cleanup/tightening pass. Dropping the
-        // check lets tree-shaped compositions through (parent calls
-        // one child that composes the others) without rejection.
-        const preViolations = await collectBodyViolations(
-          preAnalysis,
-          preKnownNames,
-          [],
-          graph,
-        );
+        // Phase N4 — natural-mode structural check. Catches hallucinated
+        // relative imports (the "./types.js" class of failure) without
+        // enforcing ctx.fns conventions. Recomposition (parent must
+        // reach every child) is NOT enforced here — orphans are handled
+        // by a later cleanup pass.
+        const preViolations = await collectNaturalViolations({
+          source: fn.implementation,
+          knownSiblings: preKnownNames,
+        });
         if (preViolations.length > 0) {
           debug(
             "dispatch",
@@ -1024,7 +1070,7 @@ export function createDesignDispatchBridge(
             graph.setTestStatus(module, name, "tests-green", pre.output);
             // Reconcile spec.dependencies from the pre-existing body's
             // observed calls. Same contract as the regenerate path.
-            reconcileSpecDependencies(graph, module, name, preAnalysis);
+            await ingestBodyEdges(graph, module, name, fn.implementation);
             return {
               module,
               name,
@@ -1186,20 +1232,50 @@ export function createDesignDispatchBridge(
           `body extracted ${key} len=${body.length}ch hash=${bodyTag}`,
         );
 
+        // Phase 5 (wrapper-kill): validate the emitted file against
+        // the architect's declared signature BEFORE running tests.
+        // Catches drift cheaply — wrong default-export name, wrong
+        // param count/types, missing ctx:Ctx, async mismatch — and
+        // feeds the specific mismatch back to the implementer.
+        //
+        // Skip validation when the response doesn't LOOK like a full
+        // file (no `export default`). Legacy body-only shape still
+        // flows through body-analyzer + test run. Once the implementer
+        // prompt fully migrates models to emit full files, this
+        // fallback becomes dead and can be dropped.
+        if (/\bexport\s+default\b/.test(body)) {
+          const sigCheck = await validateFunctionFile(body, {
+            name,
+            signature: fn.signature,
+          });
+          if (!sigCheck.ok) {
+            lastError = `signature validation rejected: ${sigCheck.reason}`;
+            previousBody = body;
+            pendingAnalyzerFeedback = `Your emitted file doesn't honor the declared contract: ${sigCheck.reason}`;
+            testOutput = ""; // tests were NOT run
+            debug(
+              "dispatch",
+              `signature drift REJECTED ${key}: ${sigCheck.reason}`,
+            );
+            debug(
+              "progress",
+              `dispatch: ${key} signature drift — ${sigCheck.reason.slice(0, 100)}`,
+            );
+            continue;
+          }
+        }
+
         // Static analysis: run tree-sitter over the body BEFORE the
-        // test run. Catches proc-ts violations (top-level imports, calls
-        // to undeclared siblings) mechanically — cheaper than tests and
-        // more deterministic than architect review.
-        const analysis = await analyzeBody(body);
+        // test run. Phase N4: catches hallucinated relative imports
+        // (things like "./types.js" that don't exist in the graph).
+        // Deterministic and cheaper than a test run.
         const knownNames = new Set(
           graph.listFunctions().map((f) => f.name),
         );
-        const violations = await collectBodyViolations(
-          analysis,
-          knownNames,
-          [],
-          graph,
-        );
+        const violations = await collectNaturalViolations({
+          source: body,
+          knownSiblings: knownNames,
+        });
         if (violations.length > 0) {
           lastError = `body-analyzer rejected: ${violations.length} violation(s)`;
           previousBody = body;
@@ -1220,6 +1296,35 @@ export function createDesignDispatchBridge(
         // ```unit-tests and/or ```integration-tests JSON arrays.
         // Same-name entries overwrite; new names append. Siblings'
         // tests and project-level tests are out of scope.
+        //
+        // Phase C2 wrapper-kill: preferred form is a ```unit-test-file
+        // (or ```integration-test-file) fence holding the complete TS
+        // source of the test file. When present, it trumps the JSON
+        // patch path — the harness writes that content verbatim.
+        const unitFile = extractUnitTestFile(response);
+        const integrationFile = extractIntegrationTestFile(response);
+        // Phase G — any `file:<path>` fences revise the asset map.
+        // Applied unconditionally: the model owns every project asset
+        // (package.json, tsconfig.json, custom configs). Protected
+        // paths — function source files, ctx scaffolding — would
+        // collide with generated output; silently ignore those.
+        const assetRevs = extractFileAssets(response);
+        const PROTECTED_ASSETS =
+          /^(?:ctx\.ts|ctx_fns\.d\.ts|[A-Za-z_$][A-Za-z0-9_$]*\.(?:ts|test\.ts|integration\.test\.ts)|project\.integration\.test\.ts)$/;
+        for (const [p, content] of assetRevs) {
+          if (PROTECTED_ASSETS.test(p)) {
+            debug(
+              "dispatch",
+              `file:${p} IGNORED — path is generated by the harness, emit it via the function/test-file fences instead`,
+            );
+            continue;
+          }
+          graph.setAsset(p, content);
+          debug(
+            "dispatch",
+            `file:${p} asset updated (${content.length} chars)`,
+          );
+        }
         const unitPatch = extractUnitTests(response);
         const integrationPatch = extractIntegrationTests(response);
         // Legacy ```tests fence still accepted as a unit-test patch
@@ -1228,6 +1333,53 @@ export function createDesignDispatchBridge(
           unitPatch === null ? extractTestPatch(response) : null;
         const current = graph.getFunction(module, name);
         if (current) {
+          // If the response emits a legacy JSON unit-tests / integration-
+          // tests patch without the wrapper-kill file form, clear any
+          // previously stored file so the graph doesn't keep a stale
+          // verbatim copy that would silently win at materialize time.
+          if (unitFile === null && unitPatch !== null && current.unitTestFile !== null) {
+            graph.setUnitTestFile(module, name, null);
+            debug(
+              "dispatch",
+              `cleared stored unit-test-file for ${key} (legacy JSON patch superseded it)`,
+            );
+          }
+          if (
+            integrationFile === null &&
+            integrationPatch !== null &&
+            current.integrationTestFile !== null
+          ) {
+            graph.setIntegrationTestFile(module, name, null);
+            debug(
+              "dispatch",
+              `cleared stored integration-test-file for ${key} (legacy JSON patch superseded it)`,
+            );
+          }
+          if (unitFile !== null) {
+            graph.setUnitTestFile(module, name, unitFile);
+            debug(
+              "dispatch",
+              `unit-test-file applied to ${key}: ${unitFile.length} chars`,
+            );
+            debug(
+              "progress",
+              `dispatch: ${key} unit-test-file (${unitFile.length} chars)`,
+            );
+          }
+          if (integrationFile !== null) {
+            if (current.children.length === 0 && integrationFile.length > 0) {
+              debug(
+                "dispatch",
+                `integration-test-file IGNORED for leaf ${key} — leaves don't render integration files`,
+              );
+            } else {
+              graph.setIntegrationTestFile(module, name, integrationFile);
+              debug(
+                "dispatch",
+                `integration-test-file applied to ${key}: ${integrationFile.length} chars`,
+              );
+            }
+          }
           const appliedUnit = unitPatch ?? legacyPatch;
           if (appliedUnit !== null) {
             const next = replaceTestSet(current.tests, appliedUnit);
@@ -1270,13 +1422,17 @@ export function createDesignDispatchBridge(
         }
 
         // No tests to run yet — the Implementer must emit at least one
-        // unit test before we can evaluate the body. Treat as a retry
-        // with explicit feedback.
+        // unit test before we can evaluate the body. A ```unit-test-file
+        // fence (Phase C2) counts too: the file is opaque to us, but the
+        // runner will find its `it(...)` blocks.
+        const fnAfterPatch = graph.getFunction(module, name);
         const hasAnyTests =
-          (graph.getFunction(module, name)?.tests.length ?? 0) > 0;
+          (fnAfterPatch?.tests.length ?? 0) > 0 ||
+          (fnAfterPatch?.unitTestFile !== null &&
+            (fnAfterPatch?.unitTestFile ?? "").length > 0);
         if (!hasAnyTests) {
           lastError =
-            "no tests declared for this function — emit a ```unit-tests fence with at least one test";
+            "no tests declared for this function — emit a ```unit-test-file fence with the full test file (or a ```unit-tests JSON array)";
           previousBody = body;
           testOutput = lastError;
           debug("dispatch", `no tests extracted ${key}; retrying`);
@@ -1288,6 +1444,25 @@ export function createDesignDispatchBridge(
         // `stack-trace` handler can surface them on the next attempt
         // if the Implementer asks.
         lastFullFailureMessages = tr.fullFailureMessages;
+        // On load failure (0/0 with hasTests), append the RENDERED
+        // test file so the implementer can see what the harness
+        // actually materialized — they write tests as JSON
+        // `{name, code}`, the harness wraps each into `it(name, ...)`,
+        // so a `}` imbalance or `it(...)` inside their code produces
+        // a syntax error in the wrapped form they can't otherwise
+        // see. Run 14 showed the implementer looping on identical
+        // bodies because the feedback never showed the rendered file.
+        if (!tr.ok && tr.failed === 0 && tr.passed === 0) {
+          const rendered = graph.materialize({ module, name, body });
+          const testFile = rendered[`${name}.test.ts`];
+          if (testFile) {
+            const excerpt = testFile.length > 1800
+              ? testFile.slice(0, 1800) + "\n...[truncated]..."
+              : testFile;
+            tr.output =
+              `${tr.output}\n----- rendered test file (${name}.test.ts) -----\n${excerpt}`;
+          }
+        }
         // Stagnation detection: if this attempt's body is within 5% of
         // the previous attempt's length AND the failure count matches,
         // the Implementer is spinning on cosmetic tweaks. Flag the
@@ -1320,10 +1495,19 @@ export function createDesignDispatchBridge(
         // true stagnation ("same tests keep failing") shows up as an
         // UNCHANGED set. Falls back to count-based signature when
         // runner doesn't supply names (test fixtures).
-        if (!tr.ok && tr.failed > 0) {
+        // Red run OR test-file-load failure (passed=0 failed=0 ok=false).
+        // The load-failure case previously fell through and the loop
+        // churned all maxAttempts without recognizing stagnation —
+        // run 13 showed this burning cycles on identical ESM-spy
+        // errors. Include both cases so stagnation detects either
+        // "same tests keep failing" or "same load error keeps
+        // happening."
+        const loadFailed = !tr.ok && tr.failed === 0 && tr.passed === 0;
+        if (!tr.ok && (tr.failed > 0 || loadFailed)) {
           const names = tr.failingTestNames;
-          const sig =
-            names && names.length > 0
+          const sig = loadFailed
+            ? `load-fail|${(tr.output ?? "").slice(0, 300)}`
+            : names && names.length > 0
               ? `names:${names.join("||")}`
               : `counts:${tr.failed}/${tr.passed}|${(tr.output ?? "").slice(0, 300)}`;
           if (sig === lastFailureSignature) {
@@ -1411,6 +1595,21 @@ export function createDesignDispatchBridge(
             `test ${key} FAILING: ${names}${digestLine ? ` | first: ${digestLine}` : ""}`,
           );
         }
+        // Parallel diagnostic for LOAD failures (0/0 ok=false) —
+        // dumps the first lines of the output so we can see the real
+        // error post-mortem instead of only in the retry prompt.
+        // Without this, stagnation on test-load failures is opaque.
+        if (!tr.ok && tr.failed === 0 && tr.passed === 0) {
+          const head = (tr.output ?? "")
+            .split("\n")
+            .slice(0, 12)
+            .map((l) => l.slice(0, 200))
+            .join(" | ");
+          debug(
+            "dispatch",
+            `test ${key} LOAD-FAILED (0/0): ${head || "(no output)"}`,
+          );
+        }
 
         if (tr.ok) {
           // Remember this green body BEFORE review — on exhaustion
@@ -1496,10 +1695,10 @@ export function createDesignDispatchBridge(
           }
           graph.setImplementation(module, name, body);
           graph.setTestStatus(module, name, "tests-green", tr.output);
-          // Reconcile the LLM's phase-2 dependency guess with the body
-          // we just saved. The `analysis` variable captured the call
-          // sites of THIS body before the test run.
-          reconcileSpecDependencies(graph, module, name, analysis);
+          // Phase N4 — snapshot the body's analyzed edges into the
+          // graph and reconcile spec.dependencies against what the
+          // implementation actually imports + calls.
+          await ingestBodyEdges(graph, module, name, body);
           debug("dispatch", `saved ${key} (green after ${attempt + 1} attempts)`);
           debug(
             "progress",

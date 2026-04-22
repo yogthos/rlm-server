@@ -1,0 +1,6 @@
+{
+  "name": "parse-url",
+  "description": "Single pure function with non-trivial edge cases — exercises spec→test coverage. No ctx.fns calls, no decomposition. Lets us diff implementer quality across prompt revisions without app-level noise.",
+  "stage": "implementer",
+  "expectedOutcome": "green"
+}

@@ -43,12 +43,12 @@ describe("buildImplementerPrompt", () => {
     expect(p).toMatch(/Implementer of `connect`/);
   });
 
-  it("renders the proc-ts signature with ctx: Ctx injected", async () => {
+  it("renders a natural signature — no ctx injection (Phase N3)", async () => {
     const g = seedGraph();
     const p = await buildImplementerPrompt(g, "src/db.ts", "connect");
-    expect(p).toContain(
-      "function connect(ctx: Ctx, path: string): Database",
-    );
+    expect(p).toContain("function connect(path: string): Database");
+    expect(p).not.toContain("ctx: Ctx");
+    expect(p).not.toContain("ctx.fns");
   });
 
   it("includes the description when present", async () => {
@@ -57,16 +57,15 @@ describe("buildImplementerPrompt", () => {
     expect(p).toContain("Open a SQLite database at the given path.");
   });
 
-  it("lists other project functions as ctx.fns entries without descriptions", async () => {
+  it("lists other project functions as importable modules (Phase N3)", async () => {
     const g = seedGraph();
     const p = await buildImplementerPrompt(g, "src/db.ts", "connect");
-    // The new format surfaces the call shape directly so the Implementer
-    // knows HOW to invoke each sibling.
-    expect(p).toContain("ctx.fns.createSchema(ctx, db: Database): void");
-    expect(p).not.toContain("throw new Error");
-    // Sibling descriptions are dropped — keep the prompt focused on
-    // the target. The target's own description is still shown.
-    expect(p).not.toContain("Install the guestbook schema");
+    // Natural mode: siblings are imported directly by file. The prompt
+    // shows both the import specifier and the plain call shape so the
+    // model knows HOW to use each function.
+    expect(p).toContain('import createSchema from "./createSchema.js"');
+    expect(p).toContain("createSchema(db: Database): void");
+    expect(p).not.toContain("ctx.fns");
   });
 
   it("embeds the tests the function must pass", async () => {
@@ -76,10 +75,13 @@ describe("buildImplementerPrompt", () => {
     expect(p).toContain("connect(");
   });
 
-  it("tells the implementer to call siblings via ctx.fns", async () => {
+  it("tells the implementer to import siblings directly (Phase N3)", async () => {
     const g = seedGraph();
     const p = await buildImplementerPrompt(g, "src/db.ts", "connect");
-    expect(p).toContain("ctx.fns");
+    // Natural TypeScript: import siblings by file, call them as normal
+    // functions. No ctx, no framework wrapper.
+    expect(p).toMatch(/import\s+\w+\s+from\s+"\.\/\w+\.js"/);
+    expect(p).not.toContain("ctx.fns");
   });
 
   it("defaults to vitest guidance when no projectConfig is set", async () => {
@@ -90,16 +92,23 @@ describe("buildImplementerPrompt", () => {
     expect(p).toMatch(/jest/); // must flag the jest trap
   });
 
-  it("switches to jest guidance when projectConfig.testFramework is jest", async () => {
+  it("echoes the architect's testFramework + testImports from the decisions block", async () => {
+    // Phase C: framework-specific guidance comes from the architect's
+    // phase-0 decisions (testImports, testingNotes), not harness
+    // hardcoding. The prompt surfaces both verbatim.
     const g = seedGraph();
     g.setProjectConfig({
-      packageJson:
-        '{"name":"x","devDependencies":{"jest":"^29.0.0","@jest/globals":"^29.0.0"}}',
+      packageJson: '{"name":"x","devDependencies":{"jest":"^29.0.0"}}',
       testFramework: "jest",
+      runtime: "node",
+      testCommand: "npx jest --reporters=jest-tap-reporter",
+      testImports: `import { describe, it, expect, jest } from "@jest/globals";`,
+      moduleSystem: "cjs",
     });
     const p = await buildImplementerPrompt(g, "src/db.ts", "connect");
-    expect(p).toMatch(/jest/);
-    expect(p).toMatch(/jest\.(fn|spyOn|mock)/);
+    expect(p).toContain("testFramework:   jest");
+    expect(p).toContain("@jest/globals");
+    expect(p).toContain("testCommand:");
   });
 
   it("tells the implementer NOT to call test_run or design_implement", async () => {
@@ -112,33 +121,40 @@ describe("buildImplementerPrompt", () => {
   it("does not include the target function in the sibling list", async () => {
     const g = seedGraph();
     const p = await buildImplementerPrompt(g, "src/db.ts", "connect");
-    const siblingSection = p.split(/Other functions/i)[1] ?? "";
-    expect(siblingSection).not.toMatch(/connect\(ctx: Ctx,/);
+    // Narrow to the sibling-list section only (before the CONTRACT block).
+    const siblingSection = p
+      .split(/Available sibling functions/i)[1]
+      ?.split(/CONTRACT \(mandatory\)/i)[0] ?? "";
+    expect(siblingSection).not.toMatch(/import\s+connect\s+from/);
   });
 
-  it("handles functions with no user params — ctx: Ctx only", async () => {
+  it("handles functions with no params naturally (Phase N3)", async () => {
     const g = createDesignGraph();
     g.addFunction("src/a.ts", "foo", { params: [], returnType: "void" });
     const p = await buildImplementerPrompt(g, "src/a.ts", "foo");
-    expect(p).toContain("function foo(ctx: Ctx): void");
+    expect(p).toContain("function foo(): void");
+    // No framework-provided ctx anywhere in generated signatures or calls.
+    expect(p).not.toContain("ctx:");
+    expect(p).not.toContain("ctx.fns");
+    expect(p).not.toContain("ctx.state");
+    expect(p).not.toMatch(/foo\(ctx[,)]/);
   });
 
-  it("asks the Implementer to emit unit-tests when none exist yet", async () => {
+  it("asks the Implementer to emit a unit-test-file when none exists yet", async () => {
     const g = createDesignGraph();
     g.addFunction("src/a.ts", "foo", { params: [], returnType: "void" });
     const p = await buildImplementerPrompt(g, "src/a.ts", "foo");
-    expect(p).toContain("```unit-tests");
+    // Phase C2 wrapper-kill: the model owns the entire test file.
+    expect(p).toContain("```unit-test-file");
   });
 
-  it("tells leaves (no children) that integration tests must be an empty array", async () => {
+  it("tells leaves (no children) to OMIT the integration-test-file", async () => {
     const g = createDesignGraph();
     g.addFunction("src/a.ts", "foo", { params: [], returnType: "void" });
     const p = await buildImplementerPrompt(g, "src/a.ts", "foo");
-    // Leaves don't assemble anything — their integration fence must be `[]`.
-    // Storing leaf integration tests is a lie: renderIntegrationTestFile
-    // drops them for children-less functions.
-    expect(p).toMatch(/integration-tests[\s\S]{0,120}empty/i);
-    expect(p).not.toMatch(/OPTIONAL for leaves/);
+    // Leaves don't assemble anything — no integration file is rendered
+    // for them, so the prompt tells the implementer to omit the fence.
+    expect(p).toMatch(/integration-test-file[\s\S]{0,120}OMIT/i);
   });
 
   it("tells branches (with children) that integration tests are REQUIRED", async () => {
@@ -153,6 +169,85 @@ describe("buildImplementerPrompt", () => {
     );
     const p = await buildImplementerPrompt(g, "src/a.ts", "parent");
     expect(p).toContain("REQUIRED");
+  });
+
+  it("prompt requires a COMPLETE file, not body-only (Phase 4 wrapper-kill)", async () => {
+    // Lock-in: since the wrapper kill, implementer emits the full
+    // file including imports + signature + body. The prompt must not
+    // regress to body-only phrasing.
+    const g = seedGraph();
+    const p = await buildImplementerPrompt(g, "src/db.ts", "connect");
+    expect(p).toContain("COMPLETE function file");
+    expect(p).toContain("imports + default-exported");
+    expect(p).not.toMatch(/body statements only/i);
+    expect(p).not.toMatch(/no signature|no.*function.*declaration/i);
+  });
+
+  it("prompt requires top-level imports for external namespaces (Phase N3 — natural)", async () => {
+    const g = seedGraph();
+    const p = await buildImplementerPrompt(g, "src/db.ts", "connect");
+    expect(p).toMatch(/`import` statements are REQUIRED/);
+    expect(p).toMatch(/TS2503|Cannot find namespace/);
+    // Natural mode: sibling imports are ENCOURAGED, not banned.
+    expect(p).not.toMatch(/Do NOT import siblings/);
+  });
+
+  it("prompt surfaces the full decisions block including testingNotes", async () => {
+    // Phase C: all project decisions (runtime, framework, commands,
+    // notes, strategy) are injected verbatim so the implementer speaks
+    // the architect's committed stack.
+    const g = seedGraph();
+    g.setProjectConfig({
+      packageJson: '{"name":"t","type":"module","devDependencies":{"vitest":"^2.0.0"}}',
+      testFramework: "vitest",
+      runtime: "node",
+      testCommand: "npx vitest run --reporter=tap",
+      testImports: `import { describe, it, expect, vi } from "vitest";`,
+      moduleSystem: "esm",
+      testingNotes:
+        "- vi.spyOn fails on ESM imports — use vi.mock('node:fs', () => ({...}))",
+    });
+    const p = await buildImplementerPrompt(g, "src/db.ts", "connect");
+    expect(p).toContain("Project decisions");
+    expect(p).toContain("runtime:         node");
+    expect(p).toContain("testFramework:   vitest");
+    expect(p).toContain("testingNotes:");
+    expect(p).toContain("vi.mock");
+  });
+
+  it("prompt has NO decisions block when no projectConfig is set", async () => {
+    const g = seedGraph();
+    const p = await buildImplementerPrompt(g, "src/db.ts", "connect");
+    expect(p).not.toContain("Project decisions");
+  });
+
+  it("prompt states the declared signature as contract (Phase N3 — natural)", async () => {
+    const g = seedGraph();
+    const p = await buildImplementerPrompt(g, "src/db.ts", "connect");
+    expect(p).toContain("connect");
+    expect(p).toContain("path: string");
+    expect(p).toContain("Database");
+    expect(p).not.toContain("ctx: Ctx");
+    expect(p).toMatch(/harness parses[\s\S]*rejects drift/);
+  });
+
+  it("parent prompt emphasizes composition over re-authoring (E2)", async () => {
+    // Parent is told that children are authoritative — revise the
+    // parent's hypothesis to match the children's actual shapes, not
+    // the other way around. Lock-in test for Phase E prompt change.
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "parent", { params: [], returnType: "void" });
+    g.addFunctionChild(
+      "parent",
+      "src/a.ts",
+      "child",
+      { params: [], returnType: "void" },
+      "child",
+    );
+    const p = await buildImplementerPrompt(g, "src/a.ts", "parent");
+    expect(p).toMatch(/WORKING, TESTED unit/);
+    expect(p).toMatch(/REVISE YOUR HYPOTHESIS/);
+    expect(p).toMatch(/AUTHORITATIVE/);
   });
 
   it("adds a 're-read spec' hint when ALL tests failed on the previous attempt", async () => {
@@ -253,8 +348,6 @@ describe("buildImplementerPrompt", () => {
       isAsync: true,
     });
     const p = await buildImplementerPrompt(g, "src/a.ts", "load");
-    expect(p).toContain(
-      "async function load(ctx: Ctx): Promise<string>",
-    );
+    expect(p).toContain("async function load(): Promise<string>");
   });
 });

@@ -42,6 +42,17 @@ export type DecomposeCallback = (
   fnName: string,
 ) => Promise<boolean>;
 
+/** Reflect callback — called on stagnation to choose a recovery
+ *  action. When absent, leaf-up falls back to the old behavior (decompose
+ *  if provided, otherwise block). See `design-reflect.ts` for the
+ *  decision types. */
+export type ReflectCallback = (
+  graph: DesignGraph,
+  module: string,
+  name: string,
+  failureContext: { testOutput: string; attempts: number },
+) => Promise<import("./design-reflect.js").ReflectDecision>;
+
 export interface LeafUpBuildOptions {
   dispatch: DispatchFn;
   projectDir?: string;
@@ -50,6 +61,12 @@ export interface LeafUpBuildOptions {
    *  function gets decomposed into children before retrying. If
    *  omitted, stagnation falls through to blocked. */
   decompose?: DecomposeCallback;
+  /** Stagnation recovery (supersedes `decompose` when both are set).
+   *  Given the failure context, the architect chooses retry /
+   *  rewrite-tests / decompose / give-up. retry + rewrite-tests
+   *  re-queue the function with a hint; decompose delegates to the
+   *  `decompose` callback; give-up marks blocked. */
+  reflect?: ReflectCallback;
   /** Max concurrent dispatches per batch. Functions at the same
    *  dependency level (or below) are inherently independent — their
    *  specs don't reference each other — so it's safe to run them in
@@ -177,6 +194,14 @@ export async function designLeafUpBuild(
   // A function that stagnates AGAIN after being decomposed gets
   // blocked instead of looping through another no-op re-plan.
   const decomposedOnce = new Set<string>();
+  // Names already put through the reflect step. One reflect per
+  // function: if the recovery decision itself stagnates, we block
+  // rather than reflect again (which would just loop).
+  const reflectedOnce = new Set<string>();
+  // Pending reflection hints — when reflect chose retry or
+  // rewrite-tests, we surface its advice as the next dispatch's
+  // externalFeedback so the implementer sees what to do differently.
+  const pendingHints = new Map<string, string>();
   // Specless functions can't be dispatched.
   for (const f of graph.listFunctions()) {
     if (f.spec === null) blocked.add(f.name);
@@ -253,8 +278,11 @@ export async function designLeafUpBuild(
     const results = await Promise.all(
       batch.map(async (p) => {
         try {
+          const hint = pendingHints.get(p.name);
+          if (hint !== undefined) pendingHints.delete(p.name);
           const r = await options.dispatch(graph, p.module, p.name, {
             projectDir: options.projectDir,
+            feedback: hint,
           });
           return { pick: p, result: r, error: null as unknown };
         } catch (e) {
@@ -282,24 +310,120 @@ export async function designLeafUpBuild(
         green.add(name);
         continue;
       }
-      if (result.status === "stagnated" && options.decompose) {
-        if (decomposedOnce.has(name)) {
+      if (result.status === "stagnated") {
+        // Second stagnation AFTER a prior decompose or reflect round
+        // is always blocked — no second-chance recovery.
+        if (decomposedOnce.has(name) || reflectedOnce.has(name)) {
           debug(
             "leaf-up-build",
-            `${name} STAGNATED AGAIN after prior decompose — blocking`,
+            `${name} STAGNATED AGAIN after prior recovery — blocking`,
           );
+          blocked.add(name);
+          continue;
+        }
+
+        // When a reflect callback is provided, it drives the choice.
+        // Otherwise fall through to the old decompose-if-provided path.
+        if (options.reflect) {
+          let decision: Awaited<ReturnType<ReflectCallback>>;
+          try {
+            decision = await options.reflect(graph, module, name, {
+              testOutput: result.testOutput ?? "",
+              attempts: result.attempts,
+            });
+          } catch (e) {
+            debug(
+              "leaf-up-build",
+              `${name} reflect threw: ${e instanceof Error ? e.message : String(e)} — blocking`,
+            );
+            blocked.add(name);
+            continue;
+          }
+          reflectedOnce.add(name);
+          debug(
+            "leaf-up-build",
+            `${name} reflect → ${decision.kind}: ${decision.rationale.slice(0, 100)}`,
+          );
+          if (decision.kind === "retry" || decision.kind === "rewrite-tests") {
+            // Re-queue with the hint surfaced as next-attempt feedback.
+            // Don't add to green/blocked; the outer loop picks the
+            // function up again on its next pass.
+            const hintPrefix =
+              decision.kind === "rewrite-tests"
+                ? "[reflect: rewrite tests] "
+                : "[reflect: retry with new hypothesis] ";
+            pendingHints.set(name, hintPrefix + decision.hint);
+            continue;
+          }
+          if (decision.kind === "revise-child") {
+            // E1: the parent can't compose its children as-is. Un-green
+            // the named child, stash the parent's hint for the child's
+            // next dispatch, and leave the parent un-green (it'll wait
+            // for the child to re-green before re-dispatching). If the
+            // named child doesn't exist or isn't actually a child of
+            // this function, block — avoids "phantom revise-child"
+            // infinite loops.
+            const child = graph.listChildren(name).find(
+              (c) => c.name === decision.childName,
+            );
+            if (!child) {
+              debug(
+                "leaf-up-build",
+                `${name} reflect revise-child "${decision.childName}" — no such child; blocking parent`,
+              );
+              blocked.add(name);
+              continue;
+            }
+            if (!green.has(decision.childName)) {
+              debug(
+                "leaf-up-build",
+                `${name} reflect revise-child "${decision.childName}" — child not green; odd state, blocking`,
+              );
+              blocked.add(name);
+              continue;
+            }
+            green.delete(decision.childName);
+            pendingHints.set(
+              decision.childName,
+              `[parent ${name} requests revision] ${decision.hint}`,
+            );
+            debug(
+              "leaf-up-build",
+              `${name} reflect revise-child ${decision.childName} — un-greened, hinted`,
+            );
+            continue;
+          }
+          if (decision.kind === "give-up") {
+            blocked.add(name);
+            continue;
+          }
+          // decision.kind === "decompose" — fall through to the
+          // decompose path below.
+          if (!options.decompose) {
+            debug(
+              "leaf-up-build",
+              `${name} reflect chose decompose but no decompose callback — blocking`,
+            );
+            blocked.add(name);
+            continue;
+          }
+        } else if (!options.decompose) {
           blocked.add(name);
           continue;
         }
         debug(
           "leaf-up-build",
-          `${name} STAGNATED — clearing body + decomposing`,
+          `${name} STAGNATED — attempting decompose`,
         );
+        // Body-clear is deferred until AFTER decompose confirms
+        // children were added. If decompose refuses (returns false or
+        // adds no children), the last stagnation attempt's body stays
+        // in the graph — reflect/finalize downstream can still see
+        // what was tried.
         const childrenBefore = graph.listChildren(name).length;
-        graph.clearImplementation(module, name);
         let ok: boolean;
         try {
-          ok = await options.decompose(graph, name);
+          ok = await options.decompose!(graph, name);
         } catch (e) {
           debug(
             "leaf-up-build",
@@ -312,11 +436,16 @@ export async function designLeafUpBuild(
         if (!ok || childrenAfter <= childrenBefore) {
           debug(
             "leaf-up-build",
-            `${name} decompose failed (ok=${ok}, children ${childrenBefore}→${childrenAfter}) — blocking`,
+            `${name} decompose refused/failed (ok=${ok}, children ${childrenBefore}→${childrenAfter}) — body preserved, blocking`,
           );
           blocked.add(name);
           continue;
         }
+        // Children added — the parent's prior body was written against
+        // NO children; it's stale now. Clear it so the re-dispatch
+        // (after children green) authors fresh glue against the new
+        // decomposition.
+        graph.clearImplementation(module, name);
         decomposedOnce.add(name);
         decomposed.push(name);
         continue;

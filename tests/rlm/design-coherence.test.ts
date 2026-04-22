@@ -38,16 +38,21 @@ describe("designCoherence — structure checks (Round 17)", () => {
     expect(phantom[0].detail).toContain("ghost");
   });
 
-  it("flags orphans — decomposition child that no one depends on", async () => {
+  it("does NOT flag decomposition children as orphans — parent link is the wiring", async () => {
+    // A child with `parent !== null` is wired into the build via the
+    // decomposition tree; the implementer prompt lists `fn.children`
+    // directly, so the child is reachable without anyone listing it in
+    // spec.dependencies. Flagging here triggered the phase-3 orphan-heal
+    // path that produced 24 cycle-revert false-positives in run 9.
     const g = createDesignGraph();
     g.addFunction("src/a.ts", "parent", sig());
     g.setSpec("src/a.ts", "parent", spec());
     g.addFunctionChild("parent", "src/a.ts", "childA", sig());
     g.setSpec("src/a.ts", "childA", spec());
     const report = await designCoherence(g);
-    expect(report.ok).toBe(false);
-    const orphans = report.violations.filter((v) => v.kind === "orphan");
-    expect(orphans.map((v) => v.name)).toContain("childA");
+    // Orphan detection was removed entirely — childA must not appear
+    // under any violation kind.
+    expect(report.violations.map((v) => v.name)).not.toContain("childA");
   });
 
   it("flags dependency cycles", async () => {
@@ -63,15 +68,14 @@ describe("designCoherence — structure checks (Round 17)", () => {
     expect(cycles[0].detail).toMatch(/a.*b|b.*a/);
   });
 
-  it("does NOT flag roots (parent=null) as orphans — they're legit entry points", async () => {
+  it("does NOT flag roots (parent=null) — they're legit entry points", async () => {
     const g = createDesignGraph();
     g.addFunction("src/a.ts", "rootA", sig());
     g.setSpec("src/a.ts", "rootA", spec());
     g.addFunction("src/a.ts", "rootB", sig());
     g.setSpec("src/a.ts", "rootB", spec());
     const report = await designCoherence(g);
-    const orphans = report.violations.filter((v) => v.kind === "orphan");
-    expect(orphans).toEqual([]);
+    expect(report.violations).toEqual([]);
   });
 
   it("ignores functions without specs (early-pipeline callers)", async () => {
@@ -79,10 +83,7 @@ describe("designCoherence — structure checks (Round 17)", () => {
     g.addFunction("src/a.ts", "stub", sig());
     // No setSpec — treat as unknown, no violations raised.
     const report = await designCoherence(g);
-    expect(report).toBeDefined();
-    // A specless leaf can still be a root → no orphan violation.
-    const orphans = report.violations.filter((v) => v.kind === "orphan");
-    expect(orphans).toEqual([]);
+    expect(report.violations).toEqual([]);
   });
 
   it("self-cycle produces a cycle violation", async () => {

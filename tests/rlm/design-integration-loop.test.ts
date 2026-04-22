@@ -97,7 +97,11 @@ describe("runIntegrationLoop", () => {
     expect(report.iterations).toBe(2);
   });
 
-  it("bounds by maxIterations when failures never resolve", async () => {
+  it("bails early when the same failure repeats after a fix attempt (no-progress guard)", async () => {
+    // The no-progress guard bails at iter 2 when the failure set is
+    // identical to iter 1 AND iter 1 attempted a fix. This is tighter
+    // than just maxIterations — we stop burning cycles on a stuck
+    // fix-dispatch.
     const g = seed();
     let dispatches = 0;
     const report = await runIntegrationLoop(g, {
@@ -124,11 +128,50 @@ describe("runIntegrationLoop", () => {
         };
       },
       chat: async () => "unused",
+      maxIterations: 5,
+    });
+    expect(report.ok).toBe(false);
+    // Iter 1 dispatches; iter 2 sees identical failures after fix → bail.
+    expect(report.iterations).toBe(2);
+    expect(dispatches).toBe(1);
+    expect(report.error).toMatch(/no-progress|environmental/i);
+  });
+
+  it("maxIterations still bounds runs when failures CHANGE each iter", async () => {
+    // When the failure set shifts each iteration, no-progress guard
+    // doesn't fire — maxIterations is the final safety net.
+    const g = seed();
+    let runCount = 0;
+    const report = await runIntegrationLoop(g, {
+      runner: async () => {
+        runCount++;
+        // Unique failure each run so signature never matches.
+        return {
+          ok: false,
+          failures: [
+            {
+              testName: `t-${runCount}`,
+              stackTrace: "at handleRequest (/tmp/proj/handleRequest.ts:1:1)",
+              message: `variation ${runCount}`,
+            },
+          ],
+        };
+      },
+      dispatch: async (_g, mod, name) => ({
+        module: mod,
+        name,
+        status: "failed" as const,
+        implementation: null,
+        attempts: 1,
+        testOutput: "",
+        error: "stuck",
+      }),
+      chat: async () => "unused",
       maxIterations: 3,
+      augmentOnRecurrence: false,
     });
     expect(report.ok).toBe(false);
     expect(report.iterations).toBe(3);
-    expect(dispatches).toBe(3);
     expect(report.error).toMatch(/iterations/i);
   });
 
@@ -211,6 +254,138 @@ describe("runIntegrationLoop", () => {
     expect(tests.some((t) => t.name === "recurrence witness")).toBe(true);
     // Still converges once the runner goes green.
     expect(report.ok).toBe(true);
+  });
+
+  it("augment prompt includes the attributed function's body + existing tests", async () => {
+    // After run 10 gap: augmentation was authoring witness tests
+    // without knowing which function they should witness or what the
+    // existing tests already cover. Now the prompt shows the target
+    // function (via direct attribution) and its tests.
+    const g = seed();
+    // Give handleRequest a body and unit test so they can appear in
+    // the augment prompt.
+    g.setImplementation("src/a.ts", "handleRequest", "return 1;");
+    g.replaceTests("src/a.ts", "handleRequest", [
+      { name: "returns one", code: "expect(handleRequest(ctx)).toBe(1);" },
+    ]);
+    let runCount = 0;
+    let augmentPrompt = "";
+    await runIntegrationLoop(g, {
+      runner: async () => {
+        runCount++;
+        if (runCount < 3) {
+          return {
+            ok: false,
+            failures: [
+              {
+                testName: "x",
+                stackTrace: "at handleRequest (/tmp/proj/handleRequest.ts:1:1)",
+                message: "y",
+              },
+            ],
+          };
+        }
+        return { ok: true, failures: [] };
+      },
+      dispatch: async (_g, mod, name) => ({
+        module: mod,
+        name,
+        status: "tests-green",
+        implementation: "// ok",
+        attempts: 1,
+        testOutput: "",
+      }),
+      chat: async (p: string) => {
+        if (p.includes("additional integration test")) {
+          augmentPrompt = p;
+          return '```json\n{"name":"w","code":"// x"}\n```';
+        }
+        return "unused";
+      },
+      maxIterations: 5,
+    });
+    expect(augmentPrompt).toContain("handleRequest");
+    expect(augmentPrompt).toContain("return 1;"); // body surfaced
+    expect(augmentPrompt).toContain("returns one"); // existing test name
+    // Phase N7 — architect now owns the full project.integration.test.ts
+    // file; the prompt advertises the project-test-file fence.
+    expect(augmentPrompt).toContain("project-test-file");
+  });
+
+  it("augment SKIPS synthetic project.runner failures — no witness for env crash", async () => {
+    const g = seed();
+    let runCount = 0;
+    let augmentPromptCount = 0;
+    await runIntegrationLoop(g, {
+      runner: async () => {
+        runCount++;
+        return {
+          ok: false,
+          failures: [
+            {
+              testName: "project.runner",
+              message: "vitest exited 1",
+              stackTrace: "",
+            },
+          ],
+        };
+      },
+      dispatch: async (_g: any, mod: string, name: string) => ({
+        module: mod,
+        name,
+        status: "tests-green" as const,
+        implementation: "",
+        attempts: 0,
+        testOutput: "",
+      }),
+      fixProjectTests: async () => {},
+      chat: async (p: string) => {
+        if (p.includes("additional integration test")) {
+          augmentPromptCount++;
+        }
+        return '```json\n{"name":"w","code":"// nope"}\n```';
+      },
+      maxIterations: 3,
+    });
+    expect(augmentPromptCount).toBe(0); // never prompted for synthetic
+  });
+
+  it("augment SKIPS when the stack is unattributable — no function to witness", async () => {
+    const g = seed();
+    let runCount = 0;
+    let augmentPromptCount = 0;
+    await runIntegrationLoop(g, {
+      runner: async () => {
+        runCount++;
+        if (runCount < 3) {
+          return {
+            ok: false,
+            failures: [
+              {
+                testName: "orphan",
+                message: "somewhere deep",
+                stackTrace: "at unknownFn (node_modules/thing/index.js:1:1)", // no in-project frame
+              },
+            ],
+          };
+        }
+        return { ok: true, failures: [] };
+      },
+      dispatch: async (_g: any, mod: string, name: string) => ({
+        module: mod,
+        name,
+        status: "tests-green" as const,
+        implementation: "",
+        attempts: 0,
+        testOutput: "",
+      }),
+      chat: async (p: string) => {
+        if (p.includes("additional integration test")) augmentPromptCount++;
+        return '```json\n{"name":"w","code":"// x"}\n```';
+      },
+      maxIterations: 5,
+    });
+    expect(augmentPromptCount).toBe(0);
   });
 
   it("does NOT augment when augmentOnRecurrence: false", async () => {
@@ -514,5 +689,137 @@ describe("runIntegrationLoop", () => {
     });
     // Two unique functions; each gets exactly one dispatch per iteration.
     expect(dispatched.sort()).toEqual(["handleRequest", "startServer"]);
+  });
+
+  it("early-aborts when two consecutive iterations produce identical synthetic-only failures", async () => {
+    // Run 10 behavior: tsc/vitest environmental crash repeats every
+    // iteration unchanged — no user-function attribution, repair can't
+    // help. Loop should bail at iter 2 rather than exhaust all 5.
+    const g = seed();
+    let runCount = 0;
+    const phantomFailure = {
+      testName: "project.typecheck",
+      message: "tsc exited 2 with no parseable errors",
+      stackTrace: "stderr (last 2000 chars):\nstdout (last 800 chars):",
+    };
+    const report = await runIntegrationLoop(g, {
+      runner: async () => {
+        runCount++;
+        return { ok: false, failures: [phantomFailure] };
+      },
+      dispatch: async () => ({
+        module: "src/a.ts",
+        name: "x",
+        status: "tests-green",
+        implementation: "",
+        attempts: 0,
+        testOutput: "",
+      }),
+      fixProjectTests: async () => {
+        // repair "succeeds" but the phantom doesn't go away.
+      },
+      chat: async () => "unused",
+      maxIterations: 5,
+      augmentOnRecurrence: false,
+    });
+    expect(report.ok).toBe(false);
+    // Two runs: iter 1 tries repair; iter 2 sees same set → bails.
+    expect(report.iterations).toBe(2);
+    expect(runCount).toBe(2);
+    expect(report.error).toMatch(/environmental/i);
+  });
+
+  it("early-aborts on synthetic crashes whose messages vary only by PID / volatile noise", async () => {
+    // Bug from review: synthetic `project.runner` crash messages
+    // embed the Node PID (`(node:91857) [DEP0169]...`), which differs
+    // each run. Using raw message in the signature would cause every
+    // iter to look "different" and guard would never fire. Fix: for
+    // synthetics, sign on testName only.
+    const g = seed();
+    let runCount = 0;
+    const report = await runIntegrationLoop(g, {
+      runner: async () => {
+        runCount++;
+        return {
+          ok: false,
+          failures: [
+            {
+              testName: "project.runner",
+              message: `vitest exited 1. First stderr: (node:9${runCount}000) [DEP0169] DeprecationWarning`,
+              stackTrace: "",
+            },
+          ],
+        };
+      },
+      dispatch: async () => ({
+        module: "src/a.ts",
+        name: "x",
+        status: "tests-green",
+        implementation: "",
+        attempts: 0,
+        testOutput: "",
+      }),
+      fixProjectTests: async () => {},
+      chat: async () => "unused",
+      maxIterations: 5,
+      augmentOnRecurrence: false,
+    });
+    // Must bail at iter 2 despite PID variance in the message.
+    expect(report.ok).toBe(false);
+    expect(report.iterations).toBe(2);
+    expect(report.error).toMatch(/environmental/i);
+  });
+
+  it("does NOT early-abort when synthetic failure set CHANGES between iterations", async () => {
+    // Guard against over-eager abort: if the synthetic testName set
+    // shifts (different crash signature, or augmentation added a new
+    // synthetic), repair may still be making progress — keep iterating.
+    const g = seed();
+    let runCount = 0;
+    const report = await runIntegrationLoop(g, {
+      runner: async () => {
+        runCount++;
+        if (runCount === 1) {
+          return {
+            ok: false,
+            failures: [
+              {
+                testName: "project.typecheck",
+                message: "tsc exited 2",
+                stackTrace: "",
+              },
+            ],
+          };
+        }
+        if (runCount === 2) {
+          // Different synthetic — vitest crash instead of tsc.
+          return {
+            ok: false,
+            failures: [
+              {
+                testName: "project.runner",
+                message: "vitest exited 1",
+                stackTrace: "",
+              },
+            ],
+          };
+        }
+        return { ok: true, failures: [] };
+      },
+      dispatch: async () => ({
+        module: "src/a.ts",
+        name: "x",
+        status: "tests-green",
+        implementation: "",
+        attempts: 0,
+        testOutput: "",
+      }),
+      fixProjectTests: async () => {},
+      chat: async () => "unused",
+      maxIterations: 5,
+      augmentOnRecurrence: false,
+    });
+    expect(report.ok).toBe(true);
+    expect(runCount).toBe(3);
   });
 });

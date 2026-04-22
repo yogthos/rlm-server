@@ -124,6 +124,70 @@ describe("branch decomposition — orphan handling deferred to cleanup pass", ()
     expect(result.attempts).toBe(1);
   });
 
+  it("REJECTS a full file whose signature drifts from the declared shape (Phase 5)", async () => {
+    // When the implementer emits a COMPLETE file (`export default
+    // function ...`) the dispatcher validates the signature against
+    // the architect's declared one. Mismatches surface as retry
+    // feedback; tests don't run until the file matches.
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "greet", {
+      params: [{ name: "who", type: "string" }],
+      returnType: "string",
+    });
+    const prompts: string[] = [];
+    let attempts = 0;
+    let testsRan = false;
+    const b = createDesignDispatchBridge(
+      g,
+      async (p) => {
+        prompts.push(p);
+        attempts++;
+        if (attempts === 1) {
+          // Drift: return type declared as `number` instead of `string`.
+          return (
+            '```ts\nexport default function greet(who: string): number {\n  return 42;\n}\n```\n' +
+            '```unit-tests\n[{"name":"u","code":"expect(1).toBe(1);"}]\n```'
+          );
+        }
+        return (
+          '```ts\nexport default function greet(who: string): string {\n  return `hi ${who}`;\n}\n```\n' +
+          '```unit-tests\n[{"name":"u","code":"expect(1).toBe(1);"}]\n```'
+        );
+      },
+      {
+        runTests: async () => {
+          testsRan = true;
+          return { ok: true, passed: 1, failed: 0, output: "ok" };
+        },
+        maxReviewCycles: 0,
+      },
+    );
+    const result = await b.dispatch("src/a.ts", "greet");
+    expect(result.status).toBe("tests-green");
+    expect(attempts).toBe(2);
+    // Retry must carry signature-drift feedback naming expected vs got.
+    expect(prompts[1]).toMatch(/return type|signature|contract/i);
+    expect(prompts[1]).toMatch(/string/);
+    expect(testsRan).toBe(true);
+  });
+
+  it("ACCEPTS a full file with matching signature + imports", async () => {
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "foo", { params: [], returnType: "number" });
+    const b = createDesignDispatchBridge(
+      g,
+      async () =>
+        '```ts\nimport * as http from "node:http";\nexport default function foo(): number {\n  return 1;\n}\n```\n' +
+        '```unit-tests\n[{"name":"u","code":"expect(foo()).toBe(1);"}]\n```',
+      {
+        runTests: async () => ({ ok: true, passed: 1, failed: 0, output: "ok" }),
+        maxReviewCycles: 0,
+      },
+    );
+    const result = await b.dispatch("src/a.ts", "foo");
+    expect(result.status).toBe("tests-green");
+  });
+
   it("leaf (children=[]) has no recomposition requirement — any body accepted", async () => {
     const g = createDesignGraph();
     g.addFunction("src/a.ts", "leaf", { params: [], returnType: "number" });
@@ -143,24 +207,80 @@ describe("branch decomposition — orphan handling deferred to cleanup pass", ()
 });
 
 describe("body-analyzer integration", () => {
-  it("rejects a body containing a top-level import statement", async () => {
+  it("ACCEPTS top-level imports of non-sibling modules (Phase 7 relaxation)", async () => {
+    // Phase 7 (wrapper-kill): implementer owns the whole file and may
+    // `import` external modules. Only DIRECT SIBLING imports are
+    // rejected (those bypass the ctx.fns wiring).
     const g = createDesignGraph();
     g.addFunction("src/a.ts", "foo", { params: [], returnType: "number" });
     const response =
       "```ts\nimport fs from 'node:fs';\nreturn 1;\n```\n" +
       '```unit-tests\n[{"name":"u","code":"expect(foo(ctx)).toBe(1);"}]\n```';
-    const prompts: string[] = [];
     let attempts = 0;
+    const b = createDesignDispatchBridge(
+      g,
+      async () => {
+        attempts++;
+        return response;
+      },
+      {
+        runTests: async () => ({ ok: true, passed: 1, failed: 0, output: "ok" }),
+        maxReviewCycles: 0,
+      },
+    );
+    const result = await b.dispatch("src/a.ts", "foo");
+    // First attempt goes green — no retry needed for a node: import.
+    expect(result.status).toBe("tests-green");
+    expect(attempts).toBe(1);
+  });
+
+  it("ACCEPTS direct sibling imports (Phase N4 — natural mode)", async () => {
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "foo", { params: [], returnType: "number" });
+    g.addFunction("src/a.ts", "sibling", { params: [], returnType: "number" });
+    const body =
+      `import sibling from "./sibling.js";\nexport default function foo(): number { return sibling(); }`;
+    const response =
+      "```ts\n" + body + "\n```\n" +
+      '```unit-tests\n[{"name":"u","code":"expect(foo()).toBe(1);"}]\n```';
+    let attempts = 0;
+    const b = createDesignDispatchBridge(
+      g,
+      async () => {
+        attempts++;
+        return response;
+      },
+      {
+        runTests: async () => ({ ok: true, passed: 1, failed: 0, output: "ok" }),
+        maxReviewCycles: 0,
+      },
+    );
+    const result = await b.dispatch("src/a.ts", "foo");
+    // First attempt goes green — natural mode allows sibling imports.
+    expect(result.status).toBe("tests-green");
+    expect(attempts).toBe(1);
+  });
+
+  it("rejects a body importing a relative module that ISN'T a known function", async () => {
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "foo", { params: [], returnType: "number" });
+    // Note: no function named `types` exists — "./types.js" is phantom.
+    let attempts = 0;
+    const prompts: string[] = [];
     const b = createDesignDispatchBridge(
       g,
       async (p) => {
         prompts.push(p);
         attempts++;
-        // On retry, return a clean body without imports.
-        if (attempts === 1) return response;
+        if (attempts === 1) {
+          return (
+            "```ts\nimport type { T } from \"./types.js\";\nexport default function foo(): number { return 1; }\n```\n" +
+            '```unit-tests\n[{"name":"u","code":"expect(foo()).toBe(1);"}]\n```'
+          );
+        }
         return (
-          "```ts\nreturn 1;\n```\n" +
-          '```unit-tests\n[{"name":"u","code":"expect(foo(ctx)).toBe(1);"}]\n```'
+          "```ts\nexport default function foo(): number { return 1; }\n```\n" +
+          '```unit-tests\n[{"name":"u","code":"expect(foo()).toBe(1);"}]\n```'
         );
       },
       {
@@ -171,44 +291,13 @@ describe("body-analyzer integration", () => {
     const result = await b.dispatch("src/a.ts", "foo");
     expect(result.status).toBe("tests-green");
     expect(result.attempts).toBe(2);
-    // Retry prompt must mention the import violation.
-    expect(prompts[1]).toMatch(/import/i);
+    expect(prompts[1]).toMatch(/types\.js|types.*NOT a function/i);
   });
 
-  it("rejects a body calling an undeclared ctx.fns.<sibling>", async () => {
-    const g = createDesignGraph();
-    g.addFunction("src/a.ts", "foo", { params: [], returnType: "number" });
-    // Note: no sibling `bogus` exists in the graph.
-    let attempts = 0;
-    const prompts: string[] = [];
-    const b = createDesignDispatchBridge(
-      g,
-      async (p) => {
-        prompts.push(p);
-        attempts++;
-        if (attempts === 1) {
-          return (
-            "```ts\nreturn ctx.fns.bogus(ctx);\n```\n" +
-            '```unit-tests\n[{"name":"u","code":"expect(foo(ctx)).toBe(1);"}]\n```'
-          );
-        }
-        return (
-          "```ts\nreturn 1;\n```\n" +
-          '```unit-tests\n[{"name":"u","code":"expect(foo(ctx)).toBe(1);"}]\n```'
-        );
-      },
-      {
-        runTests: async () => ({ ok: true, passed: 1, failed: 0, output: "ok" }),
-        maxReviewCycles: 0,
-      },
-    );
-    const result = await b.dispatch("src/a.ts", "foo");
-    expect(result.status).toBe("tests-green");
-    expect(result.attempts).toBe(2);
-    expect(prompts[1]).toMatch(/bogus/);
-  });
-
-  it("analyzer rejection surfaces under 'Static-analysis' section with line numbers, not under Test output", async () => {
+  it("analyzer rejection surfaces under 'Static-analysis' section with context, not under Test output", async () => {
+    // Phase N4 trigger: a hallucinated relative import. Same routing
+    // contract — the violation goes into the Static-analysis block,
+    // not the Test output section.
     const g = createDesignGraph();
     g.addFunction("src/a.ts", "foo", { params: [], returnType: "number" });
     let attempts = 0;
@@ -220,13 +309,13 @@ describe("body-analyzer integration", () => {
         attempts++;
         if (attempts === 1) {
           return (
-            "```ts\nimport fs from 'node:fs';\nreturn 1;\n```\n" +
-            '```unit-tests\n[{"name":"u","code":"expect(foo(ctx)).toBe(1);"}]\n```'
+            "```ts\nimport { x } from \"./phantom.js\";\nexport default function foo(): number { return x; }\n```\n" +
+            '```unit-tests\n[{"name":"u","code":"expect(foo()).toBe(1);"}]\n```'
           );
         }
         return (
-          "```ts\nreturn 1;\n```\n" +
-          '```unit-tests\n[{"name":"u","code":"expect(foo(ctx)).toBe(1);"}]\n```'
+          "```ts\nexport default function foo(): number { return 1; }\n```\n" +
+          '```unit-tests\n[{"name":"u","code":"expect(foo()).toBe(1);"}]\n```'
         );
       },
       {
@@ -237,7 +326,7 @@ describe("body-analyzer integration", () => {
     await b.dispatch("src/a.ts", "foo");
     const retryPrompt = prompts[1];
     expect(retryPrompt).toMatch(/Static-analysis violation/);
-    expect(retryPrompt).toMatch(/line 1: import from "node:fs"/);
+    expect(retryPrompt).toMatch(/phantom\.js/);
     // Make sure the violation isn't leaking into the Test output section.
     const testOutputIdx = retryPrompt.indexOf("Test output:");
     if (testOutputIdx >= 0) {
@@ -245,11 +334,11 @@ describe("body-analyzer integration", () => {
         testOutputIdx,
         testOutputIdx + 400,
       );
-      expect(testOutputSection).not.toMatch(/node:fs/);
+      expect(testOutputSection).not.toMatch(/phantom\.js/);
     }
   });
 
-  it("reconciles spec.dependencies from observed ctx.fns calls after green dispatch", async () => {
+  it("reconciles spec.dependencies from observed sibling imports+calls after green dispatch (Phase N4)", async () => {
     const g = createDesignGraph();
     g.addFunction("src/a.ts", "foo", { params: [], returnType: "number" });
     g.addFunction("src/a.ts", "realA", { params: [], returnType: "number" });
@@ -264,21 +353,29 @@ describe("body-analyzer integration", () => {
       edgeCases: [],
       examples: [],
     });
+    const body = [
+      `import realA from "./realA.js";`,
+      `import realB from "./realB.js";`,
+      `export default function foo(): number {`,
+      `  const x = realA();`,
+      `  return realB() + x;`,
+      `}`,
+    ].join("\n");
     const response =
-      "```ts\nconst x = ctx.fns.realA(ctx);\nreturn ctx.fns.realB(ctx, x);\n```\n" +
-      '```unit-tests\n[{"name":"u","code":"expect(foo(ctx)).toBe(1);"}]\n```';
+      "```ts\n" + body + "\n```\n" +
+      '```unit-tests\n[{"name":"u","code":"expect(foo()).toBe(1);"}]\n```';
     const b = createDesignDispatchBridge(g, async () => response, {
       runTests: async () => ({ ok: true, passed: 1, failed: 0, output: "ok" }),
       maxReviewCycles: 0,
     });
     await b.dispatch("src/a.ts", "foo");
     const fn = g.getFunction("src/a.ts", "foo")!;
-    // Derived from the actual body — `phantom` dropped, `realA`+`realB`
-    // captured, alphabetical order for stability.
     expect(fn.spec!.dependencies).toEqual(["realA", "realB"]);
+    // Edges also saved for the graph's own bookkeeping.
+    expect(fn.analyzedCallees).toEqual(["realA", "realB"]);
   });
 
-  it("leaves spec.dependencies alone when dispatch fails (body-analyzer reject)", async () => {
+  it("leaves spec.dependencies alone when dispatch fails (analyzer reject)", async () => {
     const g = createDesignGraph();
     g.addFunction("src/a.ts", "foo", { params: [], returnType: "number" });
     g.setSpec("src/a.ts", "foo", {
@@ -293,9 +390,9 @@ describe("body-analyzer integration", () => {
     const b = createDesignDispatchBridge(
       g,
       async () =>
-        // Every attempt calls a nonexistent sibling — analyzer rejects.
-        "```ts\nreturn ctx.fns.nonexistent(ctx);\n```\n" +
-        '```unit-tests\n[{"name":"u","code":"expect(foo(ctx)).toBe(1);"}]\n```',
+        // Every attempt imports a phantom module — analyzer rejects.
+        "```ts\nimport { x } from \"./phantom.js\";\nexport default function foo(): number { return 1; }\n```\n" +
+        '```unit-tests\n[{"name":"u","code":"expect(foo()).toBe(1);"}]\n```',
       {
         runTests: async () => ({ ok: true, passed: 1, failed: 0, output: "ok" }),
         maxReviewCycles: 0,
@@ -304,13 +401,12 @@ describe("body-analyzer integration", () => {
     );
     const result = await b.dispatch("src/a.ts", "foo");
     expect(result.status).toBe("failed");
-    // LLM's guess survives — we only reconcile on successful save.
     expect(
       g.getFunction("src/a.ts", "foo")!.spec!.dependencies,
     ).toEqual(["initial-guess"]);
   });
 
-  it("pre-test green path also reconciles dependencies", async () => {
+  it("pre-test green path also reconciles dependencies (Phase N4)", async () => {
     const g = createDesignGraph();
     g.addFunction("src/a.ts", "foo", { params: [], returnType: "number" });
     g.addFunction("src/a.ts", "helper", { params: [], returnType: "number" });
@@ -324,7 +420,11 @@ describe("body-analyzer integration", () => {
       examples: [],
     });
     // Pre-populate an impl — simulates resume.
-    g.setImplementation("src/a.ts", "foo", "return ctx.fns.helper(ctx);");
+    g.setImplementation(
+      "src/a.ts",
+      "foo",
+      `import helper from "./helper.js";\nexport default function foo(): number { return helper(); }`,
+    );
     const b = createDesignDispatchBridge(
       g,
       async () => "```\nAPPROVE\n```", // only architect is called
@@ -340,14 +440,17 @@ describe("body-analyzer integration", () => {
     ).toEqual(["helper"]);
   });
 
-  it("pre-test path rejects a loaded body with a top-level import (analyzer fires before tests)", async () => {
+  it("pre-test path rejects a loaded body with a phantom relative import (Phase N4)", async () => {
+    // Natural-mode trigger: a loaded body that imports from a phantom
+    // relative module. The pre-test analyzer must catch it before
+    // tests run, just as before — only the rule changed (unknown
+    // relative import, not direct-sibling-import).
     const g = createDesignGraph();
     g.addFunction("src/a.ts", "foo", { params: [], returnType: "number" });
-    // Resume scenario: a stale body from disk with a forbidden import.
     g.setImplementation(
       "src/a.ts",
       "foo",
-      "import fs from 'node:fs';\nreturn 1;",
+      `import { x } from "./phantom.js";\nexport default function foo(): number { return x; }`,
     );
     let testsRan = false;
     let attempts = 0;
@@ -358,8 +461,8 @@ describe("body-analyzer integration", () => {
         prompts.push(p);
         attempts++;
         return (
-          "```ts\nreturn 1;\n```\n" +
-          '```unit-tests\n[{"name":"u","code":"expect(foo(ctx)).toBe(1);"}]\n```'
+          "```ts\nexport default function foo(): number { return 1; }\n```\n" +
+          '```unit-tests\n[{"name":"u","code":"expect(foo()).toBe(1);"}]\n```'
         );
       },
       {
@@ -372,12 +475,11 @@ describe("body-analyzer integration", () => {
     );
     const result = await b.dispatch("src/a.ts", "foo");
     expect(result.status).toBe("tests-green");
-    // The regenerate loop runs: at least one Implementer call made.
     expect(attempts).toBeGreaterThanOrEqual(1);
     // First Implementer attempt must carry the analyzer feedback (NOT
     // deferred until attempt 2 like the pre-fix behavior).
     expect(prompts[0]).toMatch(/Static-analysis violation/);
-    expect(prompts[0]).toMatch(/import from "node:fs"/);
+    expect(prompts[0]).toMatch(/phantom\.js|phantom.*NOT a function/i);
     // Tests for the stale body were never run — analyzer short-circuits.
     // (tests DO run for the regenerated clean body.)
     expect(testsRan).toBe(true);
@@ -516,6 +618,20 @@ describe("parseReviewVerdict", () => {
     // `quality` is not in our spec-field allowlist — treat as
     // untagged to avoid giving the Implementer a misleading citation.
     expect(v.specField).toBeUndefined();
+  });
+
+  it("REVISE tests — architect flags the test suite itself (B2)", () => {
+    // B2: the architect may judge that the body satisfies the spec
+    // but the TESTS are wrong (assert something the spec doesn't
+    // promise, or enforce too-tight constraints). `tests` joins the
+    // valid REVISE targets so the citation propagates to the
+    // implementer's retry prompt with a nudge to rewrite the suite.
+    const v = parseReviewVerdict(
+      "```\nREVISE tests\nThe unit tests assert behavior the spec doesn't promise. Rewrite them against the spec.\n```",
+    );
+    expect(v.approved).toBe(false);
+    expect(v.specField).toBe("tests");
+    expect(v.feedback).toMatch(/Rewrite them/);
   });
 
   it("handles REVISE with trailing punctuation or markdown", () => {
@@ -1250,6 +1366,35 @@ describe("architect review (post-green gate)", () => {
     expect(reviewPrompt).toContain("childA");
     expect(reviewPrompt).toContain("childB");
     expect(reviewPrompt).toContain("doubles x");
+  });
+
+  it("architect review prompt frames spec as contract-not-recipe (D1)", async () => {
+    // D1: the review prompt must instruct the architect to anchor on
+    // purpose+output, treat edge cases as suggestions, and NOT
+    // prescribe implementation shape. Lock-in test.
+    const g = seed();
+    let reviewPrompt = "";
+    const b = createDesignDispatchBridge(
+      g,
+      async (p) => {
+        if (p.includes("You are the ARCHITECT reviewing")) {
+          reviewPrompt = p;
+          return "```\nAPPROVE\n```";
+        }
+        return (
+          "```ts\nreturn 1;\n```\n" +
+          '```unit-tests\n[{"name":"u","code":"expect(foo(ctx)).toBe(1);"}]\n```'
+        );
+      },
+      {
+        runTests: async () => ({ ok: true, passed: 1, failed: 0, output: "ok" }),
+        maxReviewCycles: 2,
+      },
+    );
+    await b.dispatch("src/a.ts", "foo");
+    expect(reviewPrompt).toContain("PURPOSE + OUTPUT");
+    expect(reviewPrompt).toContain("edgeCases are SUGGESTIONS");
+    expect(reviewPrompt).toContain("DO NOT prescribe implementation details");
   });
 
   it("REVISE second-attempt Implementer prompt labels feedback as architect, not test output", async () => {
@@ -2051,8 +2196,11 @@ describe("createDesignDispatchBridge", () => {
         maxReviewCycles: 0,
       },
     );
+    // Dispatch passes externalFeedback through verbatim — the SENDER
+    // owns tagging. Simulate what the real integration-loop sends.
     await b.dispatch("src/a.ts", "foo", {
-      externalFeedback: "Integration test X failed: expected 500 to be 200",
+      externalFeedback:
+        "[integration-loop feedback]\nIntegration test X failed: expected 500 to be 200",
     });
     expect(seenPrompts[0]).toContain("integration-loop feedback");
     expect(seenPrompts[0]).toContain("expected 500 to be 200");
@@ -2155,6 +2303,44 @@ describe("createDesignDispatchBridge", () => {
     expect(result.status).toMatch(/stagnated|failed/);
     // The pre-existing body is preserved — exhaustion kept it.
     expect(g.getFunction("src/a.ts", "foo")!.implementation).toBe("return 1;");
+  });
+
+  it("stagnation-bails on identical test-file-load failures (0/0 ok=false)", async () => {
+    // Run 13 finding: vitest ESM spy limitations caused the test
+    // file to fail loading → tr = {passed: 0, failed: 0, ok: false}.
+    // Stagnation detection previously gated on `tr.failed > 0` and
+    // never incremented the streak, burning all maxAttempts. Now
+    // load-failure signatures are tracked so stagnation bails after
+    // STAGNATION_BAIL_STREAK identical loads.
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "foo", { params: [], returnType: "number" });
+    let attempts = 0;
+    const b = createDesignDispatchBridge(
+      g,
+      async () => {
+        attempts++;
+        return (
+          '```ts\nreturn 1;\n```\n' +
+          '```unit-tests\n[{"name":"u","code":"expect(foo(ctx)).toBe(1);"}]\n```'
+        );
+      },
+      {
+        runTests: async () => ({
+          ok: false,
+          passed: 0,
+          failed: 0,
+          output: "[TEST FILE DID NOT LOAD] Cannot spy on export readFile.",
+        }),
+        maxAttempts: 8,
+        maxReviewCycles: 0,
+      },
+    );
+    const result = await b.dispatch("src/a.ts", "foo");
+    // Bails before exhausting the 8-attempt budget.
+    expect(result.status).toBe("stagnated");
+    expect(attempts).toBeLessThan(8);
+    // STAGNATION_BAIL_STREAK is 2 → 2 attempts to confirm identical.
+    expect(attempts).toBeLessThanOrEqual(3);
   });
 
   it("propagates chat error after MAX_ABORT_RETRIES consecutive aborts", async () => {

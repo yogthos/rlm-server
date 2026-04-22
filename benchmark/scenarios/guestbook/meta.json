@@ -1,0 +1,6 @@
+{
+  "name": "guestbook",
+  "description": "Full HTTP app with SQLite persistence — exercises every decomposition site (phase-0 stack pick, phase-1 multi-root plan, IMPLEMENT-vs-DECOMPOSE gate) and the project-level integration loop against a real dep (better-sqlite3).",
+  "stage": "full-pipeline",
+  "expectedOutcome": "green — 4–6 function files that compose a working guestbook"
+}

@@ -17,6 +17,7 @@ import type {
   TestSpec,
 } from "./design-graph.js";
 import { computeRelevantFunctions } from "./prompt-scope.js";
+import { renderDecisionsBlock } from "./decisions-prompt.js";
 
 function renderParam(p: ParamSpec): string {
   const q = p.optional ? "?" : "";
@@ -25,16 +26,12 @@ function renderParam(p: ParamSpec): string {
 }
 
 /**
- * Render the proc-ts-shape signature shown in the prompt. The
- * `ctx: Ctx` first param is implicit — the harness injects it at
- * emission time — but we still display it here so the Implementer
- * knows ctx is in scope.
+ * Phase N3 — natural TypeScript signature. No ctx injection. The
+ * architect's declared params ARE the signature.
  */
 function renderSignature(name: string, sig: Signature): string {
   const async = sig.isAsync ? "async " : "";
-  const userParams = sig.params.map(renderParam).join(", ");
-  const paramList =
-    userParams.length > 0 ? `ctx: Ctx, ${userParams}` : "ctx: Ctx";
+  const paramList = sig.params.map(renderParam).join(", ");
   return `export default ${async}function ${name}(${paramList}): ${sig.returnType}`;
 }
 
@@ -53,7 +50,7 @@ function renderSpec(spec: FunctionSpec): string {
     for (const s of spec.sideEffects) lines.push(`  - ${s}`);
   }
   if (spec.dependencies.length > 0) {
-    lines.push("Depends on (call via ctx.fns):");
+    lines.push("Dependencies (import these directly):");
     for (const d of spec.dependencies) lines.push(`  - ${d}`);
   }
   if (spec.edgeCases.length > 0) {
@@ -143,9 +140,19 @@ export async function buildImplementerPrompt(
   // Test framework was picked in phase 0; adapt the test-harness
   // guidance to match. Default to vitest for manual/legacy graphs that
   // never went through phase 0.
-  const framework = graph.getProjectConfig()?.testFramework ?? "vitest";
-  const frameworkGuidanceLine =
-    framework === "jest"
+  const projectCfg = graph.getProjectConfig();
+  // Phase C: inject ALL project decisions verbatim into the prompt.
+  // No hardcoded per-framework guidance — the model committed to a
+  // combination in phase 0, and the downstream prompts read that
+  // commitment rather than the harness prescribing it.
+  const decisionsBlock = renderDecisionsBlock(graph);
+  // Legacy framework guidance kept as a last-resort fallback for
+  // graphs that never went through phase 0 (tests, manual setups).
+  // Production runs hit the decisions block above.
+  const framework = projectCfg?.testFramework ?? "vitest";
+  const frameworkGuidanceLine = projectCfg
+    ? `   The test \`code\` runs under your chosen framework (${framework}). Use whatever APIs your testImports exposes.`
+    : framework === "jest"
       ? "   The test `code` runs inside a **jest** `it(...)` body — use `jest.fn()` / `jest.spyOn()` / `jest.mock()` for mocks. The `vi` global is NOT defined under jest."
       : "   The test `code` runs inside a **vitest** `it(...)` body — use `vi.fn()` / `vi.spyOn()` / `vi.mock()` for mocks. The `jest` global is NOT defined; `jest.fn()` throws at load time and fails every test.";
 
@@ -176,13 +183,16 @@ export async function buildImplementerPrompt(
           const params = cfn.signature.params
             .map((p) => `${p.name}: ${p.type}`)
             .join(", ");
-          return `  - ctx.fns.${c}(ctx${params.length > 0 ? ", " + params : ""}): ${cfn.signature.returnType} — ${cfn.description}`;
+          return [
+            `  - import ${c} from "./${c}.js";`,
+            `      ${c}(${params}): ${cfn.signature.returnType} — ${cfn.description}`,
+          ].join("\n");
         })
         .join("\n")
     : "";
-  // All project functions are wired into ctx.fns — the body can call
-  // ANY of them, not just its formal children. List them as "other
-  // available" so the LLM sees the full ctx.fns surface.
+  // Phase N3 — siblings are importable modules, not ctx.fns entries.
+  // List every relevant project function as an import + natural call
+  // shape so the model can pull in whichever it needs.
   const childSet = new Set(fn.children);
   const otherAvailable = relevant
     .filter((f) => f.name !== fn.name && !childSet.has(f.name))
@@ -190,7 +200,10 @@ export async function buildImplementerPrompt(
       const params = f.signature.params
         .map((p) => `${p.name}: ${p.type}`)
         .join(", ");
-      return `  - ctx.fns.${f.name}(ctx${params.length > 0 ? ", " + params : ""}): ${f.signature.returnType}`;
+      return [
+        `  - import ${f.name} from "./${f.name}.js";`,
+        `      ${f.name}(${params}): ${f.signature.returnType}`,
+      ].join("\n");
     })
     .join("\n");
 
@@ -212,9 +225,15 @@ export async function buildImplementerPrompt(
 
   const integrationNeeded = hasChildren;
 
+  const paramExamples = fn.signature.params
+    .map((p) => `<${p.name}>`)
+    .join(", ");
+  const firstSibling = [...fn.children, ...relevant.filter((f) => f.name !== fn.name && !childSet.has(f.name)).map((f) => f.name)][0];
   const lines = [
-    `You are the Implementer of \`${fn.name}\` in the proc-ts project.`,
-    "You own BOTH the body AND the tests for this function.",
+    `You are the Implementer of \`${fn.name}\`. Write it the way you'd`,
+    "write any small TypeScript module: plain imports, a natural",
+    "signature, a body that does exactly what the spec says, and unit",
+    "tests that exercise it. The harness takes care of wiring.",
     "",
     `Signature: ${renderSignature(fn.name, fn.signature)}`,
     descriptionBlock,
@@ -222,101 +241,128 @@ export async function buildImplementerPrompt(
     "",
     ...(hasChildren
       ? [
-          "This function has ALREADY been DECOMPOSED into children. The",
-          "children have been implemented and are green. Your job is to",
-          "write the ASSEMBLY body that orchestrates them:",
+          "Available sibling functions — DECOMPOSED CHILDREN (already",
+          "implemented and tested). Import and call them directly:",
           "",
           childList,
           "",
-          "Call each child via `ctx.fns.<name>(ctx, …)`. The body you write",
-          "is the glue code that composes these into this function's",
-          "observable behavior.",
+          "These children are a WORKING, TESTED unit — their signatures",
+          "are AUTHORITATIVE. If your mental model of a child differs",
+          "from its declared shape, REVISE YOUR HYPOTHESIS to match the",
+          "reality you got. If you genuinely cannot compose them into",
+          "the spec's purpose, emit `request-info` with `sibling:<name>`",
+          "or `help` to explore.",
           "",
         ]
       : []),
-    "PROC-TS CONVENTIONS (mandatory):",
-    "- The emitted function has signature",
-    `  \`export default function ${fn.name}(ctx: Ctx, ...params)\`.`,
-    "  `ctx: Ctx` is ALREADY in scope as the first parameter. You do not",
-    "  declare it — you USE it.",
-    "- Call sibling functions via `ctx.fns.<name>(ctx, ...args)`. Do NOT",
-    "  write `import` statements. Do NOT call siblings by bare name.",
-    "  ",
-    "  // good:  const db = ctx.fns.connect(ctx, path);",
-    "  // bad:   const db = connect(ctx, path);          // ReferenceError",
-    "  // bad:   const db = ctx.fns.connect(path);       // missing ctx arg",
-    "",
-    "- If you need external npm/Node APIs (`fs`, `http`, etc.), use a",
-    "  dynamic `require(...)` or `await import(...)` inside the body.",
-    "- Runtime data goes on `ctx.state.<key>` (object keyed by string).",
-    "",
     ...(otherAvailable.length > 0
       ? [
           hasChildren
-            ? "Other project functions also wired into ctx.fns (use when useful):"
-            : "All other project functions wired into ctx.fns (call them as needed):",
+            ? "Other sibling functions you MAY import if helpful:"
+            : "Available sibling functions in the project — import if you need them:",
           otherAvailable,
           "",
         ]
       : []),
+    "CONTRACT (mandatory):",
+    "- Emit a COMPLETE TypeScript source file: imports + default-exported",
+    `  \`${fn.name}\` with the declared signature + body. The harness`,
+    "  writes it verbatim — no wrapping, no post-processing.",
+    `- The default export MUST be named \`${fn.name}\` with the signature`,
+    `  \`${renderSignature(fn.name, fn.signature)}\`. The harness parses`,
+    "  the file and rejects drift with specific feedback.",
+    "- Top-level `import` statements are REQUIRED whenever your signature",
+    "  or body references an external namespace or type. tsc rejects",
+    "  unresolved references with TS2503 (\"Cannot find namespace\") and",
+    "  TS2304 (\"Cannot find name\"). Examples:",
+    '    import * as http from "node:http";            // namespace',
+    '    import type * as fs from "node:fs";           // type-only',
+    '    import { readFile } from "node:fs/promises";  // named',
+    '    import sibling from "./sibling.js";           // sibling',
+    "  Use `import type` for imports referenced only in type positions.",
+    "- Siblings are ordinary modules — import them with the `.js`",
+    "  extension (ESM convention). No framework-provided `ctx` object.",
+    "",
     ...existingTestsBlock,
     ...existingBlock,
+    ...decisionsBlock,
     "",
-    "Task — emit THREE fenced blocks in your response:",
+    "Task — emit TWO (or THREE) fenced blocks in your response:",
     "",
-    "1. ```ts — the function body (statements only, no signature, no",
-    `   surrounding \`function\` declaration). This is what \`${fn.name}\``,
-    "   does when called.",
+    "1. ```ts — the COMPLETE function file: imports + default-exported",
+    `   function \`${fn.name}\` with the declared signature + body.`,
     "",
-    "2. ```unit-tests — JSON array of tests that exercise THIS function",
-    "   in isolation. Each entry is `{\"name\": \"...\", \"code\": \"...\"}`.",
+    `2. \`\`\`unit-test-file — the COMPLETE TypeScript test file for \`${fn.name}\`.`,
+    "   You own it end-to-end: imports, describe/it, assertions.",
     frameworkGuidanceLine,
-    `   Call the function under test as \`${fn.name}(ctx, ...)\`.`,
+    `   Import the function under test as \`import ${fn.name} from "./${fn.name}.js";\``,
+    `   and call it naturally: \`${fn.name}(${paramExamples})\` — no ctx.`,
     "   Cover every edge case from the spec and at least one example.",
-    "   Unit tests should NOT depend on siblings — stub `ctx.fns.<name>`",
-    "   if needed.",
+    "   When you need to isolate this function from its siblings, use",
+    "   the test framework's native mock API (see decisions.mockingStrategy).",
     "",
     integrationNeeded
-      ? "3. ```integration-tests — REQUIRED. JSON array, same shape."
-      : "3. ```integration-tests — MUST be an empty array `[]` for this function.",
+      ? `3. \`\`\`integration-test-file — REQUIRED. Full TS content for \`${fn.name}.integration.test.ts\`.`
+      : "3. ```integration-test-file — OMIT for this function (no children to assemble).",
     integrationNeeded
-      ? "   Integration tests run with real siblings wired via `ctx.fns`."
-      : "   This function has no children to assemble, so integration tests",
-    integrationNeeded
-      ? "   Because this function assembles children, you MUST include at"
-      : "   would not run (the harness only materializes integration test",
-    integrationNeeded
-      ? "   least one integration test that exercises the full wire-up."
-      : "   files for branches). Emit `[]` and put behavior coverage in unit tests.",
+      ? "   Import REAL siblings and exercise the full assembly end-to-end."
+      : "   Put all behavior coverage in the unit-test-file.",
     "",
     "Fence shape:",
     "```ts",
-    "// body statements",
+    firstSibling ? `import ${firstSibling} from "./${firstSibling}.js";` : "// imports as needed",
+    "",
+    `export default function ${fn.name}(${fn.signature.params
+      .map((p) => `${p.name}: ${p.type}`)
+      .join(", ")}): ${fn.signature.returnType} {`,
+    firstSibling ? `  // e.g. ${firstSibling}(...)` : "  // body statements",
+    "}",
     "```",
-    "```unit-tests",
-    "[",
-    '  {"name": "...", "code": "..."}',
-    "]",
+    "",
+    "```unit-test-file",
+    `import { describe, it, expect } from "<framework>";`,
+    `import ${fn.name} from "./${fn.name}.js";`,
+    "",
+    `describe("${fn.name}", () => {`,
+    `  it("...", () => {`,
+    `    const result = ${fn.name}(${paramExamples});`,
+    "    expect(result).toBe(/* expected */);",
+    "  });",
+    "});",
     "```",
-    "```integration-tests",
-    "[",
-    '  {"name": "...", "code": "..."}',
-    "]",
-    "```",
+    ...(integrationNeeded
+      ? [
+          "```integration-test-file",
+          "// full TS test file — import real siblings directly and",
+          "// exercise the assembly end-to-end. No mocking.",
+          "```",
+        ]
+      : []),
     "",
     "Rules:",
     "- Do not narrate, do not call test_run, do not call design_implement.",
     "  The harness runs the tests and saves the body on your behalf.",
     "- If the tests fail, you will be called again with the failure output.",
-    "  You can revise BOTH the body and the tests on each retry — whichever",
-    "  you believe is wrong. Emitting a `unit-tests` or `integration-tests`",
-    "  block REPLACES the stored tests entirely with whatever you emit —",
-    "  so include the COMPLETE test set every time you emit the fence, not",
-    "  a partial patch. Omit the block to keep existing tests unchanged.",
-    "  The replace-on-emit rule prevents contradictory assertions from",
-    "  piling up across cycles.",
+    "  You can revise BOTH the source file and the test file(s) on each",
+    "  retry — whichever you believe is wrong. Emitting a test-file fence",
+    "  REPLACES the stored test file entirely. Omit the fence to keep",
+    "  the previous test file unchanged.",
     "- Tests are YOURS. Siblings' tests and project-level tests are out",
     "  of scope for you.",
+    "",
+    "ASSET REVISION — the model owns every non-source-file asset in the",
+    "project (package.json, tsconfig.json, custom configs, seed data,",
+    "…). To change one, emit a `file:<path>` fence alongside your",
+    "code fence:",
+    "",
+    "    ```file:package.json",
+    '    { ... updated contents ... }',
+    "    ```",
+    "",
+    "The harness replaces the asset verbatim. Use this when the test",
+    "run failed because of a missing dep, a config mismatch, or a tool",
+    "setting — don't suffer under the existing assets if they're the",
+    "root cause.",
     "",
     "═══════════════════════════════════════════════════════════════",
     "REQUEST-INFO TOOL (always available — use whenever you need it)",
@@ -326,12 +372,22 @@ export async function buildImplementerPrompt(
     "confidently, emit a `request-info` fence INSTEAD of body+tests:",
     "",
     "```request-info",
-    "stack-trace              # full vitest traces from the last run",
+    "stack-trace              # full test-runner traces from the last run",
     "sibling:<name>           # a sibling's body + spec + tests",
     "spec:<name>              # full spec of a function (defaults to self)",
-    "callers                  # who depends on this function",
-    "related                  # ±1 hop call subgraph",
+    "signature:<name>         # one-line declared signature (defaults to self)",
+    "body:<name>              # stored implementation of a function",
+    "callers                  # who calls me (or callers:<name>)",
+    "callees                  # what I call     (or callees:<name>)",
+    "imports:<name>           # analyzer-observed import list of a function",
+    "related                  # ±1 hop call subgraph around me",
+    "graph                    # compact neighborhood summary",
     "task                     # the original top-level user task",
+    "file:<path>              # read any project asset by path",
+    "                         # e.g. file:package.json, file:tsconfig.json,",
+    "                         # file:<fn>.ts, file:<fn>.test.ts",
+    "files                    # list every file the harness will write",
+    "decisions                # echo the committed ProjectDecisions",
     "help                     # list all supported request kinds",
     "```",
     "",

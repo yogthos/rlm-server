@@ -15,6 +15,13 @@
  *     calls `ctx.fns.X`. Harmless at runtime but misleading for
  *     reviewers and the coherence graph.
  *
+ *   - `arity-mismatch`: body calls `ctx.fns.X(ctx, a, b)` but X is
+ *     declared as `(ctx, a, b, c)` — three user params, call-site
+ *     passes two. Sporulator-style edge sig-compat: flags clearly-
+ *     wrong call sites independent of TypeScript's lenient mode.
+ *     Doesn't catch type mismatches (those need real type inference)
+ *     but catches structural drift that survives tsc's `strict: false`.
+ *
  * This pass is PURE analysis — no automatic repair. Callers (the
  * integration orchestrator, a tightening sub-pass, or the user) decide
  * what to do: delete orphans, ask the architect to wire them in, or
@@ -27,7 +34,7 @@
 
 import type { DesignGraph } from "./design-graph.js";
 import type { DispatchResult } from "./design-dispatch.js";
-import { analyzeBody } from "./body-analyzer.js";
+import { analyzeSource } from "./body-analyzer.js";
 import { debug } from "./debug.js";
 
 export type CleanupFindingKind = "body-orphan" | "unused-dep";
@@ -36,7 +43,7 @@ export interface CleanupFinding {
   kind: CleanupFindingKind;
   module: string;
   name: string;
-  /** For `unused-dep`: the declared dep that's never called. */
+  /** For `unused-dep`: the callee name. */
   dep?: string;
   detail: string;
 }
@@ -50,32 +57,61 @@ export interface CleanupReport {
   reachable: string[];
 }
 
+interface CallSiteDetail {
+  name: string; // callee
+  userArgCount: number;
+  line: number;
+}
+
+interface BodyCallInfo {
+  names: Set<string>; // callee names, for dep/reachability checks
+  sites: CallSiteDetail[]; // per-call-site, for arity checks
+}
+
 async function collectObservedCalls(
   graph: DesignGraph,
-): Promise<Map<string, Set<string>>> {
+): Promise<Map<string, BodyCallInfo>> {
+  const knownSiblings = new Set(graph.listFunctions().map((f) => f.name));
   const candidates = graph
     .listFunctions()
     .filter((fn) => fn.implementation !== null);
-  // Parallelize body analysis — tree-sitter parses are CPU-bound but
-  // analyzeBody is async so they naturally interleave. For graphs of
-  // ~20 functions, serial takes ~20× a single parse; Promise.all
-  // flattens that.
+  // Phase U8 — post-refactor, each function's `analyzedCallees` /
+  // `analyzedImports` were written by `ingestBodyEdges` at save time.
+  // Prefer that pre-computed data; re-parse only when it's empty (a
+  // leaf function saved before the analyzer landed, or a body-only
+  // implementation). Arity (userArgCount) is no longer tracked — the
+  // arity-drift check is redundant now that the TypeScript compiler
+  // validates the signature at tsc time.
   const results = await Promise.all(
     candidates.map(async (fn) => {
-      try {
-        const analysis = await analyzeBody(fn.implementation!);
-        return { name: fn.name, calls: new Set(analysis.ctxFnsCalls.map((c) => c.name)) };
-      } catch (e) {
-        debug(
-          "cleanup",
-          `body-analyze threw for ${fn.name} (${e instanceof Error ? e.message : String(e)}); treating as leaf`,
-        );
-        return { name: fn.name, calls: new Set<string>() };
+      const names = new Set<string>(fn.analyzedCallees ?? []);
+      const sites: CallSiteDetail[] = [];
+      // Fallback 1 — parse the stored implementation with the natural
+      // analyzer (catches bodies written before ingestBodyEdges ran, or
+      // test fixtures that set implementation but didn't analyze).
+      if (names.size === 0 && fn.implementation) {
+        try {
+          const analysis = await analyzeSource(fn.implementation);
+          for (const imp of analysis.imports) {
+            const m = imp.source.match(/^\.\/(.+?)(?:\.js|\.ts)?$/);
+            if (!m) continue;
+            if (knownSiblings.has(m[1])) names.add(m[1]);
+          }
+        } catch (e) {
+          debug(
+            "cleanup",
+            `analyzeSource threw for ${fn.name} (${e instanceof Error ? e.message : String(e)}); treating as leaf`,
+          );
+        }
       }
+      for (const n of names) {
+        sites.push({ name: n, userArgCount: -1, line: 0 });
+      }
+      return { name: fn.name, info: { names, sites } as BodyCallInfo };
     }),
   );
-  const calls = new Map<string, Set<string>>();
-  for (const r of results) calls.set(r.name, r.calls);
+  const calls = new Map<string, BodyCallInfo>();
+  for (const r of results) calls.set(r.name, r.info);
   return calls;
 }
 
@@ -84,7 +120,11 @@ export async function designCleanup(
 ): Promise<CleanupReport> {
   const fns = graph.listFunctions();
   const byName = new Map(fns.map((f) => [f.name, f] as const));
-  const observed = await collectObservedCalls(graph);
+  const observedMap = await collectObservedCalls(graph);
+  // Backwards-compat view for the rest of the function — existing
+  // reachability + unused-dep checks only need the callee-name set.
+  const observed = new Map<string, Set<string>>();
+  for (const [k, v] of observedMap) observed.set(k, v.names);
   // Entry points — top-level planned functions (no decomposition parent).
   const entryPoints = fns
     .filter((f) => f.parent === null)
@@ -132,6 +172,11 @@ export async function designCleanup(
       });
     }
   }
+  // Phase U8 — arity-mismatch check retired. It was a ctx.fns-era
+  // sporulator-inspired edge check comparing `ctx.fns.X(ctx, ...args)`
+  // call-site arity against X's declared params. Under natural mode,
+  // siblings are imported directly and TypeScript's compiler catches
+  // arity mismatches at tsc time. No runtime heuristic needed.
   debug(
     "cleanup",
     `post-leaf-up cleanup: ${findings.length} finding(s) (${findings.map((f) => f.kind).join(", ")})`,
@@ -211,7 +256,7 @@ export async function autoRepairCleanup(
         targets.set(key, { module: f.module, name: f.name, messages: [] });
       }
       targets.get(key)!.messages.push(
-        `Cleanup: spec.dependencies lists "${f.dep}" but your body doesn't call ctx.fns.${f.dep} — drop the dep or call it.`,
+        `Cleanup: spec.dependencies lists "${f.dep}" but your body doesn't import or call ${f.dep} — drop the dep or call it.`,
       );
     }
   }

@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import { mirrorTestsToFiles } from "./fixtures.js";
 import {
   createDesignGraph,
   type Signature,
@@ -263,6 +264,75 @@ describe("DesignGraph — projectConfig (package.json + test framework)", () => 
     expect(files["package.json"]).toBeUndefined();
   });
 
+  // Phase 3 (wrapper-kill): fn.implementation now holds the complete
+  // file the implementer emitted. Materialize passes it through. For
+  // unimplemented functions we still emit a stub (so tsc can compile
+  // the project when a sibling hasn't been written yet).
+
+  it("materialize emits fn.implementation VERBATIM when set (no wrapping)", () => {
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "foo", sig([]));
+    const file = `import * as http from "node:http";
+
+export default function foo(ctx: Ctx): void {
+  http.createServer().listen(3001);
+}
+`;
+    g.setImplementation("src/a.ts", "foo", file);
+    const files = g.materialize();
+    expect(files["foo.ts"]).toBe(file);
+  });
+
+  it("materialize emits a full-file stub when implementation is null", () => {
+    const g = createDesignGraph();
+    g.addFunction(
+      "src/a.ts",
+      "foo",
+      {
+        params: [{ name: "req", type: "string" }],
+        returnType: "number",
+      },
+    );
+    const files = g.materialize();
+    const content = files["foo.ts"];
+    expect(content).toContain("export default function foo(req: string): number");
+    expect(content).toContain("throw new Error");
+    expect(content).toContain("not implemented");
+  });
+
+  it("materialize wraps legacy body-only implementation with the declared signature", () => {
+    // Back-compat for pre-wrapper-kill fixtures and occasional LLM
+    // deviation: if `fn.implementation` lacks `export default`, wrap
+    // it so the emitted file is still a valid module. Without this
+    // wrap, `import foo from "./foo.js"` in the test file would fail
+    // because foo.ts has no default export.
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "foo", {
+      params: [{ name: "x", type: "number" }],
+      returnType: "number",
+    });
+    g.setImplementation("src/a.ts", "foo", "return x + 1;");
+    const files = g.materialize();
+    const content = files["foo.ts"];
+    expect(content).toContain(
+      "export default function foo(x: number): number",
+    );
+    expect(content).toContain("return x + 1;");
+  });
+
+  it("materialize stub reflects async declaration", () => {
+    const g = createDesignGraph();
+    g.addFunction(
+      "src/a.ts",
+      "foo",
+      { params: [], returnType: "Promise<void>", isAsync: true },
+    );
+    const files = g.materialize();
+    expect(files["foo.ts"]).toContain(
+      "export default async function foo(): Promise<void>",
+    );
+  });
+
   it("snapshot preserves projectConfig", () => {
     const g = createDesignGraph();
     const cfg = {
@@ -445,6 +515,7 @@ describe("DesignGraph — integration-test layer", () => {
       name: "assembly works",
       code: "expect(root(ctx)).toBeUndefined();",
     });
+    mirrorTestsToFiles(g);
     const files = g.materialize();
     expect(files["root.integration.test.ts"]).toBeDefined();
     expect(files["root.integration.test.ts"]).toContain("root (integration)");
@@ -457,6 +528,7 @@ describe("DesignGraph — integration-test layer", () => {
     const g = createDesignGraph();
     g.addFunction("src/a.ts", "foo", sig([]), "");
     g.addTest("src/a.ts", "foo", { name: "u", code: "expect(1).toBe(1);" });
+    mirrorTestsToFiles(g);
     const files = g.materialize();
     expect(files["foo.test.ts"]).toBeDefined();
     expect(files["foo.integration.test.ts"]).toBeUndefined();
@@ -469,6 +541,7 @@ describe("DesignGraph — integration-test layer", () => {
       name: "end-to-end",
       code: "expect(foo(ctx)).toBeUndefined();",
     });
+    mirrorTestsToFiles(g);
     const files = g.materialize();
     expect(files["project.integration.test.ts"]).toBeDefined();
     expect(files["project.integration.test.ts"]).toContain("project integration");
@@ -498,10 +571,10 @@ describe("DesignGraph — integration-test layer", () => {
   });
 
   it("strips a leading `ctx` param if the planner includes it", () => {
-    // The emitter always prepends `ctx: Ctx` to every function's
-    // signature. If the planner mistakenly includes `ctx` in its
-    // params, we'd produce `function foo(ctx: Ctx, ctx: Ctx, ...)` —
-    // a TS parse error. Defensive strip guarantees single injection.
+    // Defensive — the planner (or a legacy graph loader) may leak a
+    // `ctx` first parameter from the old proc-ts contract. Natural
+    // mode has no ctx, so drop it rather than leaving a confusing
+    // artifact in the signature the Implementer reads.
     const g = createDesignGraph();
     g.addFunction("src/a.ts", "foo", {
       params: [
@@ -513,8 +586,8 @@ describe("DesignGraph — integration-test layer", () => {
     const fn = g.getFunction("src/a.ts", "foo")!;
     expect(fn.signature.params).toEqual([{ name: "x", type: "string" }]);
     const files = g.materialize();
-    expect(files["foo.ts"]).toContain("function foo(ctx: Ctx, x: string)");
-    expect(files["foo.ts"]).not.toContain("ctx: Ctx, ctx: Ctx");
+    expect(files["foo.ts"]).toContain("function foo(x: string)");
+    expect(files["foo.ts"]).not.toContain("ctx: Ctx");
   });
 
   it("rejects `project` as a reserved function name", () => {
@@ -614,11 +687,21 @@ describe("DesignGraph — materialize() (proc-ts layout)", () => {
       sig([{ name: "a", type: "number" }, { name: "b", type: "number" }], "number"),
       "",
     );
-    g.setImplementation("src/math.ts", "add", "return a + b;");
+    // Phase 3: fn.implementation now holds a full file (not just a
+    // body). The architect's declared shape is baked into what the
+    // implementer emits.
+    g.setImplementation(
+      "src/math.ts",
+      "add",
+      `export default function add(a: number, b: number): number {
+  return a + b;
+}
+`,
+    );
     const files = g.materialize();
     expect(files["add.ts"]).toBeDefined();
     expect(files["add.ts"]).toMatch(
-      /export default function add\(ctx: Ctx, a: number, b: number\): number \{/,
+      /export default function add\(a: number, b: number\): number \{/,
     );
     expect(files["add.ts"]).toContain("return a + b;");
   });
@@ -631,27 +714,13 @@ describe("DesignGraph — materialize() (proc-ts layout)", () => {
     expect(files["foo.ts"]).toMatch(/not implemented|TODO/i);
   });
 
-  it("emits ctx.ts with global Ctx declaration", () => {
-    const g = createDesignGraph();
-    g.addFunction("src/a.ts", "foo", sig([], "void"), "");
-    const files = g.materialize();
-    expect(files["ctx.ts"]).toBeDefined();
-    expect(files["ctx.ts"]).toContain("export type Ctx");
-    expect(files["ctx.ts"]).toContain("declare global");
-    expect(files["ctx.ts"]).toContain("fns: CtxFns");
-  });
-
-  it("emits auto-generated ctx_fns.d.ts listing every function", () => {
+  it("does NOT emit ctx.ts / ctx_fns.d.ts (Phase N2 — natural mode)", () => {
     const g = createDesignGraph();
     g.addFunction("src/a.ts", "foo", sig([], "void"), "");
     g.addFunction("src/a.ts", "bar", sig([], "void"), "");
     const files = g.materialize();
-    expect(files["ctx_fns.d.ts"]).toContain(
-      'foo: typeof import("./foo").default',
-    );
-    expect(files["ctx_fns.d.ts"]).toContain(
-      'bar: typeof import("./bar").default',
-    );
+    expect(files["ctx.ts"]).toBeUndefined();
+    expect(files["ctx_fns.d.ts"]).toBeUndefined();
   });
 
   it("emits a companion <fnName>.test.ts for each function with tests", () => {
@@ -666,6 +735,7 @@ describe("DesignGraph — materialize() (proc-ts layout)", () => {
       name: "returns the sum",
       code: "expect(add(ctx, 1, 2)).toBe(3);",
     });
+    mirrorTestsToFiles(g);
     const files = g.materialize();
     expect(files["add.test.ts"]).toBeDefined();
     const test = files["add.test.ts"];
@@ -683,7 +753,14 @@ describe("DesignGraph — materialize() (proc-ts layout)", () => {
       { params: [{ name: "id", type: "string" }], returnType: "User", isAsync: true },
       "",
     );
-    g.setImplementation("src/api.ts", "fetchUser", "return await get(id);");
+    g.setImplementation(
+      "src/api.ts",
+      "fetchUser",
+      `export default async function fetchUser(ctx: Ctx, id: string): User {
+  return await get(id);
+}
+`,
+    );
     expect(g.materialize()["fetchUser.ts"]).toMatch(
       /export default async function fetchUser/,
     );
@@ -703,7 +780,9 @@ describe("DesignGraph — materialize() (proc-ts layout)", () => {
       ),
       "",
     );
-    g.setImplementation("src/api.ts", "greet", "return title ? `${title} ${name}` : name;");
+    // For the stub case (implementation=null), the render uses
+    // renderProcSignature which still emits `name?: string` for optional
+    // params — same shape we verify here.
     expect(g.materialize()["greet.ts"]).toMatch(/name: string, title\?: string/);
   });
 });

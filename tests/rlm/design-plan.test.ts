@@ -6,7 +6,9 @@ import {
   parseFunctionList,
   parseTestList,
   parseFunctionSpec,
-  parsePackageJson,
+  extractTestingNotes,
+  parsePhase0Response,
+  extractTaggedFence,
 } from "../../src/rlm/design-plan.js";
 
 describe("extractJson", () => {
@@ -111,66 +113,199 @@ describe("parseFunctionList — module path sanity", () => {
   });
 });
 
-describe("parsePackageJson", () => {
-  it("accepts valid JSON with vitest in devDependencies", () => {
-    const raw = JSON.stringify({
-      name: "proj",
-      type: "module",
-      devDependencies: { vitest: "^2.0.0" },
-    });
-    const cfg = parsePackageJson(raw);
+describe("extractTaggedFence", () => {
+  it("pulls content from a specific fence tag", () => {
+    const r = 'pre ```decisions\n{"a":1}\n``` post';
+    expect(extractTaggedFence(r, "decisions")).toBe('{"a":1}');
+  });
+
+  it("returns null when the tag is absent", () => {
+    expect(extractTaggedFence('```json\n{}\n```', "decisions")).toBeNull();
+  });
+
+  it("returns null for an empty fence body", () => {
+    expect(extractTaggedFence("```decisions\n\n```", "decisions")).toBeNull();
+  });
+
+  it("handles file:<path> style tags with dots", () => {
+    const r = "```file:tsconfig.json\n{}\n```";
+    expect(extractTaggedFence(r, "file:tsconfig.json")).toBe("{}");
+  });
+});
+
+describe("parsePhase0Response", () => {
+  const makeResponse = (overrides?: {
+    decisions?: string;
+    packageJson?: string;
+    tsconfig?: string;
+  }) => {
+    const decisions =
+      overrides?.decisions ??
+      JSON.stringify({
+        runtime: "node",
+        moduleSystem: "esm",
+        testFramework: "vitest",
+        testCommand: "npx vitest run --reporter=tap",
+        singleTestCommand: "npx vitest run --reporter=tap {file}",
+        testImports: `import { describe, it, expect } from "vitest";`,
+      });
+    const pkg = overrides?.packageJson ?? '{"name":"p"}';
+    const ts = overrides?.tsconfig ?? "{}";
+    return (
+      "```decisions\n" +
+      decisions +
+      "\n```\n```file:package.json\n" +
+      pkg +
+      "\n```\n```file:tsconfig.json\n" +
+      ts +
+      "\n```"
+    );
+  };
+
+  it("parses a complete response", () => {
+    const cfg = parsePhase0Response(makeResponse());
+    expect(cfg.runtime).toBe("node");
     expect(cfg.testFramework).toBe("vitest");
-    expect(cfg.packageJson).toBe(raw);
+    expect(cfg.testCommand).toContain("tap");
+    expect(cfg.packageJson).toBe('{"name":"p"}');
+    expect(cfg.tsconfig).toBe("{}");
   });
 
-  it("accepts valid JSON with jest in devDependencies", () => {
-    const raw = JSON.stringify({
-      name: "proj",
-      type: "module",
-      devDependencies: { jest: "^29.0.0", "@jest/globals": "^29.0.0" },
+  it("accepts any runtime / framework string (no allowlist)", () => {
+    const decisions = JSON.stringify({
+      runtime: "deno",
+      moduleSystem: "esm",
+      testFramework: "deno:test",
+      testCommand: "deno test --reporter=tap",
+      singleTestCommand: "deno test --reporter=tap {file}",
+      testImports: `import { assertEquals } from "jsr:@std/assert";`,
     });
-    const cfg = parsePackageJson(raw);
-    expect(cfg.testFramework).toBe("jest");
+    const cfg = parsePhase0Response(
+      makeResponse({ decisions, packageJson: "{}", tsconfig: "{}" }),
+    );
+    expect(cfg.runtime).toBe("deno");
+    expect(cfg.testFramework).toBe("deno:test");
   });
 
-  it("rejects a package.json with BOTH vitest and jest (ambiguous)", () => {
-    const raw = JSON.stringify({
-      name: "proj",
-      type: "module",
-      devDependencies: { vitest: "^2.0.0", jest: "^29.0.0" },
+  it("propagates optional fields (testingNotes, mockingStrategy, packageManager)", () => {
+    const decisions = JSON.stringify({
+      runtime: "node",
+      moduleSystem: "esm",
+      testFramework: "vitest",
+      testCommand: "npx vitest run --reporter=tap",
+      singleTestCommand: "npx vitest run --reporter=tap {file}",
+      testImports: "import...",
+      packageManager: "pnpm",
+      mockingStrategy: "DI only via ctx.fns — no module mocks",
+      testingNotes: "prefer injection",
     });
-    expect(() => parsePackageJson(raw)).toThrow(/both/i);
+    const cfg = parsePhase0Response(makeResponse({ decisions }));
+    expect(cfg.packageManager).toBe("pnpm");
+    expect(cfg.mockingStrategy).toContain("DI only");
+    expect(cfg.testingNotes).toBe("prefer injection");
   });
 
-  it("rejects a package.json with NEITHER vitest nor jest", () => {
-    const raw = JSON.stringify({
-      name: "proj",
-      type: "module",
-      devDependencies: { typescript: "^5.0.0" },
+  it("throws when decisions fence missing", () => {
+    const r = "```file:package.json\n{}\n```\n```file:tsconfig.json\n{}\n```";
+    expect(() => parsePhase0Response(r)).toThrow(/decisions fence/i);
+  });
+
+  it("throws when required field missing", () => {
+    const decisions = JSON.stringify({
+      runtime: "node",
+      moduleSystem: "esm",
+      testFramework: "vitest",
+      // missing testCommand + testImports
     });
-    expect(() => parsePackageJson(raw)).toThrow(/vitest|jest/i);
+    expect(() => parsePhase0Response(makeResponse({ decisions }))).toThrow(
+      /testCommand/,
+    );
   });
 
-  it("rejects missing devDependencies", () => {
-    const raw = JSON.stringify({ name: "proj", type: "module" });
-    expect(() => parsePackageJson(raw)).toThrow(/devDependencies/i);
-  });
-
-  it('requires "type": "module" (ESM is mandatory for proc-ts emitter)', () => {
-    const raw = JSON.stringify({
-      name: "proj",
-      devDependencies: { vitest: "^2.0.0" },
+  it("throws when package.json fence missing", () => {
+    const decisions = JSON.stringify({
+      runtime: "node",
+      moduleSystem: "esm",
+      testFramework: "vitest",
+      testCommand: "x",
+      singleTestCommand: "x {file}",
+      testImports: "y",
     });
-    expect(() => parsePackageJson(raw)).toThrow(/type.*module/i);
+    const r = "```decisions\n" + decisions + "\n```\n```file:tsconfig.json\n{}\n```";
+    expect(() => parsePhase0Response(r)).toThrow(/package\.json fence/i);
   });
 
-  it("rejects non-JSON input", () => {
-    expect(() => parsePackageJson("not json")).toThrow();
+  it("throws when tsconfig fence missing", () => {
+    const decisions = JSON.stringify({
+      runtime: "node",
+      moduleSystem: "esm",
+      testFramework: "vitest",
+      testCommand: "x",
+      singleTestCommand: "x {file}",
+      testImports: "y",
+    });
+    const r = "```decisions\n" + decisions + "\n```\n```file:package.json\n{}\n```";
+    expect(() => parsePhase0Response(r)).toThrow(/tsconfig\.json fence/i);
   });
 
-  it("rejects non-object JSON (array / string / number)", () => {
-    expect(() => parsePackageJson("[]")).toThrow();
-    expect(() => parsePackageJson('"hi"')).toThrow();
+  it("throws on decisions JSON parse failure", () => {
+    const r =
+      "```decisions\n{not valid\n```\n```file:package.json\n{}\n```\n```file:tsconfig.json\n{}\n```";
+    expect(() => parsePhase0Response(r)).toThrow(/not valid JSON/);
+  });
+
+  // Phase U12 — per-node scoping requires a second command, a template
+  // string with a {file} placeholder, that the harness interpolates at
+  // dispatch time with the target's `<name>.test.ts`.
+  it("throws when singleTestCommand is missing (U12)", () => {
+    const decisions = JSON.stringify({
+      runtime: "node",
+      moduleSystem: "esm",
+      testFramework: "vitest",
+      testCommand: "npx vitest run --reporter=tap",
+      testImports: "x",
+      // singleTestCommand intentionally absent
+    });
+    expect(() => parsePhase0Response(makeResponse({ decisions }))).toThrow(
+      /singleTestCommand/,
+    );
+  });
+
+  it("throws when singleTestCommand has no {file} placeholder (U12)", () => {
+    const decisions = JSON.stringify({
+      runtime: "node",
+      moduleSystem: "esm",
+      testFramework: "vitest",
+      testCommand: "npx vitest run --reporter=tap",
+      singleTestCommand: "npx vitest run --reporter=tap",
+      testImports: "x",
+    });
+    expect(() => parsePhase0Response(makeResponse({ decisions }))).toThrow(
+      /\{file\}/,
+    );
+  });
+
+  it("propagates singleTestCommand on happy path (U12)", () => {
+    const cfg = parsePhase0Response(makeResponse());
+    expect(cfg.singleTestCommand).toContain("{file}");
+  });
+});
+
+describe("extractTestingNotes", () => {
+  it("returns the body of a ```testing-notes fence", () => {
+    const response =
+      "```json\n{}\n```\n```testing-notes\n- ESM+vitest: prefer vi.mock()\n- Custom injection via ctx.fns\n```";
+    expect(extractTestingNotes(response)).toBe(
+      "- ESM+vitest: prefer vi.mock()\n- Custom injection via ctx.fns",
+    );
+  });
+
+  it("returns null when no fence present", () => {
+    expect(extractTestingNotes("no fences here")).toBeNull();
+  });
+
+  it("returns null for an empty fence", () => {
+    expect(extractTestingNotes("```testing-notes\n\n```")).toBeNull();
   });
 });
 
@@ -292,7 +427,8 @@ function seedVitestProjectConfig(g: ReturnType<typeof createDesignGraph>): void 
   g.setProjectConfig({
     packageJson:
       '{"name":"test","version":"0.1.0","type":"module","scripts":{"test":"vitest run"},"dependencies":{},"devDependencies":{"vitest":"^2.0.0"}}',
-    testFramework: "vitest",
+    testFramework: "vitest", runtime: "node", testCommand: "npx vitest run --reporter=json", testImports: "",
+    moduleSystem: "esm",
   });
 }
 
@@ -302,17 +438,33 @@ describe("designPlan", () => {
     const prompts: string[] = [];
     const chat = async (prompt: string) => {
       prompts.push(prompt);
-      if (prompt.includes("fill in this package.json")) {
+      if (prompt.includes("Phase 0 — project initialization")) {
+        const pkg = JSON.stringify({
+          name: "guestbook",
+          version: "0.1.0",
+          type: "module",
+          scripts: { test: "vitest run --reporter=tap" },
+          dependencies: {},
+          devDependencies: { vitest: "^2.0.0" },
+        });
+        const tsconfig = '{"compilerOptions":{"module":"ESNext","target":"ES2022"}}';
+        const decisions = JSON.stringify({
+          runtime: "node",
+          moduleSystem: "esm",
+          testFramework: "vitest",
+          testCommand: "npx vitest run --reporter=tap",
+          singleTestCommand: "npx vitest run --reporter=tap {file}",
+          testImports: `import { describe, it, expect, vi } from "vitest";`,
+          packageManager: "npm",
+          testingNotes: "ESM + vitest: prefer vi.mock() with hoisted factories.",
+        });
         return (
-          "```json\n" +
-          JSON.stringify({
-            name: "guestbook",
-            version: "0.1.0",
-            type: "module",
-            scripts: { test: "vitest run" },
-            dependencies: {},
-            devDependencies: { vitest: "^2.0.0" },
-          }) +
+          "```decisions\n" +
+          decisions +
+          "\n```\n```file:package.json\n" +
+          pkg +
+          "\n```\n```file:tsconfig.json\n" +
+          tsconfig +
           "\n```"
         );
       }
@@ -365,7 +517,8 @@ describe("designPlan", () => {
     g.setProjectConfig({
       packageJson:
         '{"name":"x","devDependencies":{"jest":"^29.0.0"}}',
-      testFramework: "jest",
+      testFramework: "jest", runtime: "node", testCommand: "npx jest --json", testImports: "",
+      moduleSystem: "cjs",
     });
     const prompts: string[] = [];
     const chat = async (prompt: string) => {
@@ -409,7 +562,7 @@ describe("designPlan", () => {
       }),
     });
     // The phase-0 prompt must not have been emitted.
-    expect(prompts.some((p) => p.includes("fill in this package.json"))).toBe(
+    expect(prompts.some((p) => p.includes("Phase 0 of the pipeline"))).toBe(
       false,
     );
     // Original config preserved.
@@ -419,7 +572,7 @@ describe("designPlan", () => {
   it("phase 0 failure fails the plan with phase='plan' and includes failedSpecs=[]", async () => {
     const g = createDesignGraph();
     const chat = async (prompt: string) => {
-      if (prompt.includes("fill in this package.json")) {
+      if (prompt.includes("Phase 0 of the pipeline")) {
         return "total garbage not JSON at all";
       }
       throw new Error("should not reach phase 1");
@@ -596,7 +749,7 @@ describe("designPlan", () => {
       "plan",
     );
     const chat = async (prompt: string) => {
-      if (prompt.startsWith("You are decomposing")) {
+      if (prompt.includes("Parent function:")) {
         return (
           "```json\n" +
           JSON.stringify([
@@ -716,7 +869,7 @@ describe("designPlan", () => {
       "plan",
     );
     const chat = async (prompt: string) => {
-      if (prompt.startsWith("You are decomposing")) {
+      if (prompt.includes("Parent function:")) {
         // 10 children — over the cap
         return (
           "```json\n" +
@@ -880,7 +1033,7 @@ describe("designPlan", () => {
     const prompts: string[] = [];
     const chat = async (prompt: string) => {
       prompts.push(prompt);
-      if (prompt.startsWith("You are decomposing")) {
+      if (prompt.includes("Parent function:")) {
         return (
           "```json\n" +
           JSON.stringify([
@@ -974,7 +1127,7 @@ describe("designPlan", () => {
     );
     expect(phase2Prompt).toBeDefined();
     // Normalization forces `async` keyword in the displayed signature.
-    expect(phase2Prompt).toContain("async function load(ctx: Ctx): Promise<string>");
+    expect(phase2Prompt).toContain("async function load(): Promise<string>");
   });
 
   it("surfaces cross-module name collision as a plan failure (not a silent skip)", async () => {
@@ -1028,7 +1181,7 @@ describe("designPlan", () => {
       "plan",
     );
     const chat = async (prompt: string) => {
-      if (prompt.startsWith("You are decomposing")) {
+      if (prompt.includes("Parent function:")) {
         // LLM returns children with a WRONG module path — the harness
         // must discard the LLM's module and use the parent's.
         return (
@@ -1122,6 +1275,243 @@ describe("designPlan", () => {
     });
     // `bar` should appear in failedSpecs, build still proceeds.
     expect(report.failedSpecs).toEqual(["src/a.ts#bar"]);
+  });
+
+  // ── A2: phase-1 idempotent re-entry ─────────────────────────────
+  // When the outer agent re-invokes designPlan on a graph that already
+  // has functions (first run hit a coherence failure, second run is a
+  // retry on the same graph), phase 1 must not crash or silently throw
+  // away information. The planner must SEE what's there, and duplicate
+  // proposals should be absorbed without halting the pipeline.
+
+  it("phase 1 top-level prompt lists existing functions with sig+desc", async () => {
+    const g = createDesignGraph();
+    seedVitestProjectConfig(g);
+    g.addFunction(
+      "src/a.ts",
+      "loadEntries",
+      { params: [], returnType: "Promise<Entry[]>", isAsync: true },
+      "read guestbook entries from disk",
+      "plan",
+    );
+    // Simulate a non-resumable situation: origin "plan" but we want
+    // phase 1 to RUN AGAIN (e.g. outer agent retry). Force by clearing
+    // the prior-skip path — trick: add a second function with origin
+    // "declared" so prior filter still sees loadEntries as prior. Then
+    // no phase 1 chat call happens. To actually exercise phase 1 with
+    // pre-existing context we need a graph where origin !== "plan" so
+    // prior filter is empty. Use origin "declared" instead.
+    const g2 = createDesignGraph();
+    seedVitestProjectConfig(g2);
+    g2.addFunction(
+      "src/a.ts",
+      "loadEntries",
+      { params: [], returnType: "Promise<Entry[]>", isAsync: true },
+      "read guestbook entries from disk",
+      "manual",
+    );
+    let phase1Prompt = "";
+    const chat = async (prompt: string) => {
+      if (prompt.includes("list the top-level functions")) {
+        phase1Prompt = prompt;
+        return (
+          "```json\n" +
+          JSON.stringify([
+            {
+              module: "src/a.ts",
+              name: "saveEntries",
+              signature: { params: [], returnType: "void" },
+              description: "write entries",
+            },
+          ]) +
+          "\n```"
+        );
+      }
+      return specResp;
+    };
+    await designPlan(g2, "task", {
+      chat,
+      dispatch: async (_g, mod, name) => ({
+        module: mod,
+        name,
+        status: "tests-green",
+        implementation: "",
+        attempts: 1,
+        testOutput: "",
+      }),
+      finalize: async () => ({
+        ok: true,
+        files: {},
+        unimplemented: [],
+        consistency: { ok: true, violations: [], advisories: [] },
+        testsPassed: 0,
+        testsFailed: 0,
+        testOutput: "",
+        typecheckOk: true,
+        typecheckOutput: "",
+      }),
+    });
+    // Prompt must mention the existing function by name, signature,
+    // and description so the model knows what's already there.
+    expect(phase1Prompt).toContain("loadEntries");
+    expect(phase1Prompt).toContain("read guestbook entries from disk");
+    expect(phase1Prompt).toContain("Promise<Entry[]>");
+  });
+
+  it("phase 1 silent-skips duplicate-name collisions across module boundaries", async () => {
+    // Outer agent retry: LLM proposes `loadEntries` (already in graph
+    // under src/a.ts) but gives module as `src/server.ts`. Without
+    // silent-skip, the cross-module collision throws "duplicate
+    // function name" and halts the whole pipeline.
+    const g = createDesignGraph();
+    seedVitestProjectConfig(g);
+    g.addFunction(
+      "src/a.ts",
+      "loadEntries",
+      { params: [], returnType: "void" },
+      "existing",
+      "manual",
+    );
+    const chat = async (prompt: string) => {
+      if (prompt.includes("list the top-level functions")) {
+        return (
+          "```json\n" +
+          JSON.stringify([
+            {
+              module: "src/server.ts", // different module — collision!
+              name: "loadEntries",
+              signature: { params: [], returnType: "void" },
+              description: "duplicate attempt",
+            },
+            {
+              module: "src/server.ts",
+              name: "fresh",
+              signature: { params: [], returnType: "void" },
+              description: "new fn",
+            },
+          ]) +
+          "\n```"
+        );
+      }
+      return specResp;
+    };
+    const report = await designPlan(g, "task", {
+      chat,
+      dispatch: async (_g, mod, name) => ({
+        module: mod,
+        name,
+        status: "tests-green",
+        implementation: "",
+        attempts: 1,
+        testOutput: "",
+      }),
+      finalize: async () => ({
+        ok: true,
+        files: {},
+        unimplemented: [],
+        consistency: { ok: true, violations: [], advisories: [] },
+        testsPassed: 0,
+        testsFailed: 0,
+        testOutput: "",
+        typecheckOk: true,
+        typecheckOutput: "",
+      }),
+    });
+    // Pipeline did not halt on the collision; the "fresh" fn made it in.
+    expect(report.phase).not.toBe("plan");
+    expect(g.getFunction("src/server.ts", "fresh")).toBeDefined();
+    // The colliding loadEntries stayed in its original module; no
+    // second copy in src/server.ts.
+    expect(g.getFunction("src/server.ts", "loadEntries")).toBeUndefined();
+    expect(g.getFunction("src/a.ts", "loadEntries")?.description).toBe("existing");
+  });
+
+  it("phase 2 spec prompt frames the spec as contract-not-recipe (D1)", async () => {
+    // D1: spec prompt must tell the architect to state WHAT not HOW,
+    // and that edge cases are suggestions not mandates. Lock-in test
+    // so a later rewrite doesn't silently drift prescriptive again.
+    const g = createDesignGraph();
+    seedVitestProjectConfig(g);
+    g.addFunction(
+      "src/a.ts",
+      "foo",
+      { params: [], returnType: "void" },
+      "do a thing",
+      "plan",
+    );
+    let specPrompt = "";
+    const chat = async (prompt: string) => {
+      if (prompt.includes("Fill in the SPEC")) {
+        specPrompt = prompt;
+        return specResp;
+      }
+      return specResp;
+    };
+    await designPlan(g, "task", {
+      chat,
+      dispatch: async (_g, mod, name) => ({
+        module: mod,
+        name,
+        status: "tests-green",
+        implementation: "",
+        attempts: 1,
+        testOutput: "",
+      }),
+      finalize: async () => ({
+        ok: true,
+        files: {},
+        unimplemented: [],
+        consistency: { ok: true, violations: [], advisories: [] },
+        testsPassed: 0,
+        testsFailed: 0,
+        testOutput: "",
+        typecheckOk: true,
+        typecheckOutput: "",
+      }),
+    });
+    expect(specPrompt).toContain("CONTRACT");
+    expect(specPrompt).toContain("not the implementation plan");
+    expect(specPrompt).toMatch(/edge cases are SUGGESTIONS|Edge cases are SUGGESTIONS/i);
+    expect(specPrompt).toContain("2–4 edge cases");
+  });
+
+  it("decompose prompt offers refuse option + concrete refuse examples", async () => {
+    // A3: the decompose prompt must explicitly allow returning an
+    // empty array and name the cases where splitting is wrong
+    // (built-in wrappers, small fns, test/sibling bugs). Regression
+    // guard — the old prompt just asked for 2-5 children, which led
+    // to the run 9 over-decomposition cascade.
+    const g = createDesignGraph();
+    seedVitestProjectConfig(g);
+    g.addFunction(
+      "src/r.ts",
+      "simple",
+      { params: [], returnType: "void" },
+      "wraps path.join",
+      "plan",
+    );
+    let decomposePrompt = "";
+    const chat = async (prompt: string) => {
+      if (prompt.includes("Parent function:")) {
+        decomposePrompt = prompt;
+        return "```json\n[]\n```"; // refuse
+      }
+      return specResp;
+    };
+    await designPlan(g, "task", {
+      chat,
+      parent: "simple",
+      dispatch: async () => {
+        throw new Error("should not dispatch");
+      },
+      finalize: async () => {
+        throw new Error("should not finalize");
+      },
+    });
+    expect(decomposePrompt).toContain("EMPTY ARRAY");
+    expect(decomposePrompt).toContain("path.join");
+    expect(decomposePrompt).toContain("<30 lines");
+    expect(decomposePrompt).toContain("tests look wrong");
   });
 
   it("fails with phase=plan when phase 1 never returns valid JSON", async () => {

@@ -22,6 +22,7 @@ import type {
   DesignGraph,
 } from "./design-graph.js";
 import { debug } from "./debug.js";
+import { parseTestOutput, splitCommand } from "./test-runner.js";
 
 export interface FinalizeOptions {
   typecheck?: boolean;
@@ -122,32 +123,50 @@ export async function finalizeProject(
     }
 
     if (runTests) {
-      const vitest = await shellOut(
-        "npx",
-        ["vitest", "run", "--reporter=json", "--root", dir],
-        options,
-      );
-      const counts = parseVitestJson(vitest.stdout);
+      // Phase U2 — spawn decisions.testCommand, parse TAP (with
+      // JSON fallback for vitest/jest reporter output). Throw in
+      // production when testCommand is missing; VITEST env keeps the
+      // legacy vitest spawn working for the harness's own test suite.
+      const decisions = graph.getProjectConfig();
+      const rawCmd = decisions?.testCommand?.trim() ?? "";
+      let command: string;
+      let args: string[];
+      let useProjectDirCwd = false;
+      if (rawCmd.length > 0) {
+        const tokens = splitCommand(rawCmd);
+        command = tokens[0];
+        args = tokens.slice(1);
+        useProjectDirCwd = true;
+      } else if (process.env.VITEST) {
+        command = "npx";
+        args = ["vitest", "run", "--reporter=json", "--root", dir];
+      } else {
+        throw new Error(
+          "finalize: missing decisions.testCommand. Phase 0 must commit to a test framework + command.",
+        );
+      }
+      const run = await shellOutArgs(command, args, {
+        ...options,
+        cwdOverride: useProjectDirCwd ? dir : undefined,
+      });
+      const counts = parseTestOutput(run.stdout);
       report.testsPassed = counts?.passed ?? 0;
       report.testsFailed = counts?.failed ?? 0;
       debug(
         "finalize",
-        `vitest parsed=${counts !== null} passed=${report.testsPassed} failed=${report.testsFailed}`,
+        `tests parsed=${counts !== null} passed=${report.testsPassed} failed=${report.testsFailed}`,
       );
-      // Lead with a distilled per-failure digest — the Architect's
-      // repair loop needs the assertion messages, not the JSON reporter
-      // boilerplate.
       const combined = counts
         ? [
             counts.failureDigest
               ? `----- failures -----\n${counts.failureDigest}`
               : "",
             `----- counts -----\npassed=${counts.passed} failed=${counts.failed}`,
-            `----- stderr tail -----\n${vitest.stderr.slice(-800)}`,
+            `----- stderr tail -----\n${run.stderr.slice(-800)}`,
           ]
             .filter(Boolean)
             .join("\n")
-        : `${vitest.stdout}\n${vitest.stderr}`;
+        : `${run.stdout}\n${run.stderr}`;
       report.testOutput = combined.slice(-4000);
     }
 
@@ -237,7 +256,19 @@ function shellOut(
   args: string[],
   options: FinalizeOptions,
 ): Promise<ShellResult> {
-  const cwd = options.cwd ?? process.cwd();
+  return shellOutArgs(cmd, args, { ...options });
+}
+
+/** Same as shellOut but accepts an explicit `cwdOverride` so the
+ *  Phase U2 path can spawn in the materialized project dir (where
+ *  the architect's testCommand expects to find tsconfig + node_modules)
+ *  rather than the caller's cwd. */
+function shellOutArgs(
+  cmd: string,
+  args: string[],
+  options: FinalizeOptions & { cwdOverride?: string },
+): Promise<ShellResult> {
+  const cwd = options.cwdOverride ?? options.cwd ?? process.cwd();
   const timeoutMs = options.timeoutMs ?? 120_000;
   return new Promise((resolve) => {
     const child = spawn(cmd, args, { cwd, env: process.env });

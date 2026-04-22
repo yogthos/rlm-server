@@ -1,0 +1,4 @@
+Write a TypeScript function `parseQueryString(s: string): Record<string, string>`
+that parses `a=1&b=2` → `{ a: "1", b: "2" }`. Cover: empty string, single
+pair, multiple pairs, URL-encoded values (e.g. `name=John%20Doe`),
+duplicate keys (last wins).

@@ -9,11 +9,15 @@
  *   - `phantom-dep`: a spec lists a dependency whose name isn't in
  *     the graph. Was `dangling-call` under the old scheme; now
  *     caught at the spec layer instead of the body layer.
- *   - `orphan`: a function nobody depends on AND isn't listed as a
- *     top-level root (no decomposition parent). Dead code in the
- *     call graph — either wire it in or drop it.
  *   - `cycle`: a dependency cycle. Leaf-up build can't level the
  *     graph with cycles, so this is a hard error.
+ *
+ * Orphan detection was removed: decomposition children (parent !==
+ * null) are wired via the tree link — `computeDependencyLevels` unions
+ * spec.deps with tree-children, and the implementer prompt lists
+ * `fn.children` directly. The prior orphan heal burned LLM calls
+ * patching spec.deps that nothing reads (run 9: 24 false-positive
+ * cycle-reverts).
  *
  * Dropped vs. old coherence:
  *   - `undeclared-call` (body calls X but spec doesn't list it):
@@ -29,7 +33,7 @@
 import type { DesignGraph } from "./design-graph.js";
 import { debug } from "./debug.js";
 
-export type CoherenceViolationKind = "phantom-dep" | "orphan" | "cycle";
+export type CoherenceViolationKind = "phantom-dep" | "cycle";
 
 export interface CoherenceViolation {
   kind: CoherenceViolationKind;
@@ -119,19 +123,13 @@ export async function designCoherence(
     });
   }
 
-  // Orphans: a function nobody depends on, not a root in the
-  // decomposition tree. Root-in-decomposition is a legitimate
-  // entry point even without callers.
-  for (const f of fns) {
-    if (f.parent === null) continue; // root → not an orphan
-    if (calledSet.has(f.name)) continue;
-    violations.push({
-      kind: "orphan",
-      module: f.module,
-      name: f.name,
-      detail: `Function "${f.name}" has a decomposition parent "${f.parent}" but no function lists it in spec.dependencies. Wire it into "${f.parent}"'s deps or drop it from the plan.`,
-    });
-  }
+  // Orphan detection intentionally dropped: decomposition children
+  // (parent !== null) are wired via the tree link — `computeDependency
+  // Levels` unions spec.deps with tree-children, and the implementer
+  // prompt lists `fn.children` directly. Top-level functions are
+  // legitimate entry points, so they're not orphans either. The prior
+  // flag triggered a heal that burned LLM calls patching spec.deps
+  // nothing reads (run 9: 24 false-positive cycle-reverts).
 
   debug(
     "coherence",

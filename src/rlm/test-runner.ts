@@ -12,6 +12,10 @@
 
 import { spawn } from "node:child_process";
 import { mkdtemp, mkdir, writeFile, rm, symlink } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { fileURLToPath } from "node:url";
+import { ensureDepsInstalled } from "./install-deps.js";
+import { repairPackageJson } from "./design-package-json-repair.js";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { DesignGraph } from "./design-graph.js";
@@ -20,6 +24,9 @@ import { debug } from "./debug.js";
 export interface CandidateBody {
   module: string;
   name: string;
+  /** Since Phase 3 (wrapper-kill): the COMPLETE file content
+   *  (imports + signature + body). Kept named `body` for brevity
+   *  across call sites; semantically this is the full file. */
   body: string;
 }
 
@@ -75,28 +82,105 @@ export interface RunTestsOptions {
  */
 export interface ProjectDir {
   path: string;
+  /** Phase H1 — dispose is OPT-IN. Callers no longer invoke this in
+   *  their finally block; by default the directory survives so the
+   *  user can `cd` into it post-build. To clean up explicitly, set
+   *  `RLM_DISPOSE_PROJECT_DIR=1` (respected by design-build and
+   *  design-plan-integration) or call `dispose()` manually in tests. */
   dispose(): Promise<void>;
 }
 
 /**
  * Create a persistent project directory — materialize the full graph
- * once, keep the package.json/tsconfig/ctx.ts/etc. warm across calls.
- * The caller must `await dir.dispose()` when the build finishes.
+ * once, keep the package.json/tsconfig/etc. warm across calls.
+ *
+ * Phase H1 — the project is NO LONGER auto-disposed. Callers can
+ * `await dir.dispose()` when they want to remove it, but by default
+ * the directory survives so the user can inspect what the LLM built.
+ * Default location is `<repo>/benchmark/projects/rlm-<timestamp>/`
+ * (previously `/tmp/rlm-project-XXXXXX/`) so the artifacts are where
+ * the user expects to find them.
  */
 export async function createProjectDir(
   graph: DesignGraph,
-  options: { tmpRoot?: string } = {},
+  options: {
+    tmpRoot?: string;
+    projectRoot?: string;
+    /** Phase H3 — when provided, a failed `npm install` triggers a
+     *  `repairPackageJson` round trip. Up to `maxRepairAttempts`
+     *  repair+retry cycles before we give up and materialize anyway
+     *  (the downstream dispatch will surface compile errors). */
+    chat?: (prompt: string) => Promise<string>;
+    maxRepairAttempts?: number;
+  } = {},
 ): Promise<ProjectDir> {
-  const tmpRoot = options.tmpRoot ?? tmpdir();
-  const dir = await mkdtemp(path.join(tmpRoot, "rlm-project-"));
+  // Resolution order: explicit projectRoot (preferred) → tmpRoot
+  // (back-compat for tests) → <repo>/benchmark/projects.
+  // Under VITEST, default to the OS tmpdir so test runs never pollute
+  // benchmark/projects (tests don't set projectRoot and accumulated
+  // dirs there are just noise).
+  const root =
+    options.projectRoot ??
+    options.tmpRoot ??
+    (process.env.VITEST ? tmpdir() : defaultProjectRoot());
+  await mkdir(root, { recursive: true });
+  const stamp = projectTimestamp();
+  const dir = path.join(root, `rlm-${stamp}`);
+  await mkdir(dir, { recursive: true });
   debug("testrun", `created persistent project dir ${dir}`);
-  const framework = graph.getProjectConfig()?.testFramework ?? "vitest";
-  await writeScaffolding(dir, framework);
   const files = graph.materialize();
+  const runtime = graph.getProjectConfig()?.runtime ?? "node";
+  // Phase U5 — minimal scaffolding. Architect-authored package.json /
+  // tsconfig in the asset map always wins; we only provide fallbacks.
+  await writeScaffolding(
+    dir,
+    "package.json" in files,
+    "tsconfig.json" in files,
+    runtime,
+  );
   for (const [rel, content] of Object.entries(files)) {
     const full = path.join(dir, rel);
     await mkdir(path.dirname(full), { recursive: true });
     await writeFile(full, content, "utf8");
+  }
+  // Phase H2 — install declared dependencies once, right after the
+  // initial materialize. Phase H3 — when install fails and a `chat`
+  // fn is available, loop through architect-driven repair rounds
+  // until install succeeds or the budget runs out. Phase U4 — use
+  // decisions.packageManager to pick npm / pnpm / yarn / bun / skip.
+  const packageManager = graph.getProjectConfig()?.packageManager;
+  const maxRepairAttempts = options.maxRepairAttempts ?? 3;
+  let installRes = await ensureDepsInstalled(dir, { packageManager });
+  if (!installRes.ok && options.chat) {
+    for (let attempt = 1; attempt <= maxRepairAttempts; attempt++) {
+      debug(
+        "testrun",
+        `install failed (attempt ${attempt}/${maxRepairAttempts}) — invoking pkg-repair`,
+      );
+      const repair = await repairPackageJson(graph, installRes.stderr, {
+        chat: options.chat,
+      });
+      if (!repair.ok) {
+        debug("testrun", `pkg-repair gave up: ${repair.error}`);
+        break;
+      }
+      // Rewrite package.json on disk from the revised graph asset.
+      const revised =
+        graph.getAsset("package.json") ??
+        graph.getProjectConfig()?.packageJson;
+      if (!revised) break;
+      await writeFile(path.join(dir, "package.json"), revised, "utf8");
+      installRes = await ensureDepsInstalled(dir, { packageManager });
+      if (installRes.ok) break;
+    }
+  }
+  if (!installRes.ok) {
+    debug(
+      "testrun",
+      `npm install still FAILED after repair loop — proceeding; dispatch will surface the error: ${installRes.stderr.slice(0, 400)}`,
+    );
+  } else if (installRes.ran) {
+    debug("testrun", `npm install OK in ${dir}`);
   }
   return {
     path: dir,
@@ -107,66 +191,139 @@ export async function createProjectDir(
   };
 }
 
+function defaultProjectRoot(): string {
+  // Walk upwards from this file looking for the repo root (the one
+  // with a `benchmark/` dir). Fall back to cwd/benchmark/projects.
+  let cur = path.dirname(fileURLToPath(import.meta.url));
+  for (let i = 0; i < 6; i++) {
+    const candidate = path.join(cur, "benchmark");
+    if (existsSync(candidate)) return path.join(candidate, "projects");
+    cur = path.dirname(cur);
+  }
+  return path.join(process.cwd(), "benchmark", "projects");
+}
+
+function projectTimestamp(): string {
+  // e.g. "20260421-160115-abc1" — sortable + unique across rapid runs.
+  const d = new Date();
+  const pad = (n: number, w = 2) => String(n).padStart(w, "0");
+  const stamp =
+    `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}-` +
+    `${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+  const salt = Math.random().toString(36).slice(2, 6);
+  return `${stamp}-${salt}`;
+}
+
+/**
+ * Phase U5 — minimal scaffolding. The architect owns `package.json`
+ * and `tsconfig.json` via phase-0 decisions (materialize emits them
+ * from the graph's asset map). This helper only writes sensible
+ * fallbacks for the files the architect did NOT provide, plus the
+ * host `node_modules` symlink for Node-runtime projects.
+ *
+ * Previously we also wrote a `jest.config.js` when `framework === "jest"`
+ * — retired. The architect now declares jest config via the project's
+ * own `package.json` ("jest" field) or as an asset.
+ */
 async function writeScaffolding(
   dir: string,
-  framework: "vitest" | "jest" = "vitest",
+  hasPackageJson: boolean,
+  hasTsconfig: boolean,
+  runtime: string = "node",
 ): Promise<void> {
-  await writeFile(
-    path.join(dir, "package.json"),
-    JSON.stringify({ name: "rlm-test", type: "module", private: true }),
-    "utf8",
-  );
-  // Jest needs explicit config; vitest auto-discovers. Without a
-  // jest.config, `npx jest --rootDir <dir>` reports "No tests found"
-  // which looks identical to a load failure in our output.
-  if (framework === "jest") {
+  if (!hasPackageJson) {
     await writeFile(
-      path.join(dir, "jest.config.js"),
-      `// Auto-generated by the RLM harness.\nexport default {\n  testEnvironment: "node",\n  testMatch: ["**/*.test.ts"],\n  transform: {\n    "^.+\\\\.tsx?$": ["ts-jest", { useESM: true }]\n  },\n  extensionsToTreatAsEsm: [".ts"],\n};\n`,
+      path.join(dir, "package.json"),
+      JSON.stringify({ name: "rlm-test", type: "module", private: true }),
       "utf8",
     );
   }
-  await writeFile(
-    path.join(dir, "tsconfig.json"),
-    JSON.stringify(
-      {
-        compilerOptions: {
-          target: "ES2022",
-          module: "ESNext",
-          moduleResolution: "Bundler",
-          strict: false,
-          noEmit: true,
-          skipLibCheck: true,
-          esModuleInterop: true,
-          allowImportingTsExtensions: true,
-          types: ["node"],
+  if (!hasTsconfig) {
+    await writeFile(
+      path.join(dir, "tsconfig.json"),
+      JSON.stringify(
+        {
+          compilerOptions: {
+            target: "ES2022",
+            module: "ESNext",
+            moduleResolution: "Bundler",
+            strict: false,
+            noEmit: true,
+            skipLibCheck: true,
+            esModuleInterop: true,
+            allowImportingTsExtensions: true,
+            types: ["node"],
+          },
+          include: ["**/*.ts"],
         },
-        include: ["**/*.ts"],
-      },
-      null,
-      2,
-    ),
-    "utf8",
-  );
-  // Symlink the host's node_modules so @types/node (and any other
-  // dev-deps) are resolvable from the temp dir. Without this, Node
-  // built-ins (`fs`, `http`, `IncomingMessage`) are unresolved and
-  // vitest's ts transform rejects the test file, yielding a bogus
-  // 0/0 pass-through we can't distinguish from "no tests matched."
-  const hostNodeModules = path.join(process.cwd(), "node_modules");
-  const targetNodeModules = path.join(dir, "node_modules");
-  try {
-    await symlink(hostNodeModules, targetNodeModules, "dir");
-  } catch (e) {
-    debug(
-      "testrun",
-      `could not symlink node_modules: ${e instanceof Error ? e.message : String(e)}`,
+        null,
+        2,
+      ),
+      "utf8",
     );
+  }
+  // Phase U9 — symlink the host's node_modules only for Node-runtime
+  // projects. Deno resolves dependencies via URL imports; Bun uses its
+  // central cache; neither benefits from (and may be confused by) a
+  // node_modules tree dropped in.
+  if (runtime === "node") {
+    const hostNodeModules = path.join(process.cwd(), "node_modules");
+    const targetNodeModules = path.join(dir, "node_modules");
+    try {
+      await symlink(hostNodeModules, targetNodeModules, "dir");
+    } catch (e) {
+      debug(
+        "testrun",
+        `could not symlink node_modules: ${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
   }
 }
 
 function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Split a shell-ish command into argv, honoring single- and double-quoted
+ * segments. Backslash-escapes INSIDE quotes are preserved as-is (Node's
+ * `spawn` doesn't interpret them — the caller gets the literal byte).
+ * Not a full POSIX shell parser: no `$VAR` expansion, no `\\` escaping
+ * outside quotes, no redirection tokens. Covers the common cases:
+ *   npx vitest run
+ *   node --test
+ *   npx vitest run --dir "sub dir"
+ *   bun test 'pattern with space'
+ */
+export function splitCommand(cmd: string): string[] {
+  const out: string[] = [];
+  let cur = "";
+  let quote: '"' | "'" | null = null;
+  for (let i = 0; i < cmd.length; i++) {
+    const c = cmd[i];
+    if (quote) {
+      if (c === quote) {
+        quote = null;
+      } else {
+        cur += c;
+      }
+      continue;
+    }
+    if (c === '"' || c === "'") {
+      quote = c as '"' | "'";
+      continue;
+    }
+    if (/\s/.test(c)) {
+      if (cur.length > 0) {
+        out.push(cur);
+        cur = "";
+      }
+      continue;
+    }
+    cur += c;
+  }
+  if (cur.length > 0) out.push(cur);
+  return out;
 }
 
 export async function runTests(
@@ -203,12 +360,26 @@ export async function runTests(
       "testrun",
       `reused project dir ${dir} — rewrote ${Object.keys(files).length} files`,
     );
+    // Phase H2 — if package.json was among the rewritten files,
+    // `ensureDepsInstalled` will re-run the install. When unchanged,
+    // the hash check skips the spawn. Phase U4 — honors
+    // decisions.packageManager.
+    const install = await ensureDepsInstalled(dir, {
+      packageManager: graph.getProjectConfig()?.packageManager,
+    });
+    if (!install.ok) {
+      debug(
+        "testrun",
+        `npm install FAILED mid-dispatch: ${install.stderr.slice(0, 400)}`,
+      );
+    }
     const result = await invokeTestRunner(
       dir,
       options,
       hasTests,
       framework,
       nameFilter,
+      resolvePerNodeCommand(graph.getProjectConfig(), candidate.name),
     );
     debug(
       "testrun",
@@ -221,7 +392,12 @@ export async function runTests(
   const tmpRoot = options.tmpRoot ?? tmpdir();
   const dir = await mkdtemp(path.join(tmpRoot, "rlm-test-"));
   try {
-    await writeScaffolding(dir, framework);
+    await writeScaffolding(
+      dir,
+      "package.json" in files,
+      "tsconfig.json" in files,
+      graph.getProjectConfig()?.runtime ?? "node",
+    );
     for (const [rel, content] of Object.entries(files)) {
       const full = path.join(dir, rel);
       await mkdir(path.dirname(full), { recursive: true });
@@ -237,6 +413,7 @@ export async function runTests(
       hasTests,
       framework,
       nameFilter,
+      resolvePerNodeCommand(graph.getProjectConfig(), candidate.name),
     );
     debug(
       "testrun",
@@ -248,27 +425,74 @@ export async function runTests(
   }
 }
 
+/**
+ * Phase U12 — resolve the per-node test command. Prefer
+ * `singleTestCommand` with `{file}` interpolated to `<name>.test.ts`
+ * so dispatch spawns ONE test file. Fall back to `testCommand` when
+ * `singleTestCommand` is absent (legacy graphs, VITEST-env tests). The
+ * fallback keeps old call sites working; phase 0 now requires the new
+ * field for every fresh run.
+ */
+function resolvePerNodeCommand(
+  cfg: import("./design-graph.js").ProjectDecisions | null | undefined,
+  candidateName: string,
+): string | undefined {
+  if (!cfg) return undefined;
+  const tpl = cfg.singleTestCommand?.trim();
+  if (tpl && tpl.length > 0) {
+    return tpl.replaceAll("{file}", `${candidateName}.test.ts`);
+  }
+  return cfg.testCommand;
+}
+
 function invokeTestRunner(
   dir: string,
   options: RunTestsOptions,
   hasTests: boolean,
-  framework: "vitest" | "jest",
-  nameFilter?: string,
+  framework: string,
+  nameFilter: string | undefined,
+  testCommand: string | undefined,
 ): Promise<TestRunResult> {
   const cwd = options.cwd ?? process.cwd();
   const timeoutMs = options.timeoutMs ?? 60_000;
-  // Both runners emit a JSON report with the same top-level
-  // numPassedTests / numFailedTests shape, so parseVitestJson handles
-  // both. The CLI surface differs slightly.
-  const args =
-    framework === "jest"
-      ? ["jest", "--json", "--rootDir", dir]
-      : ["vitest", "run", "--reporter=json", "--root", dir];
-  if (nameFilter) {
-    args.push("--testNamePattern", nameFilter);
+  // Phase U1 — universal spawn. `decisions.testCommand` is REQUIRED in
+  // production. Under VITEST (the harness's own test suite), fall back
+  // to the legacy vitest/jest hardcoded spawn so existing tests keep
+  // exercising that code path — but any real run must commit to a
+  // testCommand at phase 0.
+  let command: string;
+  let args: string[];
+  let useProjectDirAsCwd = false;
+  const trimmedCommand = testCommand?.trim() ?? "";
+  // Treat explicit-but-empty testCommand as misconfiguration — phase 0
+  // committed to "run nothing," which is never what the architect
+  // means. Only the VITEST fallback or a throw are valid downstream.
+  if (trimmedCommand.length > 0) {
+    const tokens = splitCommand(trimmedCommand);
+    command = tokens[0];
+    args = tokens.slice(1);
+    useProjectDirAsCwd = true;
+  } else if (process.env.VITEST) {
+    // Test-suite fallback — keeps the existing `runTests — end-to-end
+    // via vitest` tests working without setProjectConfig ceremony.
+    if (framework === "jest") {
+      command = "npx";
+      args = ["jest", "--json", "--rootDir", dir];
+    } else {
+      command = "npx";
+      args = ["vitest", "run", "--reporter=json", "--root", dir];
+    }
+    if (nameFilter) args.push("--testNamePattern", nameFilter);
+  } else {
+    throw new Error(
+      "runTests: missing decisions.testCommand. Phase 0 must commit to a test framework + command before dispatch; the harness no longer defaults to vitest.",
+    );
   }
   return new Promise((resolve) => {
-    const child = spawn("npx", args, { cwd, env: process.env });
+    const child = spawn(command, args, {
+      cwd: useProjectDirAsCwd ? dir : cwd,
+      env: process.env,
+    });
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (d) => (stdout += d.toString()));
@@ -278,8 +502,8 @@ function invokeTestRunner(
     }, timeoutMs);
     child.on("close", () => {
       clearTimeout(timer);
-      const parsed = parseVitestJson(stdout);
-      const output = buildTestOutput(parsed, stderr, hasTests);
+      const parsed = parseTestOutput(stdout);
+      const output = buildTestOutput(parsed, stderr, hasTests, stdout);
       // If the target function has no tests declared, a 0/0 result is a
       // legitimate "no contract to violate" — treat as ok. Otherwise
       // 0/0 usually means the runner crashed before any test executed.
@@ -325,6 +549,43 @@ export function extractStderrDiagnostic(stderr: string): string {
   return lines.join("\n");
 }
 
+/** Extract jest-style "Test suite failed to run" errors from stdout.
+ *  Jest's test-load failures go to stdout (human-readable) even under
+ *  --json reporter — the JSON payload is incomplete in that case.
+ *  Captures the "● Test suite failed to run" block until the next
+ *  blank line so the implementer sees the parse / import error. */
+export function extractStdoutDiagnostic(stdout: string): string {
+  if (!stdout) return "";
+  const sections: string[] = [];
+  // Jest pattern: "● Test suite failed to run" followed by indented
+  // lines. Capture until a blank line or end.
+  const jestBlock =
+    /(?:^|\n)(\s*●\s*Test suite failed to run[\s\S]*?)(?:\n\s*\n|$)/g;
+  let m: RegExpExecArray | null;
+  while ((m = jestBlock.exec(stdout)) !== null) {
+    sections.push(m[1].trim());
+    if (sections.length >= 2) break;
+  }
+  // Vitest can print "SyntaxError" / "TypeError" to stdout too when the
+  // file fails to transform. Scan those as a fallback.
+  if (sections.length === 0) {
+    const markers =
+      /^.*\b(SyntaxError|TypeError|ReferenceError|RangeError|URIError|EvalError):.*$/gm;
+    const hits = stdout.match(markers);
+    if (hits) {
+      const seen = new Set<string>();
+      for (const h of hits) {
+        const line = h.trim();
+        if (seen.has(line)) continue;
+        seen.add(line);
+        sections.push(line);
+        if (sections.length >= 4) break;
+      }
+    }
+  }
+  return sections.join("\n\n");
+}
+
 /**
  * Assemble the test-output blob fed back to the Implementer. Distinguishes
  * three cases:
@@ -348,8 +609,22 @@ export function buildTestOutput(
   parsed: VitestCounts | null,
   stderr: string,
   hasTests: boolean,
+  stdout: string = "",
 ): string {
-  if (!parsed) return stderr;
+  if (!parsed) {
+    // Parse fully failed — surface everything we have. Jest's test-
+    // load errors go to stdout (JSON reporter doesn't intercept
+    // them); vitest's go to stderr. Including both keeps the
+    // implementer from missing the actual diagnostic.
+    const parts: string[] = [];
+    if (stderr.trim().length > 0) {
+      parts.push(`----- stderr -----\n${stderr.slice(-1500)}`);
+    }
+    if (stdout.trim().length > 0) {
+      parts.push(`----- stdout -----\n${stdout.slice(-1500)}`);
+    }
+    return parts.length > 0 ? parts.join("\n\n") : stderr;
+  }
   const sections: string[] = [];
   if (hasTests && parsed.passed === 0 && parsed.failed === 0) {
     sections.push(
@@ -364,14 +639,24 @@ export function buildTestOutput(
     sections.push(`----- failures -----\n${parsed.failureDigest}`);
   }
   // Surface the first few error lines near the top so they survive
-  // even when the 800-char stderr-tail window misses them.
-  const keyErrors = extractStderrDiagnostic(stderr);
+  // even when the 800-char tail windows miss them. Scan BOTH streams:
+  // jest emits "Test suite failed to run" blocks to stdout, vitest
+  // pushes SyntaxError / TypeError to stderr. Without both, the
+  // implementer sees "[TEST FILE DID NOT LOAD]" but no specifics.
+  const stderrErrors = extractStderrDiagnostic(stderr);
+  const stdoutErrors = extractStdoutDiagnostic(stdout);
+  const keyErrors = [stderrErrors, stdoutErrors]
+    .filter((s) => s.length > 0)
+    .join("\n\n");
   if (keyErrors) {
     sections.push(`----- key errors -----\n${keyErrors}`);
   }
   sections.push(
     `----- counts -----\npassed=${parsed.passed} failed=${parsed.failed}`,
   );
+  if (stdout.trim().length > 0) {
+    sections.push(`----- stdout tail -----\n${stdout.slice(-800)}`);
+  }
   if (stderr.trim().length > 0) {
     sections.push(`----- stderr tail -----\n${stderr.slice(-800)}`);
   }
@@ -387,6 +672,99 @@ export interface VitestCounts {
   failingTestNames: string[];
   /** Map of test name → full failure message (including stack trace). */
   fullFailureMessages: Map<string, string>;
+}
+
+/**
+ * Phase F — universal TAP parser. Handles TAP13/14 output from any
+ * runner (node:test, bun test, deno test --reporter=tap, tape, etc.).
+ * Minimal by design: scan for `ok N` / `not ok N` lines, split the
+ * directive from the description, accumulate a failure digest keyed by
+ * the test's name.
+ *
+ * Tolerant of:
+ *   - leading `TAP version 13` / `1..N` plan lines
+ *   - YAML diagnostic blocks (`  ---` … `  ...`) — we capture their
+ *     content as the failure message for the preceding `not ok`
+ *   - `ok N - name` or `ok N name` (hyphen optional)
+ *   - `SKIP` / `TODO` directives — counted as passed (SKIP) or failed
+ *     (TODO) following common convention
+ */
+function parseTapOutput(stdout: string): VitestCounts | null {
+  const lines = stdout.split("\n");
+  let passed = 0;
+  let failed = 0;
+  let sawAnyTap = false;
+  const failures: string[] = [];
+  const failingNames = new Set<string>();
+  const fullFailureMessages = new Map<string, string>();
+  let pendingFailName: string | null = null;
+  let yamlBuffer: string[] | null = null;
+  const TAP_RE = /^(\s*)(ok|not ok)\s+(\d+)?\s*-?\s*(.*)$/;
+  for (const raw of lines) {
+    // YAML-block capture for a preceding "not ok".
+    if (yamlBuffer !== null) {
+      if (/^\s*\.\.\.\s*$/.test(raw)) {
+        const joined = yamlBuffer.join("\n");
+        if (pendingFailName) fullFailureMessages.set(pendingFailName, joined);
+        yamlBuffer = null;
+        pendingFailName = null;
+        continue;
+      }
+      yamlBuffer.push(raw);
+      continue;
+    }
+    if (/^\s*---\s*$/.test(raw) && pendingFailName !== null) {
+      yamlBuffer = [];
+      continue;
+    }
+    const m = raw.match(TAP_RE);
+    if (!m) continue;
+    const verdict = m[2];
+    const rest = m[4].trim();
+    const directive = /#\s*(SKIP|TODO)\b/i.exec(rest)?.[1]?.toUpperCase();
+    // Strip directive comment from the displayed name.
+    const name = rest.replace(/\s*#\s*(SKIP|TODO)\b.*$/i, "").trim() || "(unnamed)";
+    sawAnyTap = true;
+    if (verdict === "ok") {
+      if (directive === "TODO") {
+        failed++;
+        failingNames.add(name);
+        failures.push(`✗ ${name}: # TODO`);
+      } else {
+        passed++;
+      }
+    } else {
+      if (directive === "SKIP") {
+        passed++; // skipped-and-ok treated as non-failing
+      } else {
+        failed++;
+        failingNames.add(name);
+        failures.push(`✗ ${name}`);
+        pendingFailName = name;
+      }
+    }
+  }
+  if (!sawAnyTap) return null;
+  return {
+    passed,
+    failed,
+    failureDigest: failures.slice(0, 20).join("\n"),
+    failingTestNames: [...failingNames].sort(),
+    fullFailureMessages,
+  };
+}
+
+export { parseTapOutput };
+
+/**
+ * Phase F — try TAP first, fall back to JSON. TAP is the universal
+ * contract the ProjectDecisions target; JSON is the legacy
+ * (vitest/jest) path.
+ */
+export function parseTestOutput(stdout: string): VitestCounts | null {
+  const tap = parseTapOutput(stdout);
+  if (tap !== null) return tap;
+  return parseVitestJson(stdout);
 }
 
 function parseVitestJson(stdout: string): VitestCounts | null {

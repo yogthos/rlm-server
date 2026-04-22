@@ -1,0 +1,4 @@
+Write a minimal Node HTTP server in TypeScript: one GET `/greet?name=X`
+route that responds with `{"greeting": "Hello, X"}`. Default `name` to
+"world" when missing. Include integration tests that spin up the server
+and hit the route.

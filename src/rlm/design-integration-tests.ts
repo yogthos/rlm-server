@@ -19,7 +19,11 @@
 import type { DesignGraph } from "./design-graph.js";
 import { extractJson } from "./design-plan.js";
 import { enumeratePaths, type Path } from "./design-paths.js";
-import { parseProjectTestList } from "./design-project-tests.js";
+import {
+  extractProjectTestFile,
+  parseProjectTestList,
+} from "./design-project-tests.js";
+import { renderDecisionsBlock } from "./decisions-prompt.js";
 import { debug } from "./debug.js";
 
 export interface DesignIntegrationTestsOptions {
@@ -63,34 +67,44 @@ function buildPrompt(
   task: string,
   paths: Path[],
 ): string {
+  const fns = graph.listFunctions();
+  const importLines = fns.map((f) => `import ${f.name} from "./${f.name}.js";`);
   return [
-    "You are authoring PROJECT-LEVEL integration tests for a proc-ts app.",
-    "These tests exercise end-to-end workflows — HTTP round-trips, file I/O,",
+    "You are authoring the PROJECT-LEVEL integration test file. These",
+    "tests exercise end-to-end workflows — HTTP round-trips, file I/O,",
     "full call chains — not individual functions in isolation.",
-    "",
+    ...renderDecisionsBlock(graph),
     `User task: ${task}`,
     "",
-    "Functions in the design graph:",
+    "Functions in the design graph (import directly with `.js` extension",
+    "and call naturally):",
     ...renderFunctionSpecs(graph),
     "",
     "Call-graph paths (one test per path REQUIRED):",
     ...renderPaths(paths),
     "",
     "Your task:",
-    "  1. Write ONE integration test for each enumerated path above. The",
-    "     test name should reference the path (e.g., \"path X>Y>Z — does <thing>\").",
-    "  2. Write ADDITIONAL (supplementary) tests for important scenarios",
-    "     the paths don't capture — error branches, malformed input,",
-    "     idempotency, concurrency, whatever the spec suggests matters.",
+    "  1. Write ONE it(...) case for each enumerated path above. The test",
+    "     name should reference the path (e.g., \"path X>Y>Z — does <thing>\").",
+    "  2. Write ADDITIONAL it(...) cases for scenarios the paths don't",
+    "     capture — error branches, malformed input, idempotency, etc.",
     "     Label these as \"supplementary: <what it covers>\".",
     "",
-    "Return ONLY a fenced JSON array. Each entry is:",
-    '  {"name": "<test name>", "code": "<full test body>"}',
+    "OUTPUT — emit ONE fence containing the COMPLETE TypeScript source of",
+    "`project.integration.test.ts`:",
     "",
-    "Example:",
-    "```json",
-    '[{"name": "path startServer>handleRequest — GET / returns 200", "code": "const res = await fetch(\'/\');"}]',
+    "```project-test-file",
+    `import { describe, it, expect } from "<test framework>";`,
+    ...importLines.slice(0, 4),
+    "",
+    'describe("project integration", () => {',
+    '  it("path X>Y>Z — does <thing>", async () => {',
+    "    // call project functions naturally — no ctx, no wrapper.",
+    "  });",
+    "});",
     "```",
+    "",
+    "The harness writes the file verbatim. Do NOT emit a JSON array.",
   ].join("\n");
 }
 
@@ -99,10 +113,10 @@ export async function designIntegrationTests(
   task: string,
   options: DesignIntegrationTestsOptions,
 ): Promise<IntegrationTestsReport> {
-  if (graph.listProjectTests().length > 0) {
+  if (graph.getProjectTestFile() || graph.listProjectTests().length > 0) {
     debug(
       "integration-tests",
-      `resume: ${graph.listProjectTests().length} existing tests, skipping LLM`,
+      `resume: project test file already set, skipping LLM`,
     );
     return { ok: true };
   }
@@ -128,20 +142,29 @@ export async function designIntegrationTests(
       debug("integration-tests", `chat error: ${lastError}`);
       break;
     }
-    const parsed = extractJson(response);
-    if (parsed === null) {
-      lastError = "response did not contain valid JSON";
-      prompt = `${basePrompt}\n\nYour previous response was not valid JSON. Return ONLY a fenced JSON block this time.`;
-      continue;
-    }
-    try {
-      const tests = parseProjectTestList(parsed);
-      for (const t of tests) graph.addProjectTest(t);
+    const fileContent = extractProjectTestFile(response);
+    if (fileContent !== null) {
+      graph.setProjectTestFile(fileContent);
+      debug(
+        "integration-tests",
+        `project-test-file stored (${fileContent.length} chars)`,
+      );
       return { ok: true };
-    } catch (e) {
-      lastError = e instanceof Error ? e.message : String(e);
-      prompt = `${basePrompt}\n\nYour previous response had a schema error: ${lastError}. Fix the shape and return ONLY a fenced JSON block.`;
     }
+    const parsed = extractJson(response);
+    if (parsed !== null) {
+      try {
+        const tests = parseProjectTestList(parsed);
+        for (const t of tests) graph.addProjectTest(t);
+        return { ok: true };
+      } catch (e) {
+        lastError = e instanceof Error ? e.message : String(e);
+      }
+    } else {
+      lastError =
+        "response did not contain a ```project-test-file fence";
+    }
+    prompt = `${basePrompt}\n\nYour previous response didn't include a valid \`\`\`project-test-file fence. Emit ONE fence containing the COMPLETE TypeScript source of project.integration.test.ts.`;
   }
   return { ok: false, error: lastError };
 }

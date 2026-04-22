@@ -23,7 +23,15 @@ describe("designCleanup — body-orphan detection", () => {
     const g = createDesignGraph();
     g.addFunction("src/a.ts", "root", sig());
     g.setSpec("src/a.ts", "root", spec(["helper"]));
-    g.setImplementation("src/a.ts", "root", "ctx.fns.helper(ctx);");
+    g.setImplementation(
+      "src/a.ts",
+      "root",
+      `import helper from "./helper.js";\nexport default function root(): void { helper(); }`,
+    );
+    g.setAnalyzedEdges("src/a.ts", "root", {
+      imports: [{ source: "./helper.js", name: "helper", isDefault: true, line: 1 }],
+      callees: ["helper"],
+    });
     g.addFunctionChild("root", "src/a.ts", "helper", sig());
     g.setSpec("src/a.ts", "helper", spec());
     g.setImplementation("src/a.ts", "helper", "return;");
@@ -56,14 +64,31 @@ describe("designCleanup — body-orphan detection", () => {
     const g = createDesignGraph();
     g.addFunction("src/a.ts", "parent", sig());
     g.setSpec("src/a.ts", "parent", spec(["assembler"]));
-    g.setImplementation("src/a.ts", "parent", "ctx.fns.assembler(ctx);");
+    g.setImplementation(
+      "src/a.ts",
+      "parent",
+      `import assembler from "./assembler.js";\nexport default function parent(): void { assembler(); }`,
+    );
+    g.setAnalyzedEdges("src/a.ts", "parent", {
+      imports: [
+        { source: "./assembler.js", name: "assembler", isDefault: true, line: 1 },
+      ],
+      callees: ["assembler"],
+    });
     g.addFunctionChild("parent", "src/a.ts", "assembler", sig());
     g.setSpec("src/a.ts", "assembler", spec(["partA", "partB"]));
     g.setImplementation(
       "src/a.ts",
       "assembler",
-      "ctx.fns.partA(ctx); ctx.fns.partB(ctx);",
+      `import partA from "./partA.js";\nimport partB from "./partB.js";\nexport default function assembler(): void { partA(); partB(); }`,
     );
+    g.setAnalyzedEdges("src/a.ts", "assembler", {
+      imports: [
+        { source: "./partA.js", name: "partA", isDefault: true, line: 1 },
+        { source: "./partB.js", name: "partB", isDefault: true, line: 2 },
+      ],
+      callees: ["partA", "partB"],
+    });
     g.addFunctionChild("parent", "src/a.ts", "partA", sig());
     g.setSpec("src/a.ts", "partA", spec());
     g.setImplementation("src/a.ts", "partA", "return;");
@@ -100,7 +125,17 @@ describe("designCleanup — unused-dep detection", () => {
     const g = createDesignGraph();
     g.addFunction("src/a.ts", "caller", sig());
     g.setSpec("src/a.ts", "caller", spec(["usedDep", "unusedDep"]));
-    g.setImplementation("src/a.ts", "caller", "ctx.fns.usedDep(ctx);");
+    g.setImplementation(
+      "src/a.ts",
+      "caller",
+      `import usedDep from "./usedDep.js";\nexport default function caller(): void { usedDep(); }`,
+    );
+    g.setAnalyzedEdges("src/a.ts", "caller", {
+      imports: [
+        { source: "./usedDep.js", name: "usedDep", isDefault: true, line: 1 },
+      ],
+      callees: ["usedDep"],
+    });
     g.addFunction("src/a.ts", "usedDep", sig());
     g.setSpec("src/a.ts", "usedDep", spec());
     g.setImplementation("src/a.ts", "usedDep", "return;");
@@ -124,6 +159,12 @@ describe("designCleanup — unused-dep detection", () => {
     expect(unused).toEqual([]);
   });
 });
+
+// Phase U8 — the arity-mismatch cleanup check was retired. It parsed
+// `ctx.fns.X(ctx, ...args)` call sites and compared arg-count against
+// the callee's declared params. Under natural mode the TypeScript
+// compiler catches arity mismatches at tsc time, so the heuristic
+// became redundant. Tests removed with the machinery.
 
 describe("autoRepairCleanup", () => {
   it("re-dispatches the orphan's DECOMPOSITION PARENT with wire-in feedback", async () => {

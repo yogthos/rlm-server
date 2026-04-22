@@ -25,6 +25,62 @@ describe("parseProjectTestList", () => {
       parseProjectTestList([{ name: "x" }]),
     ).toThrow();
   });
+
+  it("rejects test code containing nested it() — harness wraps code inside it(), nesting produces vitest error", () => {
+    // Bug from run 10: repair LLM produced tests where code includes
+    // `it("x", async () => ...)`. Harness wraps that inside another
+    // `it(...)`, and vitest rejects nested test constructs with
+    // "Calling the test function inside another test function is not
+    // allowed." Reject at parse so the repair retry loop fires.
+    expect(() =>
+      parseProjectTestList([
+        {
+          name: "GET /",
+          code: 'it("is nested", async () => { const res = await fetch("/"); })',
+        },
+      ]),
+    ).toThrow(/nested|it\(/);
+  });
+
+  it("rejects test code containing nested describe()", () => {
+    expect(() =>
+      parseProjectTestList([
+        {
+          name: "suite-in-suite",
+          code: 'describe("inner", () => { it("x", () => {}); })',
+        },
+      ]),
+    ).toThrow(/nested|describe\(/);
+  });
+
+  it("rejects test code containing nested test()", () => {
+    expect(() =>
+      parseProjectTestList([
+        {
+          name: "test-in-it",
+          code: 'test("inner", async () => { expect(1).toBe(1); })',
+        },
+      ]),
+    ).toThrow(/nested|test\(/);
+  });
+
+  it("tolerates bare `expect(...)`, `fetch(...)`, `it.skip`, etc. that aren't test-construct calls", () => {
+    // False-positive guard: the string "it" appears in many places
+    // (identifiers, comments). Only reject top-level calls of the
+    // test-construct functions.
+    const tests = parseProjectTestList([
+      {
+        name: "normal test",
+        code: [
+          "// this comment mentions it() and describe()",
+          'const res = await fetch("/");',
+          "expect(res.ok).toBe(true);",
+          "const splits = path.split(it);", // `it` as identifier
+        ].join("\n"),
+      },
+    ]);
+    expect(tests).toHaveLength(1);
+  });
 });
 
 describe("designProjectTests", () => {

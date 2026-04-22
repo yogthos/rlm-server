@@ -32,6 +32,7 @@ import { designBuild } from "./design-build.js";
 import { designLoad } from "./design-load.js";
 import { designPlan } from "./design-plan.js";
 import { designPlanIntegration } from "./design-plan-integration.js";
+import { reflectOnStagnation } from "./design-reflect.js";
 import { createIntegrationRunner } from "./design-integration-runner.js";
 
 import type { RLMContext, RLMResult, LLMClient, ChatMessage } from "./types.js";
@@ -310,11 +311,24 @@ function buildBridgeHelpers(ctx: RLMContext) {
       decompose,
       maxReviewCycles: ctx.maxReviewCycles,
     }).dispatch(module, name);
+  const reflect = async (
+    graph: RLMContext["designGraph"],
+    module: string,
+    name: string,
+    failureContext: { testOutput: string; attempts: number },
+  ) =>
+    reflectOnStagnation(
+      graph,
+      module,
+      name,
+      { ...failureContext, task: ctx.prompt },
+      chat,
+    );
   const finalize = (
     graph: RLMContext["designGraph"],
     options?: FinalizeOptions,
   ) => finalizeProject(graph, options ?? {});
-  return { chat, dispatch, finalize, decompose };
+  return { chat, dispatch, finalize, decompose, reflect };
 }
 
 // ─── FSM State Handlers ───────────────────────────────────────────────
@@ -555,7 +569,7 @@ async function initHandler(ctx: RLMContext): Promise<RLMContext> {
       },
       __designPlanBridge: (task: string) => {
         debug("bridge", `design_plan invoked task=${task.slice(0, 60)}...`);
-        const { decompose, finalize } = buildBridgeHelpers(ctx);
+        const { decompose, reflect, finalize } = buildBridgeHelpers(ctx);
         const chat = buildChat(ctx);
         // Pass 2 (leaf-up) and Pass 3 (integration fix) are pure-TDD:
         // Implementer writes body + tests, runs them, iterates.
@@ -582,6 +596,7 @@ async function initHandler(ctx: RLMContext): Promise<RLMContext> {
           leafDispatch,
           fixDispatch: leafDispatch,
           decompose,
+          reflect,
           integrationRunner: createIntegrationRunner(),
           finalize,
         });

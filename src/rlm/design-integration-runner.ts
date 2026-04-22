@@ -29,6 +29,7 @@ import type {
   IntegrationRunResult,
 } from "./design-integration-loop.js";
 import { debug } from "./debug.js";
+import { parseTapOutput, splitCommand } from "./test-runner.js";
 
 export interface IntegrationRunnerOptions {
   /** Reuse an existing project dir instead of materializing a fresh
@@ -69,6 +70,27 @@ export function parseTscErrors(stdout: string): IntegrationFailure[] {
  * Safe on malformed input (returns empty array), so a non-JSON
  * stderr / crash surface produces zero failures rather than throwing.
  */
+/**
+ * Phase U2 — adapt TAP output to the IntegrationFailure shape. Returns
+ * null when the stdout contained no TAP lines at all (let the caller
+ * fall through to the legacy JSON parser). Returns [] when TAP parsed
+ * cleanly with zero failures.
+ */
+export function parseTestFailuresTap(stdout: string): IntegrationFailure[] | null {
+  const counts = parseTapOutput(stdout);
+  if (counts === null) return null;
+  const failures: IntegrationFailure[] = [];
+  for (const name of counts.failingTestNames) {
+    const full = counts.fullFailureMessages.get(name) ?? "";
+    failures.push({
+      testName: name,
+      message: full.split("\n")[0] || "(no message)",
+      stackTrace: full,
+    });
+  }
+  return failures;
+}
+
 export function parseVitestFailures(jsonOutput: string): IntegrationFailure[] {
   const start = jsonOutput.indexOf("{");
   if (start < 0) return [];
@@ -161,8 +183,13 @@ async function createScaffoldDir(tmpRoot: string): Promise<string> {
       `symlink node_modules failed (continuing): ${e instanceof Error ? e.message : String(e)}`,
     );
   }
-  // tsconfig for `tsc --noEmit -p dir`. Matches finalize's default
-  // shape so runtime and typecheck agree on module resolution.
+  // tsconfig for `tsc --noEmit -p dir`. Matches test-runner's shape
+  // so the integration typecheck agrees with the per-function
+  // typecheck. Notably: `types: ["node"]` so `fs`, `http`,
+  // `IncomingMessage`, etc. resolve; `strict: false` because proc-ts
+  // bodies use dynamic imports that don't narrow well under strict;
+  // `allowImportingTsExtensions` because generated test files import
+  // siblings via `./foo.js` that resolve to `./foo.ts`.
   await writeFile(
     path.join(dir, "tsconfig.json"),
     JSON.stringify(
@@ -171,10 +198,12 @@ async function createScaffoldDir(tmpRoot: string): Promise<string> {
           target: "ES2022",
           module: "ESNext",
           moduleResolution: "Bundler",
-          strict: true,
+          strict: false,
           noEmit: true,
           skipLibCheck: true,
           esModuleInterop: true,
+          allowImportingTsExtensions: true,
+          types: ["node"],
         },
         include: ["**/*.ts"],
       },
@@ -201,16 +230,29 @@ export function createIntegrationRunner(
         owned = true;
       }
       await writeProjectFiles(graph, dir);
-      // Run vitest and tsc in PARALLEL — they're independent
-      // processes, no file contention (both read the same static
-      // snapshot), so serializing just doubles wall time.
+      // Phase U2 — spawn decisions.testCommand, parse TAP (JSON
+      // fallback via parseVitestFailures when TAP parsing yields
+      // nothing). Throw in production when testCommand is missing;
+      // VITEST env keeps the legacy vitest spawn for harness tests.
+      const decisions = graph.getProjectConfig();
+      const rawCmd = decisions?.testCommand?.trim() ?? "";
+      let testCmd: string;
+      let testArgs: string[];
+      if (rawCmd.length > 0) {
+        const tokens = splitCommand(rawCmd);
+        testCmd = tokens[0];
+        testArgs = tokens.slice(1);
+      } else if (process.env.VITEST) {
+        testCmd = "npx";
+        testArgs = ["vitest", "run", "--reporter=json", "--root", dir];
+      } else {
+        throw new Error(
+          "integration-runner: missing decisions.testCommand. Phase 0 must commit to a test framework + command.",
+        );
+      }
+      // Run tests + tsc in PARALLEL — they're independent processes.
       const [vitest, tsc] = await Promise.all([
-        shellOut(
-          "npx",
-          ["vitest", "run", "--reporter=json", "--root", dir],
-          dir,
-          timeoutMs,
-        ),
+        shellOut(testCmd, testArgs, dir, timeoutMs),
         shellOut(
           "npx",
           ["tsc", "--noEmit", "-p", dir],
@@ -218,7 +260,8 @@ export function createIntegrationRunner(
           timeoutMs,
         ),
       ]);
-      const vitestFailures = parseVitestFailures(vitest.stdout);
+      const vitestFailures =
+        parseTestFailuresTap(vitest.stdout) ?? parseVitestFailures(vitest.stdout);
       const tscFailures = parseTscErrors(tsc.stdout);
       debug(
         "integration-loop",
@@ -257,10 +300,15 @@ export function createIntegrationRunner(
       // the loop can act on.
       if (tsc.exitCode !== 0 && tscFailures.length === 0) {
         const tscStderrTail = tsc.stderr.slice(-2000);
-        const tscStdoutTail = tsc.stdout.slice(-800);
+        const tscStdoutTail = tsc.stdout.slice(-2000);
+        // tsc prints "error TSxxxx: ..." lines to STDOUT (not stderr).
+        // Config-level errors (TS6053 no inputs, TS5023 unknown option)
+        // have no file:line prefix, so parseTscErrors misses them —
+        // the synthetic failure below is our only surfacing, hence
+        // showing both streams in the debug.
         debug(
           "integration-loop",
-          `TSC CRASH exit=${tsc.exitCode} stderr[head]: ${tscStderrTail.split("\n").slice(0, 4).join(" | ").slice(0, 400)}`,
+          `TSC CRASH exit=${tsc.exitCode} stdout[head]: ${tscStdoutTail.split("\n").slice(0, 4).join(" | ").slice(0, 400)} stderr[head]: ${tscStderrTail.split("\n").slice(0, 4).join(" | ").slice(0, 400)}`,
         );
         failures.push({
           testName: "project.typecheck",

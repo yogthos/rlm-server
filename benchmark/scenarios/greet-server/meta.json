@@ -1,0 +1,6 @@
+{
+  "name": "greet-server",
+  "description": "Smallest HTTP app — exercises phase 0 (stack pick), decomposition (parser + handler + server), and integration tests (server spin-up). Mirrors the shape of run-14/15's failures but at 1/10 the surface area.",
+  "stage": "full-pipeline",
+  "expectedOutcome": "green"
+}

@@ -7,3 +7,9 @@ arXiv-*/
 log.txt
 guestbook.json
 integration_test_*.json
+
+# Generated scenario projects (materialized by the harness)
+benchmark/projects/
+
+# Local Claude Code settings
+.claude/

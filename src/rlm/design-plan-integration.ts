@@ -30,7 +30,11 @@ import type { BuildReport } from "./design-build.js";
 import { designPlan } from "./design-plan.js";
 import { designCoherence } from "./design-coherence.js";
 import { healStructureCoherence } from "./design-coherence-heal.js";
-import { designLeafUpBuild } from "./design-leaf-up-build.js";
+import {
+  designLeafUpBuild,
+  type ReflectCallback,
+} from "./design-leaf-up-build.js";
+import { walkthroughTask } from "./design-walkthrough.js";
 import { designCleanup, autoRepairCleanup } from "./design-cleanup.js";
 import { enumeratePaths } from "./design-paths.js";
 import { designIntegrationTests } from "./design-integration-tests.js";
@@ -77,6 +81,10 @@ export interface IntegrationPlanOptions {
     graph: DesignGraph,
     fnName: string,
   ) => Promise<boolean>;
+  /** Reflect callback (Phase C). When a leaf-up dispatch returns
+   *  status="stagnated", reflect chooses retry / rewrite-tests /
+   *  decompose / give-up instead of always decomposing. */
+  reflect?: ReflectCallback;
   /** Fix dispatch called by the integration loop. Typically the same
    *  as leafDispatch with failure feedback plumbed through. */
   fixDispatch: FixDispatch;
@@ -126,11 +134,40 @@ export async function designPlanIntegration(
     return planReport;
   }
 
+  // ─── Phase 2b: top-down walkthrough (D2) ─────────────────────────
+  // Before we burn cycles on leaf-up build, check whether the
+  // function graph actually covers all the task's use cases. Missing
+  // stubs get added here; a second designPlan(skipBuild) pass attaches
+  // specs to them. Removals are never automatic — walkthrough only
+  // gap-fills.
+  debug("plan-integration", "phase 2b: top-down walkthrough");
+  const walkReport = await walkthroughTask(graph, task, options.chat);
+  if (walkReport.addedNames.length > 0) {
+    debug(
+      "plan-integration",
+      `walkthrough added ${walkReport.addedNames.length} missing fn(s): ${walkReport.addedNames.join(", ")}`,
+    );
+    // Re-run phase 2 to attach specs to the new stubs. Phase 1
+    // resume-skip catches the existing functions; new ones go through
+    // phase 2 normally.
+    const refillReport = await designPlan(graph, task, {
+      chat: options.chat,
+      maxShapeRetries: options.maxShapeRetries,
+      skipBuild: true,
+    });
+    if (!refillReport.ok) {
+      debug(
+        "plan-integration",
+        `walkthrough-gap spec refill failed at ${refillReport.phase} — continuing with partial specs`,
+      );
+    }
+  }
+
   // ─── Phase 3: structure coherence + self-heal ─────────────────────
-  // Cycles are hard-fail. Phantom deps / orphans are soft — we try to
-  // auto-heal via healStructureCoherence (mechanical drop for phantom
-  // deps, LLM-driven pick-a-caller-or-drop for orphans). Up to
-  // maxCoherenceCycles iterations.
+  // Cycles are hard-fail. Phantom deps are soft — mechanical drop via
+  // healStructureCoherence. Up to maxCoherenceCycles iterations.
+  // Orphan detection was removed in A1 — decomposition children are
+  // wired by tree link, which leaf-up-build unions with spec.deps.
   debug("plan-integration", "phase 3: structure coherence + heal");
   const maxCohCycles = options.maxCoherenceCycles ?? 3;
   let cohReport = await designCoherence(graph);
@@ -149,7 +186,7 @@ export async function designPlanIntegration(
         advisories: [],
       });
     }
-    const heal = await healStructureCoherence(graph, { chat: options.chat });
+    const heal = await healStructureCoherence(graph);
     debug(
       "plan-integration",
       `heal cycle ${cohAttempt}/${maxCohCycles}: healed=${heal.healed.length} unhealed=${heal.unhealed.length}`,
@@ -164,12 +201,34 @@ export async function designPlanIntegration(
     );
   }
 
+  // ─── Project dir (warmed once for phase 4 AND phase 8) ────────────
+  // Previously we created this at phase 8 only, so leaf dispatch in
+  // phase 4 went through the cold tmpdir path — no npm install, no
+  // warm module cache. Creating it here up-front means every leaf
+  // dispatch shares one materialized project (with installed deps)
+  // and the integration loop inherits the same warm state.
+  const useDir = options.useProjectDir ?? true;
+  let projectDir: ProjectDir | null = null;
+  if (useDir) {
+    try {
+      projectDir = await createProjectDir(graph, { chat: options.chat });
+      debug("plan-integration", `warmed project dir ${projectDir.path}`);
+    } catch (e) {
+      debug(
+        "plan-integration",
+        `project dir init failed (continuing without warm dir): ${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
+  }
+
   // ─── Phase 4: leaf-up build ───────────────────────────────────────
   debug("plan-integration", "phase 4: leaf-up build");
   const buildReport = await designLeafUpBuild(graph, {
     dispatch: async (g, mod, name, opts) =>
       options.leafDispatch(g, mod, name, opts),
     decompose: options.decompose,
+    reflect: options.reflect,
+    projectDir: projectDir?.path,
   });
   if (!buildReport.ok && buildReport.error) {
     // Hard structural error (e.g., cycle caught by computeDependencyLevels).
@@ -247,18 +306,7 @@ export async function designPlanIntegration(
   }
 
   // ─── Phase 8: integration run + fix loop ──────────────────────────
-  const useDir = options.useProjectDir ?? true;
-  let projectDir: ProjectDir | null = null;
-  if (useDir) {
-    try {
-      projectDir = await createProjectDir(graph);
-    } catch (e) {
-      debug(
-        "plan-integration",
-        `project dir init failed (continuing without warm dir): ${e instanceof Error ? e.message : String(e)}`,
-      );
-    }
-  }
+  // Reuses the projectDir warmed before phase 4.
   try {
     debug("plan-integration", "phase 8: integration loop");
     const loop = await runIntegrationLoop(graph, {
@@ -276,7 +324,35 @@ export async function designPlanIntegration(
       projectDir: projectDir?.path,
     });
     if (!loop.ok) {
-      return emptyReport("integration", graph.consistency());
+      // Best-effort finalize even when integration failed — materialize
+      // whatever is in the graph so the outer agent has a concrete
+      // candidate to return. Without this, the agent sees `files: {}`
+      // and re-designs from scratch, producing phantom modules (run 10
+      // behavior: a second bare `server.js` appeared when the agent's
+      // manual fallback mutated the graph further).
+      let salvageFiles: Record<string, string> = {};
+      let salvageFinalize: FinalizeReport | null = null;
+      try {
+        salvageFinalize = await options.finalize(graph, {
+          typecheck: false,
+          runTests: false,
+        });
+        salvageFiles = salvageFinalize.files;
+      } catch (e) {
+        debug(
+          "plan-integration",
+          `salvage finalize threw (returning empty): ${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
+      return {
+        ok: false,
+        phase: "integration",
+        consistency: graph.consistency(),
+        dispatched: [],
+        failed: [],
+        finalize: salvageFinalize,
+        files: salvageFiles,
+      };
     }
 
     // ─── Finalize ───────────────────────────────────────────────────
@@ -304,6 +380,11 @@ export async function designPlanIntegration(
       cleanupFindings: residualFindings,
     };
   } finally {
-    if (projectDir) await projectDir.dispose();
+    // Phase H1 — preserve by default. Opt-in cleanup via env var.
+    if (projectDir && process.env.RLM_DISPOSE_PROJECT_DIR === "1") {
+      await projectDir.dispose();
+    } else if (projectDir) {
+      debug("plan", `project dir preserved at ${projectDir.path}`);
+    }
   }
 }

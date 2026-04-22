@@ -9,6 +9,26 @@
  * are made against the graph.
  */
 
+/**
+ * Phase N1 — analyzer-maintained edges, written by `setAnalyzedEdges`
+ * after the Implementer's body is parsed by tree-sitter. Distinct from
+ * architect-authored `spec.dependencies`: the spec is a plan, these are
+ * the facts we observed in the actual source. Divergence between them
+ * is a signal (drift, hallucinated import, missed plan step).
+ */
+export interface AnalyzedImport {
+  source: string;
+  name: string;
+  isDefault: boolean;
+  /** 1-based source line of the `import` statement. */
+  line: number;
+}
+
+export interface AnalyzedEdges {
+  imports: AnalyzedImport[];
+  callees: string[];
+}
+
 export interface ParamSpec {
   name: string;
   type: string;
@@ -87,6 +107,22 @@ export interface FunctionNode {
    *  Run after the branch's body is written against real wired
    *  children (no stubs). Empty for pure leaves. */
   integrationTests: TestSpec[];
+  /** Phase C2 — wrapper-kill for tests: when set, the harness writes
+   *  this verbatim as `<name>.test.ts` instead of rendering a
+   *  describe/it wrapper around `tests[]`. `tests[]` is still kept for
+   *  back-compat with legacy fixtures and for the model's own reference. */
+  unitTestFile: string | null;
+  /** Phase C2 — same idea for `<name>.integration.test.ts`. */
+  integrationTestFile: string | null;
+  /** Phase N1 — top-level imports found in the saved implementation by
+   *  tree-sitter (post-save). Each entry carries the module specifier
+   *  and the local binding name. Empty until the body is analyzed. */
+  analyzedImports: AnalyzedImport[];
+  /** Phase N1 — bare-identifier function call targets observed in the
+   *  saved implementation. Deduped + sorted. Together with
+   *  `analyzedImports`, these let the harness derive an authoritative
+   *  call graph without parsing disk on every lookup. */
+  analyzedCallees: string[];
   implementation: string | null;
   status: FunctionStatus;
   lastTestOutput: string | null;
@@ -113,21 +149,81 @@ export interface ModuleNode {
 }
 
 /**
- * Architect-chosen project-level config: the raw package.json (as authored
- * in phase 0) plus the test framework detected from its devDependencies.
- * `null` until `setProjectConfig` is called; once set, it's sticky across
- * resumes and drives emitter + test-runner choices downstream.
+ * Model-authored project decisions. Populated once in phase 0 via a
+ * structured template; revisable later via architect-level reflect.
+ * Drives every downstream code-generation prompt and the test-runner
+ * spawn — the HARNESS hardcodes nothing about runtime, framework, or
+ * tooling.
+ *
+ * All string fields are free-form. The harness doesn't validate their
+ * values against an allowlist; the architect commits to a combination
+ * and is responsible for consistency (e.g., `testImports` must load
+ * symbols the `testCommand` runtime understands).
+ *
+ * Required:
+ *   `runtime`        — e.g. "node", "deno", "bun" — affects materialization
+ *   `moduleSystem`   — "esm" | "cjs" | "(n/a)" — informs tsconfig + test syntax
+ *   `testFramework`  — e.g. "vitest", "jest", "mocha", "node:test", "deno:test"
+ *   `testCommand`    — the full CLI the harness will spawn in the project dir
+ *   `testImports`    — literal import line(s) placed atop auto-emitted test files
+ *                       (when the harness generates them; implementer-emitted
+ *                       test files declare their own imports)
+ *
+ * Optional:
+ *   `packageManager`   — "npm", "pnpm", "yarn", "bun", "(none)"
+ *   `packageJson`      — raw file content (verbatim at materialize) — kept here
+ *                        for phase-0 locality; lives in projectAssets too
+ *   `tsconfig`         — raw file content, architect-authored
+ *   `mockingStrategy`  — free-form description of how tests should mock deps
+ *   `testingNotes`     — free-form gotchas (framework + runtime specific)
+ *
+ * `testFramework: "vitest" | "jest"` style unions were the PRIOR shape;
+ * they forced the harness to ship per-framework code paths. The fields
+ * are now plain strings — the architect picks any framework, declares
+ * how to invoke it, and every downstream prompt receives the decision.
  */
-export interface ProjectConfig {
-  packageJson: string;
-  testFramework: "vitest" | "jest";
+export interface ProjectDecisions {
+  runtime: string;
+  moduleSystem: string;
+  testFramework: string;
+  testCommand: string;
+  /** Phase U12 — per-node dispatch spawns this instead of `testCommand`.
+   *  Template string with a literal `{file}` placeholder that the
+   *  harness substitutes at spawn time with the target function's
+   *  `<name>.test.ts`. Keeps dispatch scoped to ONE test file so a
+   *  sibling's failing test can't contaminate the current target's
+   *  pass/fail signal. `testCommand` (full suite) still runs during
+   *  the integration/finalize phase.
+   *  Optional on the TS type so pre-U12 graphs / test fixtures load
+   *  without edits; phase 0 REQUIRES it for fresh runs. */
+  singleTestCommand?: string;
+  testImports: string;
+  packageManager?: string;
+  packageJson?: string;
+  tsconfig?: string;
+  mockingStrategy?: string;
+  testingNotes?: string;
 }
+
+/**
+ * @deprecated Use `ProjectDecisions`. Kept temporarily as an alias
+ *   so the migration is mechanical; consumers will be updated in the
+ *   coming phases.
+ */
+export type ProjectConfig = ProjectDecisions;
 
 export interface DesignGraphSnapshot {
   modules: Record<string, ModuleNode>;
   functions: Record<string, FunctionNode>;
   projectTests: TestSpec[];
   projectConfig: ProjectConfig | null;
+  /** Phase D — free-form asset map. Keys are project-relative paths
+   *  (`package.json`, `tsconfig.json`, `scripts/seed.sql`, …); values
+   *  are file contents. Written verbatim at materialize time. */
+  assets: Record<string, string>;
+  /** Phase C2 unified — architect-owned `project.integration.test.ts`
+   *  source when the wrapper-kill path is in use. */
+  projectTestFile: string | null;
 }
 
 export type ConsistencyViolation =
@@ -176,6 +272,16 @@ export interface DesignGraph {
   /** Bulk-replace the function's unit tests. Used by the Implementer's
    *  test-patch path so callers don't mutate `fn.tests` directly. */
   replaceTests(module: string, name: string, tests: TestSpec[]): void;
+  /** Phase C2 — store the full unit test file content. When set, the
+   *  harness materializes it verbatim instead of wrapping
+   *  `tests[]`. Pass `null` to clear and fall back to the wrapper. */
+  setUnitTestFile(module: string, name: string, content: string | null): void;
+  /** Phase C2 — same for `<name>.integration.test.ts`. */
+  setIntegrationTestFile(
+    module: string,
+    name: string,
+    content: string | null,
+  ): void;
   /** Attach an integration test to a function (exercises the assembly
    *  through this function once its children are wired). */
   addIntegrationTest(module: string, name: string, test: TestSpec): void;
@@ -186,10 +292,30 @@ export interface DesignGraph {
     name: string,
     tests: TestSpec[],
   ): void;
+  /** Phase C2 unified — architect-owned full `project.integration.test.ts`
+   *  source. When set, the harness materializes this verbatim instead
+   *  of wrapping `projectTests[]` in a describe/it scaffold. Pass `null`
+   *  to clear. */
+  setProjectTestFile(content: string | null): void;
+  getProjectTestFile(): string | null;
+  /** Phase N1 — write the analyzer-observed edges for a function.
+   *  Overwrites both `analyzedImports` and `analyzedCallees`
+   *  atomically. Throws when the function doesn't exist. */
+  setAnalyzedEdges(
+    module: string,
+    name: string,
+    edges: AnalyzedEdges,
+  ): void;
   /** Attach the Architect's phase-0 package.json + detected test
    *  framework. Sticky across resumes. */
   setProjectConfig(config: ProjectConfig): void;
   getProjectConfig(): ProjectConfig | null;
+  /** Phase D — attach a free-form asset (any path, any content). Pass
+   *  `null` to delete. Keys are project-relative paths written by
+   *  materialize, never absolute. */
+  setAsset(path: string, content: string | null): void;
+  getAsset(path: string): string | null;
+  listAssets(): Record<string, string>;
   /** Attach an integration test to the whole project (no specific
    *  function — exercises the top-level assembly). */
   /** Remove a function from the graph entirely. Drops its entry from
@@ -264,226 +390,113 @@ function renderParam(p: ParamSpec): string {
 }
 
 /**
- * Render a proc-ts-style function signature. First parameter is always
- * `ctx: Ctx` (injected by the harness, not in `fn.signature.params`),
- * followed by the function's business-logic params. Return type is
- * emitted as a TypeScript annotation.
+ * Render a natural-style function signature for wrapping and stubs.
+ * Phase N2: ctx is no longer injected — the architect's declared
+ * params are the whole signature. Siblings are imported directly by
+ * the implementer; call-graph edges are captured post-save by tree-
+ * sitter analysis (`analyzeSource`), not by parsing `ctx.fns.*` tokens.
  */
 function renderProcSignature(fn: FunctionNode): string {
   const async = fn.signature.isAsync ? "async " : "";
-  const userParams = fn.signature.params.map(renderParam).join(", ");
-  const paramList = userParams.length > 0 ? `ctx: Ctx, ${userParams}` : "ctx: Ctx";
+  const paramList = fn.signature.params.map(renderParam).join(", ");
   return `export default ${async}function ${fn.name}(${paramList}): ${fn.signature.returnType}`;
 }
 
-function renderBody(fn: FunctionNode): string {
-  if (fn.implementation !== null) return fn.implementation;
-  return `throw new Error(\`${fn.name}: not implemented (TODO)\`);`;
-}
-
-/**
- * Import line for describe/it/expect/<mocker> based on the project's
- * configured test framework. vitest pulls `vi`; jest pulls `jest`.
- */
-function renderTestFrameworkImport(
-  framework: ProjectConfig["testFramework"],
-): string {
-  if (framework === "jest") {
-    return `import { describe, it, expect, jest } from "@jest/globals";`;
-  }
-  return `import { describe, it, expect, vi } from "vitest";`;
-}
-
-/** Emit one file per function in proc-ts style: filename = function name. */
-function renderFunctionFile(fn: FunctionNode): string {
-  const lines: string[] = [];
-  lines.push(`${renderProcSignature(fn)} {`);
-  for (const row of renderBody(fn).split("\n")) {
-    lines.push(`  ${row}`);
-  }
-  lines.push(`}`);
-  lines.push("");
-  return lines.join("\n");
-}
-
-/**
- * Emit one `<fnName>.test.ts` per function that has tests. The test
- * file imports the target directly and constructs a minimal `ctx`
- * wiring in every project-local function (so tests can call
- * `ctx.fns.<name>(ctx, ...)` against any sibling).
- */
-function renderFunctionTestFile(
-  target: FunctionNode,
-  allFns: FunctionNode[],
-  framework: ProjectConfig["testFramework"],
-): string {
-  if (target.tests.length === 0) return "";
-  const lines: string[] = [];
-  lines.push(renderTestFrameworkImport(framework));
-  // Common Node built-ins that test code frequently references. The
-  // LLM writes bodies inline without top-of-file imports, so give it a
-  // base palette available by namespace. Unused imports are cheap.
-  lines.push(`import * as fs from "node:fs";`);
-  lines.push(`import * as path from "node:path";`);
-  lines.push(`import * as http from "node:http";`);
-  lines.push(`import ${target.name} from "./${target.name}.js";`);
-  for (const f of allFns) {
-    if (f.name === target.name) continue;
-    lines.push(`import ${f.name} from "./${f.name}.js";`);
-  }
-  lines.push("");
-  // Minimal CtxFns wiring: every imported function. `as any` because
-  // these tests don't exercise the generated CtxFns d.ts shape — we
-  // just need runtime callable bindings. Declared with `let` so tests
-  // can swap in stub siblings (ctx.fns.other = () => ...) without
-  // tripping a TS "cannot assign to const" error.
-  const fnEntries = [target.name, ...allFns.filter((f) => f.name !== target.name).map((f) => f.name)];
-  lines.push(`let ctx: any = { fns: { ${fnEntries.join(", ")} }, state: {}, t: null };`);
-  lines.push("");
-  lines.push(`describe(${JSON.stringify(target.name)}, () => {`);
-  for (const t of target.tests) {
-    // Always emit the `it` callback as async. The LLM frequently
-    // writes `await` inside its test code — a plain arrow makes that
-    // a syntax error, wrecking the whole file. An async arrow is
-    // valid whether the body awaits or not.
-    lines.push(`  it(${JSON.stringify(t.name)}, async () => {`);
-    for (const row of t.code.split("\n")) {
-      lines.push(`    ${row}`);
-    }
-    lines.push(`  });`);
-  }
-  lines.push(`});`);
-  lines.push("");
-  return lines.join("\n");
-}
-
-/**
- * Emit `<name>.integration.test.ts` for a BRANCH function — exercises
- * the assembly through this function with ALL children real (no
- * stubs). This fires after the branch's body is written.
- */
-function renderIntegrationTestFile(
-  target: FunctionNode,
-  allFns: FunctionNode[],
-  framework: ProjectConfig["testFramework"],
-): string {
-  if (target.integrationTests.length === 0) return "";
-  // Integration tests only make sense on BRANCH functions — they
-  // exercise the assembly through the target and would otherwise run
-  // against sibling stubs at dispatch time, producing false failures.
-  if (target.children.length === 0) return "";
-  const lines: string[] = [];
-  lines.push(renderTestFrameworkImport(framework));
-  lines.push(`import * as fs from "node:fs";`);
-  lines.push(`import * as path from "node:path";`);
-  lines.push(`import * as http from "node:http";`);
-  lines.push(`import ${target.name} from "./${target.name}.js";`);
-  for (const f of allFns) {
-    if (f.name === target.name) continue;
-    lines.push(`import ${f.name} from "./${f.name}.js";`);
-  }
-  lines.push("");
-  const fnEntries = [
-    target.name,
-    ...allFns.filter((f) => f.name !== target.name).map((f) => f.name),
-  ];
-  // Integration wiring: ALL functions real; `const` so tests that try
-  // to stub trip a lint error (stubs defeat the purpose here).
-  lines.push(
-    `const ctx: any = { fns: { ${fnEntries.join(", ")} }, state: {}, t: null };`,
-  );
-  lines.push("");
-  lines.push(`describe(${JSON.stringify(`${target.name} (integration)`)}, () => {`);
-  for (const t of target.integrationTests) {
-    lines.push(`  it(${JSON.stringify(t.name)}, async () => {`);
-    for (const row of t.code.split("\n")) {
-      lines.push(`    ${row}`);
-    }
-    lines.push(`  });`);
-  }
-  lines.push(`});`);
-  lines.push("");
-  return lines.join("\n");
-}
-
-/**
- * Emit `project.integration.test.ts` for app-scope integration tests.
- * Wires ALL functions into ctx so tests can call any entry point.
- */
-function renderProjectTestFile(
-  allFns: FunctionNode[],
-  projectTests: TestSpec[],
-  framework: ProjectConfig["testFramework"],
-): string {
-  if (projectTests.length === 0 || allFns.length === 0) return "";
-  const lines: string[] = [];
-  lines.push(renderTestFrameworkImport(framework));
-  lines.push(`import * as fs from "node:fs";`);
-  lines.push(`import * as path from "node:path";`);
-  lines.push(`import * as http from "node:http";`);
-  for (const f of allFns) {
-    lines.push(`import ${f.name} from "./${f.name}.js";`);
-  }
-  lines.push("");
-  lines.push(
-    `const ctx: any = { fns: { ${allFns.map((f) => f.name).join(", ")} }, state: {}, t: null };`,
-  );
-  lines.push("");
-  lines.push(`describe("project integration", () => {`);
-  for (const t of projectTests) {
-    lines.push(`  it(${JSON.stringify(t.name)}, async () => {`);
-    for (const row of t.code.split("\n")) {
-      lines.push(`    ${row}`);
-    }
-    lines.push(`  });`);
-  }
-  lines.push(`});`);
-  lines.push("");
-  return lines.join("\n");
-}
-
-/** Emit the shared ctx.ts scaffolding. */
-function renderCtxFile(): string {
+/** Full-file stub for an unimplemented function. Used at materialize
+ *  time when fn.implementation is null so siblings that import it via
+ *  `./<name>.js` still resolve, and tsc can still compile the
+ *  project-level test file. */
+function renderFunctionStubFile(fn: FunctionNode): string {
   return [
-    `export type CtxFns = import("./ctx_fns").default;`,
-    "",
-    `export type Ctx = {`,
-    `  fns: CtxFns;`,
-    `  state: Record<string, any>;`,
-    `  t: any;`,
-    `};`,
-    "",
-    `declare global {`,
-    `  type Ctx = import("./ctx").Ctx;`,
+    `${renderProcSignature(fn)} {`,
+    `  throw new Error(\`${fn.name}: not implemented (TODO)\`);`,
     `}`,
-    "",
-    `const ctx: Ctx = { fns: {} as CtxFns, state: {}, t: null };`,
-    `export default ctx;`,
     "",
   ].join("\n");
 }
 
-/**
- * Emit the auto-generated CtxFns interface. One entry per function.
- * Using `typeof import("./<name>").default` lets TypeScript enforce the
- * signature of each sibling call at `ctx.fns.<name>(ctx, ...)`.
- */
-function renderCtxFnsFile(fns: FunctionNode[]): string {
-  const lines: string[] = [`// Auto-generated — do not edit.`];
-  lines.push(`export default interface CtxFns {`);
-  for (const f of [...fns].sort((a, b) => a.name.localeCompare(b.name))) {
-    lines.push(`  ${f.name}: typeof import("./${f.name}").default;`);
+/** Emit one file per function in proc-ts style: filename = function
+ *  name. Since Phase 3 (wrapper-kill): `fn.implementation` holds the
+ *  complete file the implementer emitted (imports + signature + body).
+ *  Materialize passes it through verbatim. An unimplemented function
+ *  gets a minimal full-file stub so siblings can still resolve the
+ *  import at typecheck / runtime.
+ *
+ *  Back-compat for body-only inputs: if `fn.implementation` doesn't
+ *  contain `export default`, it was produced before the wrapper-kill
+ *  (legacy test fixtures, sandbox `design_implement` calls that pass
+ *  bare statements, or occasional LLM deviation). Wrap it with the
+ *  declared signature so the emitted file is always a valid module
+ *  and the test file's `import foo from "./foo.js"` succeeds.
+ *  Callers that DO pass a full file (has `export default`) are
+ *  passed through untouched. */
+function renderFunctionFile(fn: FunctionNode): string {
+  if (fn.implementation !== null) {
+    if (/\bexport\s+default\b/.test(fn.implementation)) {
+      return fn.implementation;
+    }
+    return [
+      `${renderProcSignature(fn)} {`,
+      ...fn.implementation.split("\n").map((l) => `  ${l}`),
+      `}`,
+      "",
+    ].join("\n");
   }
-  lines.push(`}`);
-  lines.push("");
-  return lines.join("\n");
+  return renderFunctionStubFile(fn);
+}
+
+/**
+ * Emit `<fnName>.test.ts` — wrapper-kill only. The implementer owns
+ * the entire test file end-to-end (imports, describe/it, assertions).
+ * Returns "" when the implementer hasn't authored one yet.
+ *
+ * Phase U6 — the legacy `addTest` / `tests[]` wrapper path was
+ * retired. `tests[]` is still kept on the FunctionNode for the
+ * implementer's OWN reference (echoed back into subsequent prompts),
+ * but the harness never wraps those into a test file — that would
+ * hardcode vitest/jest-style describe/it syntax and defeat the
+ * "model owns tooling" principle.
+ */
+function renderFunctionTestFile(target: FunctionNode): string {
+  if (target.unitTestFile !== null && target.unitTestFile.length > 0) {
+    return target.unitTestFile;
+  }
+  return "";
+}
+
+/**
+ * Emit `<name>.integration.test.ts` — wrapper-kill only. Integration
+ * tests only make sense on BRANCH functions (with children); for
+ * leaves, even the implementer's integration file is dropped.
+ */
+function renderIntegrationTestFile(target: FunctionNode): string {
+  if (target.children.length === 0) return "";
+  if (
+    target.integrationTestFile !== null &&
+    target.integrationTestFile.length > 0
+  ) {
+    return target.integrationTestFile;
+  }
+  return "";
+}
+
+/**
+ * Emit `project.integration.test.ts` — wrapper-kill only. The architect
+ * authors the full file via `setProjectTestFile`.
+ */
+function renderProjectTestFile(projectTestFile: string | null): string {
+  return projectTestFile !== null && projectTestFile.length > 0
+    ? projectTestFile
+    : "";
 }
 
 function materializeGraph(
   _modules: Map<string, ModuleNode>,
   functions: Map<string, FunctionNode>,
-  projectTests: TestSpec[],
+  _projectTests: TestSpec[],
   projectConfig: ProjectConfig | null,
+  assets: Map<string, string>,
+  projectTestFile: string | null,
   override?: { module: string; name: string; body: string },
 ): Record<string, string> {
   if (functions.size === 0) return {};
@@ -497,22 +510,31 @@ function materializeGraph(
     );
   }
   const files: Record<string, string> = {};
-  if (projectConfig) {
+  // Phase D — assets write first so phase-0 package.json / tsconfig and
+  // anything set via setAsset landed on disk verbatim. Function files
+  // below overwrite on key collision, which is intentional: a
+  // package.json in assets beats the legacy projectConfig.packageJson
+  // path if the model has revised it.
+  for (const [path, content] of assets) files[path] = content;
+  if (projectConfig?.packageJson && !files["package.json"]) {
     files["package.json"] = projectConfig.packageJson;
   }
-  files["ctx.ts"] = renderCtxFile();
-  files["ctx_fns.d.ts"] = renderCtxFnsFile(rendered);
-  const framework = projectConfig?.testFramework ?? "vitest";
+  if (projectConfig?.tsconfig && !files["tsconfig.json"]) {
+    files["tsconfig.json"] = projectConfig.tsconfig;
+  }
+  // Phase N2 — ctx.ts / ctx_fns.d.ts are no longer emitted. The model
+  // writes plain TypeScript modules with natural imports; there's no
+  // framework scaffold to inject anymore.
   for (const fn of rendered) {
     files[`${fn.name}.ts`] = renderFunctionFile(fn);
-    const unit = renderFunctionTestFile(fn, rendered, framework);
+    const unit = renderFunctionTestFile(fn);
     if (unit.length > 0) files[`${fn.name}.test.ts`] = unit;
-    const integration = renderIntegrationTestFile(fn, rendered, framework);
+    const integration = renderIntegrationTestFile(fn);
     if (integration.length > 0) {
       files[`${fn.name}.integration.test.ts`] = integration;
     }
   }
-  const project = renderProjectTestFile(rendered, projectTests, framework);
+  const project = renderProjectTestFile(projectTestFile);
   if (project.length > 0) files["project.integration.test.ts"] = project;
   return files;
 }
@@ -522,6 +544,8 @@ export function createDesignGraph(): DesignGraph {
   const functions = new Map<string, FunctionNode>();
   const projectTests: TestSpec[] = [];
   let projectConfig: ProjectConfig | null = null;
+  let projectTestFile: string | null = null;
+  const assets = new Map<string, string>();
   let mutationChain: Promise<unknown> = Promise.resolve();
 
   function ensureModule(path: string): ModuleNode {
@@ -613,6 +637,10 @@ export function createDesignGraph(): DesignGraph {
       spec: null,
       tests: [],
       integrationTests: [],
+      unitTestFile: null,
+      integrationTestFile: null,
+      analyzedImports: [],
+      analyzedCallees: [],
       implementation: null,
       status: "declared",
       lastTestOutput: null,
@@ -713,6 +741,16 @@ export function createDesignGraph(): DesignGraph {
       fn.tests.push(...tests);
     },
 
+    setUnitTestFile(module, name, content) {
+      const fn = requireFunction(module, name);
+      fn.unitTestFile = content;
+    },
+
+    setIntegrationTestFile(module, name, content) {
+      const fn = requireFunction(module, name);
+      fn.integrationTestFile = content;
+    },
+
     addIntegrationTest(module, name, test) {
       const fn = requireFunction(module, name);
       fn.integrationTests.push(test);
@@ -724,6 +762,29 @@ export function createDesignGraph(): DesignGraph {
       fn.integrationTests.push(...tests);
     },
 
+    setAnalyzedEdges(module, name, edges) {
+      const fn = requireFunction(module, name);
+      fn.analyzedImports = edges.imports.map((i) => ({ ...i }));
+      fn.analyzedCallees = [...edges.callees];
+    },
+
+    setProjectTestFile(content) {
+      // Defense-in-depth: a blank/whitespace-only payload behaves like
+      // `null` — the harness treats "no authored file" as a signal to
+      // run the LLM next resume, and storing "" would silently skip
+      // that attempt while also producing an empty
+      // `project.integration.test.ts` at materialize time.
+      if (content !== null && content.trim().length === 0) {
+        projectTestFile = null;
+        return;
+      }
+      projectTestFile = content;
+    },
+
+    getProjectTestFile() {
+      return projectTestFile;
+    },
+
     setProjectConfig(config) {
       // Store a fresh copy so outside callers can't mutate our state by
       // reference.
@@ -732,6 +793,24 @@ export function createDesignGraph(): DesignGraph {
 
     getProjectConfig() {
       return projectConfig ? { ...projectConfig } : null;
+    },
+
+    setAsset(path, content) {
+      if (content === null) {
+        assets.delete(path);
+      } else {
+        assets.set(path, content);
+      }
+    },
+
+    getAsset(path) {
+      return assets.has(path) ? (assets.get(path) as string) : null;
+    },
+
+    listAssets() {
+      const out: Record<string, string> = {};
+      for (const [k, v] of assets) out[k] = v;
+      return out;
     },
 
     removeFunction(module, name) {
@@ -873,6 +952,8 @@ export function createDesignGraph(): DesignGraph {
         functions,
         projectTests,
         projectConfig,
+        assets,
+        projectTestFile,
         override,
       );
     },
@@ -903,6 +984,8 @@ export function createDesignGraph(): DesignGraph {
           signature: { ...v.signature, params: v.signature.params.map((p) => ({ ...p })) },
           tests: v.tests.map((t) => ({ ...t })),
           integrationTests: v.integrationTests.map((t) => ({ ...t })),
+          analyzedImports: v.analyzedImports.map((i) => ({ ...i })),
+          analyzedCallees: [...v.analyzedCallees],
           spec: v.spec
             ? {
                 purpose: v.spec.purpose,
@@ -916,11 +999,15 @@ export function createDesignGraph(): DesignGraph {
             : null,
         };
       }
+      const assetSnap: Record<string, string> = {};
+      for (const [k, v] of assets) assetSnap[k] = v;
       return {
         modules: modSnap,
         functions: fnSnap,
         projectTests: projectTests.map((t) => ({ ...t })),
         projectConfig: projectConfig ? { ...projectConfig } : null,
+        assets: assetSnap,
+        projectTestFile,
       };
     },
   };

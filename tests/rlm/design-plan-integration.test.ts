@@ -1,6 +1,10 @@
 import { describe, it, expect } from "vitest";
 import { createDesignGraph } from "../../src/rlm/design-graph.js";
-import { designPlanIntegration } from "../../src/rlm/design-plan-integration.js";
+import {
+  designPlanIntegration,
+  type IntegrationPlanOptions,
+} from "../../src/rlm/design-plan-integration.js";
+import type { FinalizeOptions } from "../../src/rlm/finalize.js";
 
 const specJson = JSON.stringify({
   purpose: "x",
@@ -30,7 +34,7 @@ function seedVitestConfig(g: ReturnType<typeof createDesignGraph>): void {
   g.setProjectConfig({
     packageJson:
       '{"name":"t","version":"0.1.0","type":"module","scripts":{"test":"vitest run"},"dependencies":{},"devDependencies":{"vitest":"^2.0.0"}}',
-    testFramework: "vitest",
+    testFramework: "vitest", runtime: "node", testCommand: "npx vitest run --reporter=json", testImports: "",
   });
 }
 
@@ -60,7 +64,7 @@ describe("designPlanIntegration — happy path", () => {
         events.push("integration-test-reviewed");
         return '```json\n{"verdict":"APPROVE","feedback":""}\n```';
       }
-      if (prompt.includes("You are authoring PROJECT-LEVEL")) {
+      if (prompt.includes("PROJECT-LEVEL integration test file")) {
         events.push("integration-tests-authored");
         return integrationTestsResp;
       }
@@ -163,7 +167,7 @@ describe("designPlanIntegration — bottom-up gating", () => {
       if (prompt.startsWith("You are reviewing")) {
         return '```json\n{"verdict":"APPROVE","feedback":""}\n```';
       }
-      if (prompt.includes("You are authoring PROJECT-LEVEL")) {
+      if (prompt.includes("PROJECT-LEVEL integration test file")) {
         return integrationTestsResp;
       }
       return specResp;
@@ -193,7 +197,7 @@ describe("designPlanIntegration — integration loop fires on red", () => {
       if (prompt.startsWith("You are reviewing")) {
         return '```json\n{"verdict":"APPROVE","feedback":""}\n```';
       }
-      if (prompt.includes("You are authoring PROJECT-LEVEL")) {
+      if (prompt.includes("PROJECT-LEVEL integration test file")) {
         return integrationTestsResp;
       }
       return specResp;
@@ -262,7 +266,7 @@ describe("designPlanIntegration — surfaces integration loop failure", () => {
       if (prompt.startsWith("You are reviewing")) {
         return '```json\n{"verdict":"APPROVE","feedback":""}\n```';
       }
-      if (prompt.includes("You are authoring PROJECT-LEVEL")) {
+      if (prompt.includes("PROJECT-LEVEL integration test file")) {
         return integrationTestsResp;
       }
       return specResp;
@@ -307,5 +311,91 @@ describe("designPlanIntegration — surfaces integration loop failure", () => {
     });
     expect(report.ok).toBe(false);
     expect(report.phase).toBe("integration");
+  });
+
+  it("salvage-finalizes on integration failure — returns materialized files", async () => {
+    // After run 10: when the integration loop exhausted, the report
+    // returned `files: {}` and the outer agent re-designed from
+    // scratch, producing phantom modules. Now we run a zero-test
+    // zero-typecheck finalize to materialize whatever is in the graph
+    // so the outer agent can FINAL_FILES(report) instead of improvising.
+    const g = createDesignGraph();
+    seedVitestConfig(g);
+    const chat = async (prompt: string) => {
+      if (prompt.includes("list the top-level functions")) return fnListResp;
+      if (prompt.startsWith("You are reviewing")) {
+        return '```json\n{"verdict":"APPROVE","feedback":""}\n```';
+      }
+      if (prompt.includes("PROJECT-LEVEL integration test file")) {
+        return integrationTestsResp;
+      }
+      return specResp;
+    };
+    let salvageFinalizeCall: FinalizeOptions | null = null;
+    const salvageFinalize: IntegrationPlanOptions["finalize"] = async (
+      _g,
+      opts,
+    ) => {
+      salvageFinalizeCall = opts ?? {};
+      return {
+        ok: false,
+        files: { "server.ts": "// materialized best-effort", "package.json": "{}" },
+        unimplemented: [],
+        consistency: { ok: true, violations: [], advisories: [] },
+        testsPassed: 0,
+        testsFailed: 0,
+        testOutput: "",
+        typecheckOk: true,
+        typecheckOutput: "",
+      };
+    };
+    const report = await designPlanIntegration(g, "task", {
+      chat,
+      leafDispatch: async (_g, mod, name) => {
+        _g.setImplementation(mod, name, "// ok");
+        _g.setTestStatus(mod, name, "tests-green", "");
+        return {
+          module: mod,
+          name,
+          status: "tests-green",
+          implementation: "// ok",
+          attempts: 1,
+          testOutput: "",
+        };
+      },
+      fixDispatch: async (_g, mod, name) => ({
+        module: mod,
+        name,
+        status: "failed",
+        implementation: null,
+        attempts: 1,
+        testOutput: "",
+        error: "stuck",
+      }),
+      integrationRunner: async () => ({
+        ok: false,
+        failures: [
+          {
+            testName: "always red",
+            stackTrace: "at startServer (/tmp/proj/startServer.ts:1:1)",
+            message: "nope",
+          },
+        ],
+      }),
+      finalize: salvageFinalize,
+      useProjectDir: false,
+      maxIntegrationIterations: 2,
+    });
+    expect(report.ok).toBe(false);
+    expect(report.phase).toBe("integration");
+    // Files were returned from the salvage finalize — agent has
+    // something to FINAL_FILES(report) instead of improvising.
+    expect(Object.keys(report.files).length).toBeGreaterThan(0);
+    expect(report.files["server.ts"]).toContain("best-effort");
+    // Salvage called finalize with typecheck + runTests explicitly off
+    // (no point re-running on a known-failing graph).
+    expect(salvageFinalizeCall).not.toBeNull();
+    expect(salvageFinalizeCall!.typecheck).toBe(false);
+    expect(salvageFinalizeCall!.runTests).toBe(false);
   });
 });

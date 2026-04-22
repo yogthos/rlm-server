@@ -1,0 +1,3 @@
+Write a TypeScript function `add` that takes two numbers and returns
+their sum. Include unit tests covering: positive numbers, negatives,
+zero, and mixed signs.

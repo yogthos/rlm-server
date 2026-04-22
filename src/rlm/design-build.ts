@@ -73,6 +73,11 @@ export interface BuildOptions {
    *  dispatch so vitest's module cache warms up — each subsequent
    *  attempt only re-transforms the changed file. Default true. */
   useProjectDir?: boolean;
+  /** Phase H3 — when provided, a failed `npm install` during
+   *  project-dir setup triggers an architect-driven repair loop on
+   *  package.json. Without it, install failures are logged and the
+   *  build proceeds (downstream dispatches surface the symptom). */
+  chat?: (prompt: string) => Promise<string>;
 }
 
 /**
@@ -261,7 +266,7 @@ export async function designBuild(
   let projectDir: ProjectDir | null = null;
   if (useProjectDir) {
     try {
-      projectDir = await createProjectDir(graph);
+      projectDir = await createProjectDir(graph, { chat: options.chat });
       debug("build", `warmed project dir ${projectDir.path}`);
     } catch (e) {
       debug(
@@ -432,8 +437,13 @@ export async function designBuild(
     files: finalizeReport.files,
   };
   } finally {
-    if (projectDir) {
+    // Phase H1 — keep the project dir around so the user can inspect
+    // artifacts after the build finishes. Opt-in cleanup via env var
+    // when running in CI / tests where directories accumulate.
+    if (projectDir && process.env.RLM_DISPOSE_PROJECT_DIR === "1") {
       await projectDir.dispose();
+    } else if (projectDir) {
+      debug("build", `project dir preserved at ${projectDir.path}`);
     }
   }
 }

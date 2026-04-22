@@ -15,11 +15,12 @@
 import type {
   DesignGraph,
   FunctionSpec,
-  ProjectConfig,
+  ProjectDecisions,
   Signature,
   TestSpec,
 } from "./design-graph.js";
 import { designBuild, type BuildReport, type BuildOptions } from "./design-build.js";
+import { renderDecompositionRules } from "./decomposition-rules.js";
 import { debug } from "./debug.js";
 
 export interface DesignPlanOptions {
@@ -47,51 +48,6 @@ export interface PlannedFunction {
   description: string;
 }
 
-/**
- * Parse the Architect's phase-0 package.json. Validates JSON shape,
- * requires `devDependencies` with exactly ONE of `vitest` / `jest` —
- * neither or both trips a retry with a clear error message.
- */
-export function parsePackageJson(raw: string): ProjectConfig {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch (e) {
-    throw new Error(
-      `package.json is not valid JSON: ${e instanceof Error ? e.message : String(e)}`,
-    );
-  }
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new Error("package.json must be a JSON object");
-  }
-  const obj = parsed as Record<string, unknown>;
-  if (obj.type !== "module") {
-    throw new Error(
-      'package.json must set "type": "module" (the proc-ts emitter produces ESM code)',
-    );
-  }
-  const dev = obj.devDependencies;
-  if (!dev || typeof dev !== "object" || Array.isArray(dev)) {
-    throw new Error('package.json missing "devDependencies" object');
-  }
-  const hasVitest = "vitest" in (dev as Record<string, unknown>);
-  const hasJest = "jest" in (dev as Record<string, unknown>);
-  if (hasVitest && hasJest) {
-    throw new Error(
-      'devDependencies lists BOTH "vitest" and "jest" — pick exactly one test framework',
-    );
-  }
-  if (!hasVitest && !hasJest) {
-    throw new Error(
-      'devDependencies must include exactly one of "vitest" or "jest" as the test framework',
-    );
-  }
-  return {
-    packageJson: raw,
-    testFramework: hasVitest ? "vitest" : "jest",
-  };
-}
-
 /** Extract the first fenced JSON block, or parse the whole response. */
 export function extractJson(response: string): unknown {
   const fenced = response.match(/```(?:json)?\s*\r?\n([\s\S]*?)```/);
@@ -109,19 +65,16 @@ export function extractJson(response: string): unknown {
  * whole response. Preserves formatting — needed for phase 0's
  * package.json where we want to write the LLM's exact text to disk.
  */
-function extractRawJson(response: string): string | null {
-  const fenced = response.match(/```(?:json)?\s*\r?\n([\s\S]*?)```/);
-  const body = fenced ? fenced[1].trim() : response.trim();
-  if (!body) return null;
-  // Validate shape without throwing — we just want to ensure the LLM
-  // at least emitted parseable JSON; full shape validation happens in
-  // parsePackageJson.
-  try {
-    JSON.parse(body);
-  } catch {
-    return null;
-  }
-  return body;
+/** Extract the contents of a ```testing-notes fence from a phase-0
+ *  response, or null if absent. Retained for backward compatibility
+ *  with any legacy flow that still emits testing-notes as a separate
+ *  fence. New code paths use `parsePhase0Response` which reads
+ *  `testingNotes` from the structured `decisions` block instead. */
+export function extractTestingNotes(response: string): string | null {
+  const m = response.match(/```testing-notes\s*\r?\n([\s\S]*?)```/);
+  if (!m) return null;
+  const body = m[1].trim();
+  return body.length > 0 ? body : null;
 }
 
 /**
@@ -300,44 +253,76 @@ export function parseFunctionSpec(
   };
 }
 
+function renderExistingFunction(fn: PlannedFunction): string {
+  const params = fn.signature.params
+    .map((p) => `${p.name}: ${p.type}`)
+    .join(", ");
+  const asyncMark = fn.signature.isAsync ? "async " : "";
+  const sig = `${asyncMark}${fn.name}(${params}): ${fn.signature.returnType}`;
+  const desc = fn.description ? ` — ${fn.description}` : "";
+  return `  - ${fn.module}#${sig}${desc}`;
+}
+
 function buildPhase1Prompt(
   task: string,
   parent?: PlannedFunction,
-  existingNames: string[] = [],
+  existingFunctions: PlannedFunction[] = [],
 ): string {
   if (parent) {
-    const userParams = parent.signature.params
+    const paramList = parent.signature.params
       .map((p) => `${p.name}: ${p.type}`)
       .join(", ");
-    const paramList = userParams.length > 0 ? `ctx: Ctx, ${userParams}` : "ctx: Ctx";
     const existingBlock =
-      existingNames.length > 0
+      existingFunctions.length > 0
         ? [
             "",
             `Functions already in the project (names are GLOBALLY UNIQUE —`,
             `do NOT reuse any of these names for a new child; pick a`,
             `distinct name. You CAN reference them from inside the parent's`,
-            `body via \`ctx.fns.<name>(ctx, ...)\` without declaring them as`,
-            `children):`,
-            ...existingNames.map((n) => `  - ${n}`),
+            `body by importing them directly (\`import <name> from "./<name>.js"\`)`,
+            `without declaring them as children):`,
+            ...existingFunctions.map(renderExistingFunction),
           ]
         : [];
     return [
-      `You are decomposing a function. It is too complex to implement`,
-      `directly — you need to break it into sub-functions (children) that`,
-      `assemble into its behavior.`,
+      `A function's tests didn't converge after repeated implementation`,
+      `attempts. You're being asked to consider splitting it into`,
+      `children — but first, judge whether splitting is the right move.`,
       "",
       `Parent task (the whole application's goal):`,
       task,
       "",
-      `Parent function you are decomposing:`,
+      `Parent function:`,
       `  module: ${parent.module}`,
       `  name: ${parent.name}`,
       `  signature: ${parent.signature.isAsync ? "async " : ""}function ${parent.name}(${paramList}): ${parent.signature.returnType}`,
       `  purpose: ${parent.description}`,
       ...existingBlock,
       "",
-      `Return ONLY a fenced JSON block listing the NEW children. Each child:`,
+      `When to RETURN AN EMPTY ARRAY (decline to split):`,
+      `  - The function wraps a single Node built-in — e.g. \`path.join\`,`,
+      `    \`process.cwd\`, \`fs.existsSync\`, a single regex. Splitting`,
+      `    into "detectSeparator / normalizeSeparators / combinePath" is`,
+      `    worse than the built-in itself.`,
+      `  - The function is <30 lines of straightforward logic. More,`,
+      `    smaller children often fail for the same reasons the parent`,
+      `    failed, compounding the problem.`,
+      `  - The failing tests look wrong for the spec (e.g. asserting`,
+      `    behavior the spec doesn't promise), OR a sibling's return`,
+      `    shape is mismatched with what this function expects. In`,
+      `    those cases the bug is NOT lack of decomposition.`,
+      "",
+      `When to SPLIT:`,
+      `  - The function genuinely coordinates 2+ distinct concerns that`,
+      `    could each be 15+ lines (e.g. "read request body" vs "parse`,
+      `    form-encoded data" vs "validate required fields" — three`,
+      `    clearly separable steps).`,
+      `  - A child would be independently testable and useful.`,
+      "",
+      ...renderDecompositionRules(),
+      "",
+      `Return ONLY a fenced JSON block — an array (possibly EMPTY). If`,
+      `you split, each child:`,
       "  - name: string (function name, camelCase, globally unique,",
       "    NOT already in the existing-functions list above)",
       "  - signature: { params: [{name, type}], returnType, isAsync? }",
@@ -345,26 +330,38 @@ function buildPhase1Prompt(
       "",
       "**IMPORTANT**:",
       "- Do NOT emit a `module` field. The harness places every child in",
-      `  the parent's module (${parent.module}) automatically — any module`,
-      "  string you supply is discarded.",
-      "- The `params` array must NOT include `ctx: Ctx` — the harness",
-      "  injects it automatically as the first parameter. Only list",
-      "  BUSINESS params (e.g. `req`, `entries`, `path`).",
+      `  the parent's module (${parent.module}) automatically.`,
+      "- `params` is the function's FULL signature. List only what the",
+      "  caller actually passes — no framework arguments.",
       "",
-      "The children should compose cleanly: the parent's body will call",
-      `each child via \`ctx.fns.<child>(ctx, ...)\`. Write 2–5 children`,
-      `focused on distinct concerns (hard cap: ${MAX_DECOMPOSE_CHILDREN}).`,
-      "Do NOT include the parent itself. No prose outside the JSON block.",
+      `Prefer 0 children over forced splits. If splitting, 2–4 is typical;`,
+      `hard cap ${MAX_DECOMPOSE_CHILDREN}. Do NOT include the parent itself.`,
+      `No prose outside the JSON block.`,
     ].join("\n");
   }
+  const existingBlock =
+    existingFunctions.length > 0
+      ? [
+          "",
+          "Functions ALREADY in the graph (names are globally unique — do",
+          "NOT re-propose any of these; you can reference them from any",
+          "new function's body by importing directly (`import <name> from",
+          '"./<name>.js"`) without declaring a dependency). Plan only',
+          "what's MISSING:",
+          ...existingFunctions.map(renderExistingFunction),
+        ]
+      : [];
   return [
     `Your job is to list the top-level functions needed to complete this task:`,
     "",
     task,
     "",
     "These are the roots of the project's call tree. Each becomes its own",
-    "proc-ts file; an Architect at dispatch time may later decompose any of",
-    "them into children if too complex.",
+    "TypeScript file; an Architect at dispatch time may later decompose any",
+    "of them into children if too complex.",
+    "",
+    ...renderDecompositionRules(),
+    ...existingBlock,
     "",
     "Return ONLY a fenced JSON block. The value must be an array of objects",
     "with these exact fields:",
@@ -374,9 +371,9 @@ function buildPhase1Prompt(
     "  - signature: { params: [{name, type}], returnType, isAsync? }",
     "  - description: string (one-line purpose in the overall assembly)",
     "",
-    "**IMPORTANT**: the `params` array must NOT include `ctx: Ctx` —",
-    "the harness injects it automatically as the first parameter.",
-    "List only BUSINESS params (e.g. `path`, `req`, `entries`).",
+    "**IMPORTANT**: `params` is the function's FULL signature. List",
+    "only what the caller passes — e.g. `path`, `req`, `entries`. No",
+    "framework-injected arguments; the harness doesn't add any.",
     "",
     "Example:",
     "```json",
@@ -396,10 +393,9 @@ function buildPhase2Prompt(
   fn: PlannedFunction,
   siblings: PlannedFunction[],
 ): string {
-  const userParams = fn.signature.params
+  const paramList = fn.signature.params
     .map((p) => `${p.name}: ${p.type}`)
     .join(", ");
-  const paramList = userParams.length > 0 ? `ctx: Ctx, ${userParams}` : "ctx: Ctx";
   const sigStr = `${fn.signature.isAsync ? "async " : ""}function ${fn.name}(${paramList}): ${fn.signature.returnType}`;
   const siblingList = siblings
     .filter((s) => !(s.module === fn.module && s.name === fn.name))
@@ -409,8 +405,21 @@ function buildPhase2Prompt(
     `Fill in the SPEC for the following function. You are the ARCHITECT.`,
     `You are NOT writing tests — the Implementer who later builds this`,
     `function will derive both unit AND integration tests from your spec.`,
-    `Your job is the contract: purpose, inputs, outputs, side effects,`,
-    `dependencies, edge cases, and concrete examples.`,
+    `Your job is the CONTRACT — not the implementation plan.`,
+    "",
+    `State WHAT the function must do (purpose, I/O shape, observable`,
+    `effects). Do NOT state HOW it should do it. Leave algorithm choice,`,
+    `data-structure choice, control-flow, and helper extraction to the`,
+    `Implementer. They see the full context (siblings, tests) and will`,
+    `choose the shape that actually works.`,
+    "",
+    `Edge cases are SUGGESTIONS, not mandates. If you list an edge case,`,
+    `the Implementer should cover it with a test — but only when the`,
+    `spec's purpose/output genuinely promises that behavior. Listing`,
+    `every conceivable failure mode ("must handle null, undefined,`,
+    `malformed input, truncated streams, ...") creates over-strict tests`,
+    `that stagnate dispatch. Prefer 2–4 edge cases that reflect REAL`,
+    `invariants the consumer of this function relies on.`,
     "",
     `Parent task (the whole application):`,
     task,
@@ -420,7 +429,7 @@ function buildPhase2Prompt(
     `Initial description: ${fn.description}`,
     "",
     siblingList
-      ? `Other functions in the project (this function MAY call any of these via ctx.fns; list them under "dependencies" if it does):\n${siblingList}`
+      ? `Other functions in the project (this function MAY import and call any of these; list them under "dependencies" if it does):\n${siblingList}`
       : "No sibling functions.",
     "",
     `HARD REQUIREMENT — "inputs" MUST be EXACTLY ${fn.signature.params.length} description string${fn.signature.params.length === 1 ? "" : "s"}, aligned with this signature's parameters in order:`,
@@ -429,7 +438,7 @@ function buildPhase2Prompt(
       : fn.signature.params
           .map((p, i) => `  index ${i}: ${p.name} (${p.type})`)
           .join("\n"),
-    `Do NOT include ctx or any wrapping envelope — only the business parameters above. Extra or missing entries cause a schema error and a retry.`,
+    `Only the declared parameters — no framework envelope. Extra or missing entries cause a schema error and a retry.`,
     "",
     `Return ONLY a fenced JSON block with EXACTLY this shape. Every field`,
     `is required; arrays can be empty but must be present.`,
@@ -442,8 +451,8 @@ function buildPhase2Prompt(
       .join(", ")}],`,
     '  "output": "what is returned, shape, meaning",',
     '  "sideEffects": ["describe each observable side effect — file I/O, HTTP, state mutation, throws on X"],',
-    '  "dependencies": ["<sibling function names this one calls via ctx.fns — empty if pure>"],',
-    '  "edgeCases": ["enumerate boundary / error / invariant cases the Implementer MUST cover with tests"],',
+    '  "dependencies": ["<sibling function names this one imports and calls — empty if pure>"],',
+    '  "edgeCases": ["2–4 invariants the CONSUMER relies on — the implementer will write tests only for those the purpose/output genuinely promises"],',
     '  "examples": [',
     '    {"input": "human-readable input description", "output": "human-readable expected output"}',
     "  ]",
@@ -463,7 +472,7 @@ function buildPhase2Prompt(
     `  Do NOT list every sibling that MIGHT be useful — that bloats the`,
     `  Implementer's prompt and will either trigger architect-review`,
     `  feedback for "declared but never called" OR be auto-overwritten`,
-    `  when we reconcile from the observed ctx.fns call sites. Unknown`,
+    `  when we reconcile from the observed imports+calls. Unknown`,
     `  names are dropped at store time; if you're uncertain, omit.`,
     `- Write 2–6 edge cases and 1–4 examples.`,
     `- No prose outside the JSON block.`,
@@ -472,50 +481,232 @@ function buildPhase2Prompt(
 
 function buildPhase0Prompt(task: string): string {
   return [
-    `Phase 0 of the pipeline — project initialization.`,
+    `Phase 0 — project initialization.`,
     "",
-    `Your job: fill in this package.json template for the project described`,
-    `in the task. The harness reads it to pick the test framework and to`,
-    `emit the file verbatim at materialize time.`,
+    `You commit to the runtime + tooling shape of this TypeScript`,
+    `project. The harness owns ONLY two conventions: every function is`,
+    `one default-exported \`function <name>(<params>): <ret>\` per file,`,
+    `and siblings are called by direct import (\`import <name> from`,
+    ` "./<name>.js"\`). EVERY other decision — runtime, test framework,`,
+    `module system, package manager, assertion / mocking strategy —`,
+    `is yours. The decisions you record here are injected into every`,
+    `later Implementer / Architect prompt so the whole pipeline speaks`,
+    `your chosen stack.`,
     "",
     `Task:`,
     task,
     "",
-    `Fill in this package.json template. Rules:`,
-    `  - pick EXACTLY ONE test framework — add either "vitest" OR "jest"`,
-    `    to devDependencies. Never both; never neither.`,
-    `  - "scripts.test" must invoke the chosen framework ("vitest run" or`,
-    `    "jest").`,
-    `  - "type" must be "module".`,
-    `  - Fill runtime dependencies as needed for the project. Keep them`,
-    `    minimal — dev-only helpers go in devDependencies.`,
-    `  - "name" should be kebab-case, derived from the task.`,
+    `Return THREE fenced blocks in this order:`,
     "",
-    "Return ONLY a fenced JSON block with your filled-in package.json:",
+    `1. \`\`\`decisions — a JSON object with the shape below. Fields are`,
+    `   free-form strings; pick whatever values fit the task. The`,
+    `   harness doesn't validate against an allowlist.`,
     "",
-    "```json",
-    "{",
-    '  "name": "<kebab-case>",',
-    '  "version": "0.1.0",',
-    '  "description": "<one-line purpose>",',
-    '  "type": "module",',
-    '  "scripts": {',
-    '    "test": "<test runner CLI>"',
-    "  },",
-    '  "dependencies": { },',
-    '  "devDependencies": { }',
-    "}",
-    "```",
+    `   {`,
+    `     "runtime":        "node" | "deno" | "bun" | ...,`,
+    `     "moduleSystem":   "esm" | "cjs" | "(n/a)",`,
+    `     "testFramework":  "vitest" | "jest" | "mocha" | "node:test" | "deno:test" | ...,`,
+    `     "testCommand":    <CLI for the FULL test suite (integration/finalize phase), including a TAP reporter flag>,`,
+    `     "singleTestCommand": <CLI template for ONE test file — must contain the literal token {file}, which the harness substitutes with "<functionName>.test.ts" per dispatch>,`,
+    `     "testImports":    <literal import line(s) every test file must include>,`,
+    `     "packageManager": "npm" | "pnpm" | "yarn" | "bun" | "(none)",`,
+    `     "mockingStrategy": <free-form: describe how tests should mock, or commit to DI-only>,`,
+    `     "testingNotes":   <free-form gotchas specific to this combination — if any>`,
+    `   }`,
     "",
-    "No prose outside the fenced block.",
+    `   IMPORTANT — both testCommand and singleTestCommand must emit`,
+    `   TAP output. The harness parses TAP to track pass/fail.`,
+    "",
+    `   Per-node dispatch runs ONE test file at a time — the function`,
+    `   being implemented. The harness spawns singleTestCommand with`,
+    `   {file} replaced by that function's "<name>.test.ts". A sibling`,
+    `   function's failing test CANNOT affect the current target's`,
+    `   pass/fail signal. Globs like *.test.ts or src/**/*.test.ts are`,
+    `   WRONG here — they'd re-introduce cross-contamination.`,
+    "",
+    `   Examples of valid singleTestCommand templates:`,
+    `     - vitest:            "npx vitest run --reporter=tap {file}"`,
+    `     - jest:              "npx jest --reporters=jest-tap-reporter {file}"`,
+    `     - mocha:             "npx mocha --reporter=tap {file}"`,
+    `     - node:test (22+):   "node --test --test-reporter=tap --experimental-strip-types {file}"`,
+    `     - node:test + tsc:   "tsc && node --test --test-reporter=tap dist/{file}".replace(".ts",".js")  — rewrite the extension in your template`,
+    `     - deno:test:         "deno test --reporter=tap {file}"`,
+    "",
+    `   testCommand is used by the FINAL integration phase (runs the`,
+    `   whole suite end-to-end); singleTestCommand is what the`,
+    `   leaf-up builder spawns for every function dispatch.`,
+    "",
+    `   STRONGLY PREFERRED — delegate to your package manager's test`,
+    `   script. Put the full pipeline (compile + spawn + reporter) in`,
+    `   your package.json's \`scripts.test\`, then set:`,
+    `     testCommand: "npm test"    (or "pnpm test", "yarn test", "bun test")`,
+    `   This keeps ONE source of truth. When testCommand and`,
+    `   scripts.test drift, the harness runs one thing, your npm run`,
+    `   does another, and you'll debug a ghost.`,
+    "",
+    `   CRITICAL — FILE LAYOUT the harness uses:`,
+    `     All function files AND test files live FLAT at the project`,
+    `     root. No \`src/\` subdir. Filenames are \`<functionName>.ts\``,
+    `     and \`<functionName>.test.ts\`. Integration tests are`,
+    `     \`integration.test.ts\` at the root.`,
+    `     A glob like \`src/**/*.test.ts\` will match ZERO files and`,
+    `     your test run will report 0/0 — which counts as failure.`,
+    `     Use \`*.test.ts\` (or \`./*.test.ts\`) in your test command /`,
+    `     scripts.test.`,
+    "",
+    `   CRITICAL — IMPORT CONVENTION the harness uses:`,
+    `     The harness emits test files that import functions with \`.js\``,
+    `     extensions — e.g. \`import foo from "./foo.js"\` — even though`,
+    `     the file on disk is \`foo.ts\`. This matches Node ESM + tsc`,
+    `     output conventions. Your test command MUST resolve \`.js\``,
+    `     specifiers to the corresponding \`.ts\` sources. Tools that`,
+    `     do this natively: vitest, jest (with ts-jest or @swc/jest),`,
+    `     tsx (as a Node loader), or a \`tsc\` compile step that`,
+    `     actually produces \`.js\` files in \`dist/\`.`,
+    `     \`node --experimental-strip-types\` does NOT do this remap —`,
+    `     it runs \`.ts\` syntax but Node's resolver still looks for the`,
+    `     literal \`.js\` file on disk, so every \`import "./x.js"\` fails`,
+    `     with ERR_MODULE_NOT_FOUND. Don't use it.`,
+    "",
+    `   If you don't delegate, the testCommand / singleTestCommand you`,
+    `   write IS what the harness spawns — standalone. Common pitfalls:`,
+    `     - \`ts-node/esm\` loader is fragile and often mismatches the`,
+    `       installed ts-node version. Prefer tsx or vitest.`,
+    `     - \`--experimental-strip-types\` alone (see above — .js imports fail).`,
+    `     - jest without a TAP reporter plugin installed: pick a TAP`,
+    `       reporter or delegate via \`npm test\`.`,
+    "",
+    `   RECOMMENDED combinations (pick one):`,
+    `     - vitest (easiest — handles .js/.ts remap natively):`,
+    `         testCommand:       "npx vitest run --reporter=tap"`,
+    `         singleTestCommand: "npx vitest run --reporter=tap {file}"`,
+    `     - node:test + tsx loader (Node 22+, tsx installed):`,
+    `         testCommand:       "node --import tsx --test --test-reporter=tap *.test.ts"`,
+    `         singleTestCommand: "node --import tsx --test --test-reporter=tap {file}"`,
+    `     - mocha + tsx:`,
+    `         testCommand:       "npx mocha --reporter=tap --loader=tsx *.test.ts"`,
+    `         singleTestCommand: "npx mocha --reporter=tap --loader=tsx {file}"`,
+    `     - deno:test (runtime: deno):`,
+    `         testCommand:       "deno test --reporter=tap"`,
+    `         singleTestCommand: "deno test --reporter=tap {file}"`,
+    "",
+    `   If your framework has no TAP reporter AND no way to delegate,`,
+    `   pick a different framework.`,
+    "",
+    `2. \`\`\`file:package.json — literal package.json for the project.`,
+    `   Include runtime deps + devDeps consistent with your decisions.`,
+    `   If your testCommand is "npm test" (or similar), make sure`,
+    `   \`scripts.test\` in this file is the FULL standalone command — it`,
+    `   is what actually runs. If testCommand is a standalone CLI`,
+    `   string instead, the two may diverge; keeping them in sync is`,
+    `   your responsibility.`,
+    `   If your runtime doesn't use package.json (e.g., Deno), emit an`,
+    `   empty \`{}\`.`,
+    "",
+    `3. \`\`\`file:tsconfig.json — literal tsconfig.json. Pick compiler`,
+    `   options that match your moduleSystem + runtime. Minimum: it`,
+    `   must let the test command compile the generated \`.ts\` files.`,
+    `   The harness emits function files like`,
+    `     export default function foo(<params>): <RT> { ... }`,
+    `   and test files that import via \`./<name>.js\` specifiers.`,
+    "",
+    `Every value is YOUR decision. No prose outside the fenced blocks.`,
   ].join("\n");
+}
+
+/** Pull the content of a specifically-tagged fence: ```<tag>\n…\n```. */
+export function extractTaggedFence(
+  response: string,
+  tag: string,
+): string | null {
+  const esc = tag.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const m = response.match(new RegExp(`\`\`\`${esc}\\s*\\r?\\n([\\s\\S]*?)\`\`\``));
+  if (!m) return null;
+  const body = m[1].trim();
+  return body.length > 0 ? body : null;
+}
+
+const REQUIRED_DECISION_FIELDS = [
+  "runtime",
+  "moduleSystem",
+  "testFramework",
+  "testCommand",
+  "singleTestCommand",
+  "testImports",
+] as const;
+
+/** Parse the `decisions` JSON fence from phase 0, cross-reference
+ *  with the two file fences (package.json + tsconfig.json), and
+ *  assemble a fully-populated ProjectDecisions. Throws on missing
+ *  required fields or missing file fences. */
+export function parsePhase0Response(response: string): ProjectDecisions {
+  const decisionsRaw = extractTaggedFence(response, "decisions");
+  if (!decisionsRaw) {
+    throw new Error(
+      "missing ```decisions fence — expected a JSON object with project decisions",
+    );
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(decisionsRaw);
+  } catch (e) {
+    throw new Error(
+      `decisions block is not valid JSON: ${e instanceof Error ? e.message : String(e)}`,
+    );
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("decisions block must be a JSON object");
+  }
+  const r = parsed as Record<string, unknown>;
+  for (const field of REQUIRED_DECISION_FIELDS) {
+    if (typeof r[field] !== "string" || (r[field] as string).length === 0) {
+      throw new Error(
+        `decisions missing required string field "${field}"`,
+      );
+    }
+  }
+  // Phase U12 — singleTestCommand must be a template with a literal
+  // `{file}` token. Without it, the harness has no way to scope the
+  // spawn to one test file, and per-node dispatch degenerates to a
+  // whole-suite run (the bug this phase is fixing).
+  if (!(r.singleTestCommand as string).includes("{file}")) {
+    throw new Error(
+      `decisions.singleTestCommand must contain the literal placeholder "{file}" — the harness substitutes it with "<functionName>.test.ts" per dispatch`,
+    );
+  }
+  const packageJson = extractTaggedFence(response, "file:package.json");
+  if (!packageJson) {
+    throw new Error(
+      "missing ```file:package.json fence — emit the project's package.json (or `{}` if runtime doesn't use one)",
+    );
+  }
+  const tsconfig = extractTaggedFence(response, "file:tsconfig.json");
+  if (!tsconfig) {
+    throw new Error(
+      "missing ```file:tsconfig.json fence — emit the project's tsconfig.json",
+    );
+  }
+  const cfg: ProjectDecisions = {
+    runtime: r.runtime as string,
+    moduleSystem: r.moduleSystem as string,
+    testFramework: r.testFramework as string,
+    testCommand: r.testCommand as string,
+    singleTestCommand: r.singleTestCommand as string,
+    testImports: r.testImports as string,
+    packageJson,
+    tsconfig,
+  };
+  if (typeof r.packageManager === "string") cfg.packageManager = r.packageManager;
+  if (typeof r.mockingStrategy === "string") cfg.mockingStrategy = r.mockingStrategy;
+  if (typeof r.testingNotes === "string") cfg.testingNotes = r.testingNotes;
+  return cfg;
 }
 
 async function runPhase0(
   chat: (p: string) => Promise<string>,
   task: string,
   maxRetries: number,
-): Promise<ProjectConfig | { error: string }> {
+): Promise<ProjectDecisions | { error: string }> {
   const basePrompt = buildPhase0Prompt(task);
   let currentPrompt = basePrompt;
   let lastError = "(no attempt made)";
@@ -529,19 +720,12 @@ async function runPhase0(
       debug("plan", `phase0-init chat error: ${lastError}`);
       break;
     }
-    const raw = extractRawJson(response);
-    if (raw === null) {
-      lastError = "response did not contain a parseable JSON block";
-      currentPrompt = `${basePrompt}\n\nYour previous response was not valid JSON. Return ONLY a fenced JSON block this time.`;
-      debug("plan", `phase0-init no JSON extracted, retrying`);
-      continue;
-    }
     try {
-      return parsePackageJson(raw);
+      return parsePhase0Response(response);
     } catch (e) {
       lastError = e instanceof Error ? e.message : String(e);
-      currentPrompt = `${basePrompt}\n\nYour previous response had a package.json error: ${lastError}. Fix it and return ONLY a fenced JSON block.`;
-      debug("plan", `phase0-init package.json error: ${lastError}`);
+      currentPrompt = `${basePrompt}\n\nYour previous response: ${lastError}. Fix and re-emit all three fences.`;
+      debug("plan", `phase0-init parse error: ${lastError}`);
     }
   }
   return { error: lastError };
@@ -618,23 +802,33 @@ export async function designPlan(
         failedSpecs: [],
       };
     }
+    const notesPreview = phase0.testingNotes
+      ? phase0.testingNotes.slice(0, 120).replace(/\s+/g, " ")
+      : "(none)";
     debug(
       "plan",
-      `phase 0 ok — testFramework=${phase0.testFramework}`,
+      `phase 0 ok — framework=${phase0.testFramework} moduleSystem=${phase0.moduleSystem} testingNotes=${phase0.testingNotes ? `${phase0.testingNotes.length}ch` : "(none)"}`,
     );
     debug(
       "progress",
-      `plan: phase 0 ok — test framework = ${phase0.testFramework}`,
+      `plan: phase 0 ok — ${phase0.testFramework} + ${phase0.moduleSystem}; testing-notes: ${notesPreview}`,
     );
     graph.setProjectConfig(phase0);
+    // Phase D — mirror package.json + tsconfig into the asset map so
+    // they're part of the model-owned asset surface (reachable via
+    // request-info / revisable via asset fences) rather than only
+    // accessible through projectConfig.
+    if (phase0.packageJson) graph.setAsset("package.json", phase0.packageJson);
+    if (phase0.tsconfig) graph.setAsset("tsconfig.json", phase0.tsconfig);
   } else if (!parentName) {
+    const cfg = graph.getProjectConfig()!;
     debug(
       "plan",
-      `phase 0 SKIPPED (resume) — projectConfig already set: testFramework=${graph.getProjectConfig()!.testFramework}`,
+      `phase 0 SKIPPED (resume) — projectConfig already set: framework=${cfg.testFramework} moduleSystem=${cfg.moduleSystem} testingNotes=${cfg.testingNotes ? `${cfg.testingNotes.length}ch` : "(none)"}`,
     );
     debug(
       "progress",
-      `plan: phase 0 skipped (resume) — framework = ${graph.getProjectConfig()!.testFramework}`,
+      `plan: phase 0 skipped (resume) — ${cfg.testFramework} + ${cfg.moduleSystem}`,
     );
   }
 
@@ -687,13 +881,23 @@ export async function designPlan(
           description: parentFn.description,
         }
       : undefined;
-    const existingNames = parentFn
-      ? graph.listFunctions().map((f) => f.name)
-      : [];
+    // Always feed the current graph to the prompt so the model sees
+    // what already exists (A2: idempotent re-entry). Both top-level
+    // and decompose branches benefit — on outer-agent retry the graph
+    // has prior functions, and the planner must not propose duplicates
+    // without knowing what's there.
+    const existingFunctions: PlannedFunction[] = graph
+      .listFunctions()
+      .map((f) => ({
+        module: f.module,
+        name: f.name,
+        signature: f.signature,
+        description: f.description,
+      }));
     const moduleOverride = parentFn?.module;
     const phase1 = await withJsonRetry(
       options.chat,
-      buildPhase1Prompt(task, parentSummary, existingNames),
+      buildPhase1Prompt(task, parentSummary, existingFunctions),
       (raw) => parseFunctionList(raw, moduleOverride),
       maxRetries,
       "phase1-functions",
@@ -716,6 +920,10 @@ export async function designPlan(
       "progress",
       `plan: phase 1 ok — ${phase1.length} functions: ${phase1.map((f) => `${f.module}#${f.name}`).join(", ")}`,
     );
+    // Track which proposals actually landed in the graph — duplicates
+    // get absorbed and must be dropped from plannedNames so phase 2
+    // doesn't try to setSpec on a function that wasn't added.
+    const addedPhase1: PlannedFunction[] = [];
     for (const fn of phase1) {
       graph.addModule(fn.module);
       try {
@@ -737,13 +945,24 @@ export async function designPlan(
             "plan",
           );
         }
+        addedPhase1.push(fn);
       } catch (e) {
-        // Only silent-skip exact-duplicate (same module+name) — that's
-        // a legitimate resume. Everything else (cross-module name
-        // collision, invalid identifier, reserved name, missing parent)
-        // is a real planning error and must surface.
+        // Silent-skip both duplicate forms on phase-1 re-entry:
+        //   - "duplicate function:" = exact same-module+name (resume)
+        //   - "duplicate function name:" = cross-module name collision
+        //     (model re-proposed an existing name under a different
+        //     module; the existing entry wins, the proposal is dropped)
+        // The model saw the full existing-functions list in the prompt,
+        // so collisions here are signal that the LLM re-proposed anyway
+        // — log but don't halt. Other errors (invalid identifier,
+        // reserved name, missing parent) still surface as planning
+        // failures.
         const msg = e instanceof Error ? e.message : String(e);
-        if (/^duplicate function:/.test(msg)) {
+        if (/^duplicate function(?:\s+name)?:/.test(msg)) {
+          debug(
+            "plan",
+            `phase 1 duplicate absorbed — ${fn.module}#${fn.name}: ${msg}`,
+          );
           continue;
         }
         debug(
@@ -769,7 +988,7 @@ export async function designPlan(
         };
       }
     }
-    plannedNames = phase1;
+    plannedNames = addedPhase1;
   }
 
   // ── Phase 2: Architect fills the SPEC for each function ────────

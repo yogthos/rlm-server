@@ -19,9 +19,17 @@
 
 import type { DesignGraph } from "./design-graph.js";
 import type { DispatchResult } from "./design-dispatch.js";
-import { attributeFailure } from "./design-attribution.js";
+import {
+  attributeFailure,
+  attributeStackDirect,
+} from "./design-attribution.js";
+import {
+  extractProjectTestFile,
+  parseProjectTestList,
+} from "./design-project-tests.js";
 import { extractJson } from "./design-plan.js";
 import { isProjectTestFailure } from "./design-project-test-repair.js";
+import { renderDecisionsBlock } from "./decisions-prompt.js";
 import { debug } from "./debug.js";
 
 export interface IntegrationFailure {
@@ -88,35 +96,110 @@ export interface IntegrationLoopReport {
 }
 
 function buildFeedback(failures: IntegrationFailure[]): string {
-  return failures
+  // Self-tagged: dispatch no longer wraps externalFeedback, so the
+  // sender owns the header.
+  const body = failures
     .map(
       (f) =>
         `Integration test "${f.testName}" failed:\n${f.message}\n\nStack:\n${f.stackTrace.trim()}`,
     )
     .join("\n\n---\n\n");
+  return `[integration-loop feedback]\n${body}`;
 }
 
 function buildAugmentPrompt(
+  graph: DesignGraph,
   recurring: IntegrationFailure,
   iteration: number,
+  attributedFnName: string,
 ): string {
+  const fn = graph.listFunctions().find((f) => f.name === attributedFnName);
+  const fnBlock: string[] = [];
+  if (fn) {
+    const params = fn.signature.params
+      .map((p) => `${p.name}: ${p.type}`)
+      .join(", ");
+    fnBlock.push(
+      `Target function (attributed from the stack trace):`,
+      `  ${fn.name}(${params}): ${fn.signature.returnType}`,
+      `  purpose: ${fn.spec?.purpose ?? "(no spec)"}`,
+    );
+    if (fn.implementation) {
+      fnBlock.push(
+        "  body:",
+        "  ```ts",
+        ...fn.implementation.split("\n").slice(0, 40).map((l) => `    ${l}`),
+        "  ```",
+      );
+    }
+    if (fn.tests.length > 0) {
+      fnBlock.push(
+        `  existing unit tests (${fn.tests.length}):`,
+        ...fn.tests.slice(0, 8).map((t) => `    - ${t.name}`),
+      );
+    }
+    if (fn.integrationTests.length > 0) {
+      fnBlock.push(
+        `  existing integration tests (${fn.integrationTests.length}):`,
+        ...fn.integrationTests.slice(0, 6).map((t) => `    - ${t.name}`),
+      );
+    }
+    // Phase N8 — show graph-backed context so the author knows which
+    // OTHER functions exercise this one (callers) and which siblings
+    // it in turn calls. Both derived from tree-sitter-analyzed edges.
+    const callers = graph
+      .listFunctions()
+      .filter((other) => other.analyzedCallees.includes(fn.name))
+      .map((o) => o.name);
+    if (callers.length > 0) {
+      fnBlock.push(
+        `  called by: ${callers.join(", ")}`,
+      );
+    }
+    if (fn.analyzedCallees.length > 0) {
+      fnBlock.push(
+        `  calls: ${fn.analyzedCallees.join(", ")}`,
+      );
+    }
+  }
+  const currentFile = graph.getProjectTestFile();
+  const existingFileBlock = currentFile
+    ? [
+        "Current project.integration.test.ts — append to this, don't duplicate:",
+        "```ts",
+        currentFile,
+        "```",
+      ]
+    : [
+        "No project.integration.test.ts yet — write one from scratch that",
+        "covers this scenario.",
+      ];
   return [
     `An integration test has failed for ${iteration} iterations in a row.`,
     "The fix attempts haven't resolved the underlying bug. Coverage is",
     "likely thin — the existing assertion may not fully articulate what's",
-    "broken. Author ONE additional integration test that exercises the",
-    "same scenario from a different angle (different input, different",
-    "side-effect check, different assertion shape) so the bug has a",
-    "concrete second witness.",
-    "",
+    "broken. Revise the project integration test file to add ONE more",
+    "additional integration test that exercises the same scenario from a different angle",
+    "(different input, different side-effect check, different assertion",
+    "shape) so the bug has a concrete second witness.",
+    ...renderDecisionsBlock(graph),
     `Recurring test name: ${recurring.testName}`,
     `Message: ${recurring.message}`,
     "Stack (excerpt):",
     recurring.stackTrace.split("\n").slice(0, 10).join("\n"),
     "",
-    "Return ONLY a fenced JSON object (SINGLE test):",
-    "```json",
-    '{"name": "<new test name>", "code": "<test body>"}',
+    ...fnBlock,
+    "",
+    ...existingFileBlock,
+    "",
+    "Call project functions naturally — direct import, no framework wrapper.",
+    "",
+    "OUTPUT — emit ONE fence with the COMPLETE revised source of",
+    "`project.integration.test.ts` (preserve existing tests + add the",
+    "new one):",
+    "",
+    "```project-test-file",
+    "// entire revised project.integration.test.ts",
     "```",
   ].join("\n");
 }
@@ -127,19 +210,64 @@ async function augmentTestsForRecurrence(
   iteration: number,
   chat: (prompt: string) => Promise<string>,
 ): Promise<void> {
+  // Skip synthetic project.* failures — they can't be "witnessed" by
+  // more tests (they're environmental crashes, not assertion failures).
+  // Adding tests just piles up noise; run 10 saw this amplify phantom
+  // crashes into new phantom tests.
+  if (isProjectTestFailure(recurring)) {
+    debug(
+      "integration-loop",
+      `augment skipped for synthetic "${recurring.testName}" — no test can witness an environmental crash`,
+    );
+    return;
+  }
+  // Attribute the failure BEFORE authoring so the prompt can show the
+  // model which function is actually involved (and what tests already
+  // cover it). Direct-only attribution — no LLM call for this step.
+  const attributed = attributeStackDirect(graph, recurring.stackTrace);
+  if (!attributed) {
+    debug(
+      "integration-loop",
+      `augment skipped for "${recurring.testName}" — unattributable stack, author wouldn't know what to witness`,
+    );
+    return;
+  }
   try {
-    const response = await chat(buildAugmentPrompt(recurring, iteration));
+    const response = await chat(
+      buildAugmentPrompt(graph, recurring, iteration, attributed),
+    );
+    // Wrapper-kill path — architect emits the full revised file.
+    const fileContent = extractProjectTestFile(response);
+    if (fileContent !== null) {
+      graph.setProjectTestFile(fileContent);
+      graph.replaceProjectTests([]);
+      debug(
+        "integration-loop",
+        `augmented project test file (${fileContent.length} chars, witness for ${attributed})`,
+      );
+      return;
+    }
+    // Legacy fallback — single {name, code} JSON object. Kept so
+    // mid-migration runs don't fall over.
     const parsed = extractJson(response);
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return;
     const r = parsed as Record<string, unknown>;
     if (typeof r.name !== "string" || typeof r.code !== "string") return;
-    // Avoid duplicating an existing test name.
     const existing = new Set(graph.listProjectTests().map((t) => t.name));
     if (existing.has(r.name)) return;
+    try {
+      parseProjectTestList([{ name: r.name, code: r.code }]);
+    } catch (e) {
+      debug(
+        "integration-loop",
+        `augment response rejected — ${e instanceof Error ? e.message : String(e)}`,
+      );
+      return;
+    }
     graph.addProjectTest({ name: r.name, code: r.code });
     debug(
       "integration-loop",
-      `augmented tests with "${r.name}" (recurrence witness)`,
+      `augmented tests with "${r.name}" (legacy JSON path; witness for ${attributed})`,
     );
   } catch (e) {
     debug(
@@ -160,11 +288,39 @@ export async function runIntegrationLoop(
   /** Per-test iteration counters — how many cycles each test has been
    *  failing. Drives the recurrence threshold for augmentation. */
   const recurrenceCount = new Map<string, number>();
+  /** Signature of the prior iteration's failures + whether the prior
+   *  iteration attempted any fix. Drives the no-progress guard below —
+   *  "same failures twice running AND we tried to fix" = bail.
+   *  Covers both environmental loops (synthetic repeats) and broader
+   *  no-progress (missing db/service, failing assertion that repairs
+   *  can't address, etc). `priorAugmentedLastIter` grants one extra
+   *  iteration after augmentation so the new witness test's result
+   *  can be observed before we call the loop stuck. */
+  let priorFailuresSignature: string | null = null;
+  let priorAttemptedFix = false;
+  let priorAugmentedLastIter = false;
   let iter = 0;
   while (iter < maxIter) {
     iter++;
     debug("integration-loop", `iteration ${iter}/${maxIter} — running`);
-    const result = await options.runner(graph);
+    let result: IntegrationRunResult;
+    try {
+      result = await options.runner(graph);
+    } catch (e) {
+      // Phase U2 — runner can throw on misconfiguration (e.g. missing
+      // decisions.testCommand). Treat a thrown runner as an integration
+      // failure so the loop's normal failure path runs: no crash, and
+      // the error propagates through the ok=false return.
+      const msg = e instanceof Error ? e.message : String(e);
+      debug("integration-loop", `runner threw: ${msg}`);
+      return {
+        ok: false,
+        iterations: iter,
+        failuresByIteration,
+        dispatched,
+        error: `runner threw: ${msg}`,
+      };
+    }
     failuresByIteration.push(result.failures.length);
     if (result.ok) {
       return {
@@ -179,6 +335,40 @@ export async function runIntegrationLoop(
       "integration-loop",
       `iteration ${iter} — ${result.failures.length} failure(s); attributing`,
     );
+    // No-progress guard setup. Computes current iteration's failure
+    // signature. The actual bail decision runs BELOW, after any
+    // augmentation — augmentation is itself a prospective fix
+    // (authors a new test) and deserves one iteration to see its
+    // effect before we call the loop stuck.
+    //
+    // Bail cases the guard catches:
+    //   - Environmental crash (tsc/vitest crash repeats) — fast path
+    //     bails even without priorAttemptedFix (nothing to wait for)
+    //   - Missing external dep (db/service unreachable, import fail)
+    //   - Over-specific test that fix-dispatches can't satisfy
+    //   - Cross-function bug that one-function-at-a-time repair can't
+    //     cohere on
+    // Synthetic `project.*` messages embed PIDs (`(node:12345)`) and
+    // varying stderr tails — using them in the signature would prevent
+    // the guard from detecting repeats. For synthetics, sign on the
+    // testName ALONE (names are stable across iters). For real
+    // failures, keep message[0..200] since assertion text is stable
+    // and distinguishes per-test failures.
+    const currentSignature = result.failures
+      .map((f) =>
+        isProjectTestFailure(f)
+          ? f.testName
+          : `${f.testName}::${f.message.slice(0, 200)}`,
+      )
+      .sort()
+      .join("||");
+    const allSynthetic =
+      result.failures.length > 0 &&
+      result.failures.every(isProjectTestFailure);
+    // Reset attempt tracker for THIS iteration — will be set true
+    // below by augmentation, dispatch, or repair.
+    let thisIterAttempted = false;
+    let thisIterAugmented = false;
     // Track recurrence — tests that fail again bump their counter;
     // tests that no longer appear drop back to 0 on next iteration.
     const currentNames = new Set(result.failures.map((f) => f.testName));
@@ -192,9 +382,43 @@ export async function runIntegrationLoop(
         recurrenceCount.set(failure.testName, next);
         // On the 2nd consecutive occurrence, augment once.
         if (next === 2) {
+          const beforeCount = graph.listProjectTests().length;
           await augmentTestsForRecurrence(graph, failure, next, options.chat);
+          if (graph.listProjectTests().length > beforeCount) {
+            // Augmentation added a test — count as a structural fix
+            // attempt so the no-progress guard doesn't bail before we
+            // see the new test's result in the next iteration.
+            thisIterAttempted = true;
+            thisIterAugmented = true;
+          }
         }
       }
+    }
+    // Early bail when failures repeat AND either we just ran fix
+    // attempts last iter (and they didn't help) OR all failures are
+    // synthetic (no repair can help). Placed AFTER augmentation so
+    // augmentation gets to run at count=2 before we decide stuck.
+    if (
+      iter > 1 &&
+      currentSignature === priorFailuresSignature &&
+      (priorAttemptedFix || allSynthetic) &&
+      !priorAugmentedLastIter &&
+      !thisIterAugmented
+    ) {
+      const reason = allSynthetic
+        ? `environmental failure loop — ${result.failures.length} synthetic project.* failure(s) unchanged across iterations ${iter - 1} → ${iter}; no user-function attribution possible (likely tsc/vitest/external-service crash that pipeline fixes can't address)`
+        : `no-progress loop — ${result.failures.length} failure(s) unchanged across iterations ${iter - 1} → ${iter} despite attempted fixes (possibly missing external dep, cross-function bug, or over-specific test the fix-dispatcher can't satisfy)`;
+      debug(
+        "integration-loop",
+        `no-progress abort at iter ${iter}: ${reason.slice(0, 160)}`,
+      );
+      return {
+        ok: false,
+        iterations: iter,
+        failuresByIteration,
+        dispatched,
+        error: reason,
+      };
     }
     // Collapse failures by attributed target. Two target kinds:
     //   1. project-tests: the project integration TEST FILE is the
@@ -255,6 +479,7 @@ export async function runIntegrationLoop(
           `dispatching project-test repair for ${projectTestFailures.length} failure(s)`,
         );
         dispatched.push("__project-tests__");
+        thisIterAttempted = true;
         try {
           await options.fixProjectTests(graph, projectTestFailures);
         } catch (e) {
@@ -277,6 +502,7 @@ export async function runIntegrationLoop(
         continue;
       }
       dispatched.push(name);
+      thisIterAttempted = true;
       try {
         await options.dispatch(graph, fn.module, fn.name, {
           feedback: buildFeedback(failures),
@@ -292,6 +518,11 @@ export async function runIntegrationLoop(
         );
       }
     }
+    // Persist this iteration's state for the next iteration's
+    // no-progress guard.
+    priorFailuresSignature = currentSignature;
+    priorAttemptedFix = thisIterAttempted;
+    priorAugmentedLastIter = thisIterAugmented;
   }
   return {
     ok: false,

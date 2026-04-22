@@ -1,0 +1,6 @@
+{
+  "name": "add-two",
+  "description": "Trivial pure-function: exercises the happy path of phase 0 + phase 1 + implementer + unit tests without any I/O, mocks, or multi-function assembly.",
+  "stage": "implementer",
+  "expectedOutcome": "green (all tests pass, function implemented)"
+}

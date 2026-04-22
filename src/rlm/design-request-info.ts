@@ -187,22 +187,53 @@ registerInfoHandler("spec", (req, ctx) => {
   ].join("\n");
 });
 
-registerInfoHandler("callers", (_req, ctx) => {
-  const callers = ctx.graph
-    .listFunctions()
-    .filter((f) => f.spec?.dependencies?.includes(ctx.fnName))
+/** Phase N6 — graph-backed "who calls me?" lookup.
+ *  Prefers analyzer-observed edges (analyzedCallees); falls back to
+ *  architect-declared deps for functions that haven't been dispatched
+ *  yet. `callers:<target>` scopes to any function; plain `callers`
+ *  uses the current dispatch target. */
+registerInfoHandler("callers", (req, ctx) => {
+  const target = req.args || ctx.fnName;
+  const all = ctx.graph.listFunctions();
+  const callers = all
+    .filter((f) =>
+      f.analyzedCallees.includes(target) ||
+      (f.analyzedCallees.length === 0 &&
+        f.spec?.dependencies?.includes(target)),
+    )
     .map((f) => f.name);
-  if (callers.length === 0) return `No function lists "${ctx.fnName}" in spec.dependencies.`;
-  return `Functions that depend on ${ctx.fnName}: ${callers.join(", ")}`;
+  if (callers.length === 0) return `No function lists "${target}" as a callee.`;
+  return `Functions that call ${target}: ${callers.join(", ")}`;
+});
+
+/** Phase N6 — "what does this function call?" lookup. */
+registerInfoHandler("callees", (req, ctx) => {
+  const target = req.args || ctx.fnName;
+  const fn = ctx.graph.listFunctions().find((f) => f.name === target);
+  if (!fn) return `No function named "${target}" in the graph.`;
+  const callees =
+    fn.analyzedCallees.length > 0
+      ? fn.analyzedCallees
+      : (fn.spec?.dependencies ?? []);
+  if (callees.length === 0) return `${target} calls no known siblings.`;
+  return `${target} calls: ${callees.join(", ")}`;
 });
 
 registerInfoHandler("related", (_req, ctx) => {
   const me = ctx.graph.listFunctions().find((f) => f.name === ctx.fnName);
   if (!me) return `Function ${ctx.fnName} not found.`;
-  const callees = me.spec?.dependencies ?? [];
+  const callees =
+    me.analyzedCallees.length > 0
+      ? me.analyzedCallees
+      : (me.spec?.dependencies ?? []);
   const callers = ctx.graph
     .listFunctions()
-    .filter((f) => f.spec?.dependencies?.includes(ctx.fnName))
+    .filter(
+      (f) =>
+        f.analyzedCallees.includes(ctx.fnName) ||
+        (f.analyzedCallees.length === 0 &&
+          f.spec?.dependencies?.includes(ctx.fnName)),
+    )
     .map((f) => f.name);
   return [
     `${ctx.fnName}:`,
@@ -212,8 +243,143 @@ registerInfoHandler("related", (_req, ctx) => {
   ].join("\n");
 });
 
+/** Phase N6 — dump the analyzer-observed import list for a function. */
+registerInfoHandler("imports", (req, ctx) => {
+  const target = req.args || ctx.fnName;
+  const fn = ctx.graph.listFunctions().find((f) => f.name === target);
+  if (!fn) return `No function named "${target}" in the graph.`;
+  if (fn.analyzedImports.length === 0) {
+    return `${target} has no observed imports yet (body not analyzed, or no imports).`;
+  }
+  const lines = fn.analyzedImports.map((i) =>
+    `  line ${i.line}: ${i.isDefault ? "default" : "named"} "${i.name}" from "${i.source}"`,
+  );
+  return [`${target} imports:`, ...lines].join("\n");
+});
+
+/** Phase N6 — just the declared signature, for quick lookup. */
+registerInfoHandler("signature", (req, ctx) => {
+  const target = req.args || ctx.fnName;
+  const fn = ctx.graph.listFunctions().find((f) => f.name === target);
+  if (!fn) return `No function named "${target}" in the graph.`;
+  const async = fn.signature.isAsync ? "async " : "";
+  const params = fn.signature.params
+    .map((p) => `${p.name}${p.optional ? "?" : ""}: ${p.type}`)
+    .join(", ");
+  return `${async}function ${target}(${params}): ${fn.signature.returnType}`;
+});
+
+/** Phase N6 — just the stored body, no prose. Useful when the
+ *  implementer wants to re-read a sibling concisely. */
+registerInfoHandler("body", (req, ctx) => {
+  const target = req.args || ctx.fnName;
+  const fn = ctx.graph.listFunctions().find((f) => f.name === target);
+  if (!fn) return `No function named "${target}" in the graph.`;
+  if (!fn.implementation) return `${target} is not implemented yet.`;
+  return cap(fn.implementation, `body ${target}`);
+});
+
+/** Phase N6 — compact ±1-hop neighborhood around the current function.
+ *  Lists direct callers (inverted analyzed edges) and direct callees
+ *  (this function's own analyzed edges). Unrelated functions are
+ *  omitted to keep the response focused. */
+registerInfoHandler("graph", (_req, ctx) => {
+  const me = ctx.graph.listFunctions().find((f) => f.name === ctx.fnName);
+  if (!me) return `Function ${ctx.fnName} not found.`;
+  const callees =
+    me.analyzedCallees.length > 0
+      ? me.analyzedCallees
+      : (me.spec?.dependencies ?? []);
+  const callers = ctx.graph
+    .listFunctions()
+    .filter(
+      (f) =>
+        f.analyzedCallees.includes(ctx.fnName) ||
+        (f.analyzedCallees.length === 0 &&
+          f.spec?.dependencies?.includes(ctx.fnName)),
+    )
+    .map((f) => f.name);
+  const lines = [
+    `Graph neighborhood (±1 hop from ${ctx.fnName}):`,
+    `  callers: ${callers.length === 0 ? "(none)" : callers.join(", ")}`,
+    `  callees: ${callees.length === 0 ? "(none)" : callees.join(", ")}`,
+  ];
+  if (me.children.length > 0) {
+    lines.push(`  children: ${me.children.join(", ")}`);
+  }
+  if (me.parent) lines.push(`  parent:   ${me.parent}`);
+  return lines.join("\n");
+});
+
 registerInfoHandler("task", (_req, ctx) => {
   return ctx.task ?? "Top-level task not available in context.";
+});
+
+// ─── Phase E: model-owned asset access ──────────────────────────────
+
+/** Read any asset by project-relative path. Covers `package.json`,
+ *  `tsconfig.json`, and anything else stored via `setAsset`. Also
+ *  accepts pseudo-paths the harness materializes on-demand:
+ *    - `<fn>.ts`                 → source file
+ *    - `<fn>.test.ts`            → unit test file
+ *    - `<fn>.integration.test.ts`→ integration test file
+ *    - `project.integration.test.ts`
+ *    - `ctx.ts` / `ctx_fns.d.ts` → scaffolding
+ *  The model can inspect any file it will eventually write. */
+registerInfoHandler("file", (req, ctx) => {
+  const path = req.args;
+  if (!path) return "Usage: file:<project-relative-path>";
+  // First preference: explicit asset (package.json / tsconfig / …).
+  const asset = ctx.graph.getAsset(path);
+  if (asset !== null) return cap(asset, `file ${path}`);
+  // Fall through: materialize to resolve on-demand files (function
+  // source, test files, ctx scaffolding, project integration test).
+  let files: Record<string, string>;
+  try {
+    files = ctx.graph.materialize();
+  } catch (e) {
+    return `materialize failed: ${e instanceof Error ? e.message : String(e)}`;
+  }
+  const hit = files[path];
+  if (typeof hit === "string") return cap(hit, `file ${path}`);
+  const keys = [...Object.keys(files), ...Object.keys(ctx.graph.listAssets())]
+    .sort();
+  return `No file "${path}". Available:\n  - ${keys.join("\n  - ")}`;
+});
+
+/** List every file path the harness will write (assets + generated). */
+registerInfoHandler("files", (_req, ctx) => {
+  const set = new Set<string>();
+  for (const k of Object.keys(ctx.graph.listAssets())) set.add(k);
+  try {
+    for (const k of Object.keys(ctx.graph.materialize())) set.add(k);
+  } catch {
+    /* empty graph — still list assets */
+  }
+  if (set.size === 0) return "(no assets yet)";
+  return [...set].sort().map((k) => `  - ${k}`).join("\n");
+});
+
+/** Echo the current ProjectDecisions block — lets the model read back
+ *  the stack it committed to. Distinct from the prompt's decisions
+ *  block: the model asks for this if it's been instructed to revise. */
+registerInfoHandler("decisions", (_req, ctx) => {
+  const cfg = ctx.graph.getProjectConfig();
+  if (!cfg) return "No projectConfig set.";
+  const lines = [
+    `runtime:         ${cfg.runtime}`,
+    `moduleSystem:    ${cfg.moduleSystem}`,
+    `testFramework:   ${cfg.testFramework}`,
+    `testCommand:     ${cfg.testCommand}`,
+    ...(cfg.singleTestCommand
+      ? [`singleTestCommand: ${cfg.singleTestCommand}`]
+      : []),
+    `testImports:     ${cfg.testImports}`,
+  ];
+  if (cfg.packageManager) lines.push(`packageManager:  ${cfg.packageManager}`);
+  if (cfg.mockingStrategy) lines.push(`mockingStrategy: ${cfg.mockingStrategy}`);
+  if (cfg.testingNotes) lines.push(`testingNotes:\n${cfg.testingNotes}`);
+  return cap(lines.join("\n"), "decisions");
 });
 
 registerInfoHandler("help", () => {

@@ -1,0 +1,5 @@
+Build a guestbook web app in TypeScript with these routes:
+- GET `/` returns an HTML page showing a form and all existing entries.
+- POST `/sign` accepts form-encoded `{name, message}`, stores the entry, redirects to `/`.
+Persist entries in SQLite via better-sqlite3. Include integration tests
+that spin up the server and exercise both routes.

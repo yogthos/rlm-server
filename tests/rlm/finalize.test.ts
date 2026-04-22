@@ -1,6 +1,15 @@
 import { describe, it, expect } from "vitest";
 import { createDesignGraph } from "../../src/rlm/design-graph.js";
 import { finalizeProject } from "../../src/rlm/finalize.js";
+import { stubFunctionFile, mirrorTestsToFiles } from "./fixtures.js";
+
+const addSig = {
+  params: [
+    { name: "a", type: "number" },
+    { name: "b", type: "number" },
+  ],
+  returnType: "number",
+};
 
 describe("finalizeProject", () => {
   it("returns ok=false when any function is unimplemented", async () => {
@@ -31,9 +40,10 @@ describe("finalizeProject", () => {
     });
     g.addTest("src/math.ts", "add", {
       name: "adds",
-      code: "expect(add(ctx, 2, 3)).toBe(5);",
+      code: "expect(add(2, 3)).toBe(5);",
     });
-    g.setImplementation("src/math.ts", "add", "return a + b;");
+    g.setImplementation("src/math.ts", "add", stubFunctionFile("add", "return a + b;", addSig));
+    mirrorTestsToFiles(g);
 
     const report = await finalizeProject(g, { typecheck: false });
     expect(report.ok).toBe(true);
@@ -52,10 +62,11 @@ describe("finalizeProject", () => {
     });
     g.addTest("src/math.ts", "add", {
       name: "adds",
-      code: "expect(add(ctx, 2, 3)).toBe(5);",
+      code: "expect(add(2, 3)).toBe(5);",
     });
-    g.setImplementation("src/math.ts", "add", "return a - b;");
+    g.setImplementation("src/math.ts", "add", stubFunctionFile("add", "return a - b;", addSig));
     g.setTestStatus("src/math.ts", "add", "tests-green", "(stale)");
+    mirrorTestsToFiles(g);
 
     const report = await finalizeProject(g, { typecheck: false });
     expect(report.ok).toBe(false);
@@ -77,9 +88,10 @@ describe("finalizeProject", () => {
     });
     g.addTest("src/math.ts", "add", {
       name: "adds",
-      code: "expect(add(ctx, 2, 3)).toBe(5);",
+      code: "expect(add(2, 3)).toBe(5);",
     });
-    g.setImplementation("src/math.ts", "add", "return a - b;");
+    g.setImplementation("src/math.ts", "add", stubFunctionFile("add", "return a - b;", addSig));
+    mirrorTestsToFiles(g);
 
     const report = await finalizeProject(g, { typecheck: false });
     expect(report.ok).toBe(false);
@@ -89,13 +101,17 @@ describe("finalizeProject", () => {
   it("returns the materialized file set", async () => {
     const g = createDesignGraph();
     g.addFunction("src/a.ts", "foo", { params: [], returnType: "number" });
-    g.setImplementation("src/a.ts", "foo", "return 1;");
+    g.setImplementation(
+      "src/a.ts",
+      "foo",
+      stubFunctionFile("foo", "return 1;", { params: [], returnType: "number" }),
+    );
     const report = await finalizeProject(g, {
       typecheck: false,
       runTests: false,
     });
     expect(report.files["foo.ts"]).toContain(
-      "function foo(ctx: Ctx): number",
+      "function foo(): number",
     );
     expect(report.files["foo.ts"]).toContain("return 1;");
   });

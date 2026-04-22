@@ -81,6 +81,20 @@ function attributeDirect(
   return null;
 }
 
+/**
+ * Cheap direct-only attribution — no LLM call. Returns a function name
+ * if the stack trace's in-project frames map to a known function, else
+ * null. Used where an LLM fallback would be wasteful (augmentation
+ * decides whether to author a witness test; unattributable failures
+ * aren't worth authoring for).
+ */
+export function attributeStackDirect(
+  graph: DesignGraph,
+  stackTrace: string,
+): string | null {
+  return attributeDirect(graph, parseStackFrames(stackTrace));
+}
+
 export function extractSubgraph(
   graph: DesignGraph,
   seed: string,

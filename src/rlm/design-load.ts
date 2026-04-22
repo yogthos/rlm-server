@@ -129,7 +129,11 @@ export function parseExports(source: string): LoadedFunction[] {
 function skippableFile(name: string): boolean {
   if (name === "ctx.ts") return true;
   if (name.endsWith(".d.ts")) return true;
-  if (name.endsWith(".test.ts")) return true;
+  // Phase U7 — skip any test-looking file. Frameworks use different
+  // conventions (.test.ts / .spec.ts / __tests__/...), so any of these
+  // patterns is noise when loading production modules.
+  if (/\.(test|spec)\.(c|m)?[jt]sx?$/.test(name)) return true;
+  if (name.includes("__tests__")) return true;
   if (!name.endsWith(".ts")) return true;
   return false;
 }

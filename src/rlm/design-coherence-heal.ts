@@ -7,9 +7,6 @@
  *
  *   - `phantom-dep`: drop the phantom name from the offending
  *     function's spec.dependencies. Mechanical — no LLM call.
- *   - `orphan`: ask the architect which existing function should take
- *     the orphan as a dep, OR whether to drop the orphan from the
- *     plan entirely. Applies the chosen fix.
  *   - `cycle`: can't auto-break without restructuring the whole
  *     decomposition. Hard-fail; surface the cycle to the caller.
  *
@@ -20,13 +17,6 @@
 
 import type { DesignGraph } from "./design-graph.js";
 import { designCoherence } from "./design-coherence.js";
-import { computeDependencyLevels } from "./design-leaf-up-build.js";
-import { extractJson } from "./design-plan.js";
-import { debug } from "./debug.js";
-
-export interface HealOptions {
-  chat: (prompt: string) => Promise<string>;
-}
 
 export interface HealReport {
   ok: boolean;
@@ -34,34 +24,6 @@ export interface HealReport {
   healed: string[];
   /** Per-violation tags identifying what remained unresolved. */
   unhealed: string[];
-}
-
-function buildOrphanPrompt(
-  graph: DesignGraph,
-  orphanName: string,
-): string {
-  const candidates = graph
-    .listFunctions()
-    .filter((f) => f.name !== orphanName)
-    .map((f) => `  - ${f.name}: ${f.spec?.purpose?.slice(0, 120) ?? "(no spec)"}`);
-  return [
-    `Function "${orphanName}" is in the graph but no other function's`,
-    `spec.dependencies lists it. Either it should be called by one of`,
-    `the existing functions, or it shouldn't be in the plan at all.`,
-    "",
-    "Candidates that could declare it as a dependency:",
-    candidates.length > 0 ? candidates.join("\n") : "  (no other functions)",
-    "",
-    "Return ONLY a fenced JSON object:",
-    "```json",
-    '{"caller": "<function name that should depend on this, or null>",',
-    ' "action": "add-dep" | "drop"}',
-    "```",
-    "",
-    `- action="add-dep": pick a caller from the list above.`,
-    `  We'll append "${orphanName}" to that function's spec.dependencies.`,
-    `- action="drop": no one should call it; remove from the plan.`,
-  ].join("\n");
 }
 
 async function healPhantomDep(
@@ -80,64 +42,8 @@ async function healPhantomDep(
   return true;
 }
 
-async function healOrphan(
-  graph: DesignGraph,
-  module: string,
-  name: string,
-  chat: (prompt: string) => Promise<string>,
-): Promise<boolean> {
-  const prompt = buildOrphanPrompt(graph, name);
-  let response: string;
-  try {
-    response = await chat(prompt);
-  } catch (e) {
-    debug(
-      "coherence",
-      `orphan heal chat threw (${e instanceof Error ? e.message : String(e)})`,
-    );
-    return false;
-  }
-  const parsed = extractJson(response);
-  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    return false;
-  }
-  const r = parsed as Record<string, unknown>;
-  if (r.action === "drop") {
-    graph.removeFunction(module, name);
-    return true;
-  }
-  if (r.action !== "add-dep") return false;
-  if (typeof r.caller !== "string") return false;
-  const caller = graph.listFunctions().find((f) => f.name === r.caller);
-  if (!caller || !caller.spec) return false;
-  if (caller.name === name) return false; // no self-cycles
-  if (caller.spec.dependencies.includes(name)) return true;
-  const before = caller.spec;
-  graph.setSpec(caller.module, caller.name, {
-    ...caller.spec,
-    dependencies: [...caller.spec.dependencies, name],
-  });
-  // Transitive-cycle guard: the LLM might nominate a caller that the
-  // orphan already reaches via some chain. `computeDependencyLevels`
-  // throws on cycles. If wiring created one, revert the setSpec so the
-  // graph stays acyclic. The violation stays unhealed; caller surfaces
-  // it on the next coherence pass.
-  try {
-    computeDependencyLevels(graph);
-  } catch {
-    graph.setSpec(caller.module, caller.name, before);
-    debug(
-      "coherence",
-      `orphan heal reverted: wiring ${caller.name} → ${name} would have created a cycle`,
-    );
-    return false;
-  }
-  return true;
-}
-
 export async function healStructureCoherence(
   graph: DesignGraph,
-  options: HealOptions,
 ): Promise<HealReport> {
   const healed: string[] = [];
   const unhealed: string[] = [];
@@ -147,10 +53,10 @@ export async function healStructureCoherence(
     const tag = v.phantomName
       ? `${v.kind}:${v.name}:${v.phantomName}`
       : `${v.kind}:${v.name}`;
-    // A prior heal may have dropped the target (orphan-drop) or
-    // already removed the phantom as a side-effect (removeFunction
-    // cleans up sibling deps). Skip silently — the violation is
-    // resolved by the earlier action, just not in the stale report.
+    // A prior heal may have already removed the phantom as a
+    // side-effect (removeFunction cleans up sibling deps). Skip
+    // silently — the violation is resolved by the earlier action,
+    // just not in the stale report.
     if (!graph.getFunction(v.module, v.name)) {
       healed.push(tag);
       continue;
@@ -165,12 +71,6 @@ export async function healStructureCoherence(
         continue;
       }
       const ok = await healPhantomDep(graph, v.module, v.name, v.phantomName);
-      if (ok) healed.push(tag);
-      else unhealed.push(tag);
-      continue;
-    }
-    if (v.kind === "orphan") {
-      const ok = await healOrphan(graph, v.module, v.name, options.chat);
       if (ok) healed.push(tag);
       else unhealed.push(tag);
       continue;
