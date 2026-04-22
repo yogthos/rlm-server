@@ -842,9 +842,14 @@ export function createDesignDispatchBridge(
       const externalFeedback = runOpts?.externalFeedback ?? null;
       const userTask = runOpts?.task;
       const key = `${module}#${name}`;
+      // W9 — bump cumulative cycle counter at the start of every
+      // dispatch. Persists across the bridge's lifetime via the graph,
+      // so even though leaf-up + integration-loop create fresh bridges
+      // per call, the counter survives and feeds the nudge prompt.
+      const totalCycles = graph.incrementDispatchCycles(module, name);
       debug(
         "dispatch",
-        `begin ${key} hasImpl=${fn.implementation !== null} tests=${fn.tests.length} children=${fn.children.length}`,
+        `begin ${key} hasImpl=${fn.implementation !== null} tests=${fn.tests.length} children=${fn.children.length} cycle=${totalCycles}`,
       );
 
       // IMPLEMENT vs DECOMPOSE — only when a decomposer is wired AND
@@ -1115,6 +1120,11 @@ export function createDesignDispatchBridge(
       // W5 — compile/load failure signal. Set when the test runner
       // reports 0/0 with hasTests (parse error / missing import).
       let lastLoadFailure = false;
+      // W7 — streak of consecutive attempts with byte-identical body.
+      // Reset when the model actually changes the body; nudges the
+      // model to stop blame-shifting onto the tests.
+      let lastBodyHash: string | null = null;
+      let bodyUnchangedStreak = 0;
       for (let attempt = 0; attempt < maxAttempts; attempt++) {
         actualAttempts = attempt + 1;
         // Use feedback on attempt 0 too, as long as something primed it
@@ -1124,7 +1134,11 @@ export function createDesignDispatchBridge(
         const hasPrimedFeedback =
           pendingArchitectFeedback !== null ||
           pendingAnalyzerFeedback !== null ||
-          pendingExternalFeedback !== null;
+          pendingExternalFeedback !== null ||
+          // W9 — force feedback path when cumulative cycles are high
+          // so the step-back nudge fires on attempt 0 of a fresh
+          // dispatch call (e.g. integration-loop re-dispatch cycle #5).
+          totalCycles >= 3;
         // External feedback rides on the architect channel because the
         // prompt template renders that field as high-priority "you must
         // address this" feedback.
@@ -1160,6 +1174,9 @@ export function createDesignDispatchBridge(
                 loadFailure: lastLoadFailure,
                 previousTestFile:
                   graph.getFunction(module, name)?.unitTestFile ?? undefined,
+                bodyUnchangedStreak:
+                  bodyUnchangedStreak > 0 ? bodyUnchangedStreak : undefined,
+                totalDispatchCycles: totalCycles,
               },
         );
         // Consumed — clear so a subsequent test-failure retry uses
@@ -1262,6 +1279,13 @@ export function createDesignDispatchBridge(
           "dispatch",
           `body extracted ${key} len=${body.length}ch hash=${bodyTag}`,
         );
+        // W7 — track whether the body actually changed between attempts.
+        if (lastBodyHash !== null && lastBodyHash === bodyTag) {
+          bodyUnchangedStreak++;
+        } else {
+          bodyUnchangedStreak = 0;
+        }
+        lastBodyHash = bodyTag;
 
         // Phase 5 (wrapper-kill): validate the emitted file against
         // the architect's declared signature BEFORE running tests.

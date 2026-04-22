@@ -192,6 +192,15 @@ export interface ImplementerFeedback {
    *  what to revise. Body-only retries let the model forget what the
    *  tests were asserting; this closes that loop. */
   previousTestFile?: string;
+  /** W7 — N consecutive attempts with a byte-identical body. Signals
+   *  "you're rewriting tests but not touching the body — the BODY is
+   *  probably the bug, not the tests." Counted in design-dispatch.ts. */
+  bodyUnchangedStreak?: number;
+  /** W9 — cumulative dispatch-cycle count for this function ACROSS
+   *  batches + integration-loop iterations. High values mean the model
+   *  has been thrashing; the prompt renders a step-back nudge to
+   *  break blame-shifting / cosmetic-tweak loops. */
+  totalDispatchCycles?: number;
 }
 
 export interface ImplementerPromptOptions {}
@@ -413,6 +422,22 @@ export async function buildImplementerPrompt(
     "   When you need to isolate this function from its siblings, use",
     "   the test framework's native mock API (see decisions.mockingStrategy).",
     "",
+    "   **MOCKING STRATEGY** — when the function wraps an external library",
+    "   (native module, database client, HTTP client, file system), PREFER",
+    "   a real ephemeral instance over `vi.mock()`:",
+    "     - SQLite (better-sqlite3, sqlite3): use `:memory:` as the path.",
+    "       Real database, no disk, no cross-test contamination, tears",
+    "       down when the handle goes out of scope.",
+    "     - HTTP servers: start on port 0 (ephemeral), make real requests,",
+    "       tear down in afterEach. No mock of the HTTP layer.",
+    "     - File system: create a tmpdir, write real files, `rm -rf` after.",
+    "     - Rate-limited / paid APIs: mock is appropriate.",
+    "   `vi.mock('native-pkg', () => ({ default: ... }))` of native",
+    "   modules with default exports is FRAGILE — the factory runs after",
+    "   the import is evaluated, bindings escape the sandbox, and type",
+    "   hints break. If you find yourself writing a complex `vi.mock()`",
+    "   factory for a native module, stop and use a real instance instead.",
+    "",
     integrationNeeded
       ? `3. \`\`\`integration-test-file — REQUIRED. Full TS content for \`${fn.name}.integration.test.ts\`.`
       : "3. ```integration-test-file — OMIT for this function (no children to assemble).",
@@ -528,6 +553,56 @@ export async function buildImplementerPrompt(
       feedback.previousBody,
       "```",
     );
+    // W9 — cumulative step-back nudge. When the function has been
+    // re-dispatched many times across batches / integration iterations
+    // WITHOUT going green, the model is stuck in a local minimum.
+    // A step-back directive at dispatch-start (before the model dives
+    // into another tweak) is the best time to ask "am I on the right
+    // path at all?"
+    if (feedback.totalDispatchCycles && feedback.totalDispatchCycles >= 3) {
+      lines.push(
+        "",
+        `**STEP BACK — dispatch cycle #${feedback.totalDispatchCycles} on this function.**`,
+        "You've been re-dispatched multiple times across batches or",
+        "integration-loop iterations. Whatever approach you've tried so",
+        "far isn't working. BEFORE you write the next attempt, consider:",
+        "",
+        "  1. Is the TEST STRATEGY wrong? If you've been mocking a native",
+        "     module (databases, file system, native add-ons) and it keeps",
+        "     failing, switch to a real in-memory / ephemeral instance.",
+        "     `:memory:` for SQLite; port 0 for HTTP servers; tmpdir for fs.",
+        "",
+        "  2. Is the BODY ARCHITECTURE wrong? If you've been tweaking",
+        "     the body within the same shape and failures persist, the",
+        "     shape itself is wrong. Rewrite the body from the SPEC.",
+        "",
+        "  3. Are the TESTS testing the wrong thing? Re-read the SPEC and",
+        "     check: do your assertions actually cover the edge cases",
+        "     listed, or are you testing your mental model of the body?",
+        "",
+        "Do NOT submit another cosmetic tweak of the previous attempt.",
+        "Pick ONE of (1) / (2) / (3), act on it, and explain the change",
+        "in a one-line comment at the top of your ```ts fence.",
+      );
+    }
+    // W7 — "body unchanged across attempts" directive. The model
+    // keeps shipping the same body and rewriting only the tests to
+    // try to force green. That's blame-shifting: the tests are
+    // failing because the BODY is wrong, not because the tests are.
+    if (feedback.bodyUnchangedStreak && feedback.bodyUnchangedStreak >= 2) {
+      lines.push(
+        "",
+        `**BODY UNCHANGED across ${feedback.bodyUnchangedStreak + 1} attempts.** You've`,
+        "submitted a byte-identical body each time and rewritten only",
+        "the tests. Tests keep failing because the BODY is the bug, not",
+        "the tests. This round: CHANGE THE BODY. If you believe the",
+        "body is correct, you must either",
+        "  (a) prove it by writing tests that actually pass against it, or",
+        "  (b) accept that the tests encode the spec correctly and the",
+        "      body needs to change to satisfy them.",
+        "Rewriting the tests to match a buggy body is cheating the spec.",
+      );
+    }
     // W6 — show the previous test file alongside the body so the model
     // can revise EITHER. Body-only retries invite the model to tweak
     // the implementation to match buggy tests (or vice versa). Seeing

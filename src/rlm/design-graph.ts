@@ -135,6 +135,13 @@ export interface FunctionNode {
    *  the Implementer writes its body directly; a branch has children
    *  and its body assembles them via `ctx.fns.<child>(ctx, …)`. */
   children: string[];
+  /** W9 — cumulative number of dispatch CYCLES this function has been
+   *  through across batches + integration-loop iterations. Each new
+   *  call to the dispatch bridge for this function bumps this. The
+   *  Implementer prompt surfaces it when high so the model can recognize
+   *  it's been thrashing across multiple rounds, not just within one
+   *  8-attempt window. Resets on a GREEN save (the function "graduated"). */
+  totalDispatchCycles: number;
 }
 
 export interface ImportEdge {
@@ -342,6 +349,12 @@ export interface DesignGraph {
    *  into sub-children, we erase the Implementer's failed work so
    *  downstream materialization doesn't embed the broken body. */
   clearImplementation(module: string, name: string): void;
+  /** W9 — increment the function's cumulative dispatch-cycle counter.
+   *  Called once per `dispatch()` entry by the bridge; the Implementer
+   *  prompt renders a nudge when the value is high (the model has
+   *  been through many rounds on this function across multiple
+   *  batches / integration iterations). */
+  incrementDispatchCycles(module: string, name: string): number;
   setTestStatus(
     module: string,
     name: string,
@@ -647,6 +660,7 @@ export function createDesignGraph(): DesignGraph {
       origin,
       parent,
       children: [],
+      totalDispatchCycles: 0,
     };
     functions.set(key, node);
     return node;
@@ -880,6 +894,12 @@ export function createDesignGraph(): DesignGraph {
       fn.integrationTests = [];
       fn.status = "declared";
       fn.lastTestOutput = null;
+    },
+
+    incrementDispatchCycles(module, name) {
+      const fn = requireFunction(module, name);
+      fn.totalDispatchCycles++;
+      return fn.totalDispatchCycles;
     },
 
     setTestStatus(module, name, status, output) {

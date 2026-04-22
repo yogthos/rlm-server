@@ -23,6 +23,83 @@ import type { DesignGraph } from "./design-graph.js";
 import { debug } from "./debug.js";
 
 /**
+ * Phase W5b — tsc pre-pass. Before spawning the test runner we ask
+ * `tsc --noEmit` to typecheck the emitted files. When it fails, we
+ * skip the test run and surface the TS diagnostics directly to the
+ * Implementer as a compile-stage failure.
+ *
+ * Why: runners like tsx silently strip `import type` at runtime, so
+ * a test file that uses an import-type'd symbol as a value emits a
+ * generic `ReferenceError: X is not defined` instead of tsc's
+ * precise `TS1361: 'X' cannot be used as a value...`. Without tsc,
+ * the model debugs the symptom; with tsc it sees the root cause.
+ *
+ * Filter: we restrict reported diagnostics to lines that reference
+ * the candidate's own files (`<name>.ts`, `<name>.test.ts`,
+ * `<name>.integration.test.ts`). Sibling stubs and previously-green
+ * files shouldn't fail tsc; if they do, those diagnostics are also
+ * surfaced as a fallback so the model sees SOMETHING actionable.
+ *
+ * Skips when: VITEST env is set (own test suite shouldn't spawn tsc),
+ * tsconfig.json doesn't exist in `dir` (non-TS runtime), or the
+ * project config marks `(none)` package manager.
+ */
+interface TscCheckResult {
+  ran: boolean;
+  ok: boolean;
+  diagnostics: string;
+}
+
+async function runTscCheck(
+  dir: string,
+  candidateName: string,
+  timeoutMs: number = 45_000,
+): Promise<TscCheckResult> {
+  if (process.env.VITEST) {
+    return { ran: false, ok: true, diagnostics: "" };
+  }
+  if (!existsSync(path.join(dir, "tsconfig.json"))) {
+    return { ran: false, ok: true, diagnostics: "" };
+  }
+  return new Promise<TscCheckResult>((resolve) => {
+    const child = spawn("npx", ["tsc", "--noEmit", "-p", dir], {
+      cwd: dir,
+      env: process.env,
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (d) => (stdout += d.toString()));
+    child.stderr.on("data", (d) => (stderr += d.toString()));
+    const timer = setTimeout(() => child.kill("SIGKILL"), timeoutMs);
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      const combined = `${stdout}\n${stderr}`.trim();
+      if (code === 0) {
+        resolve({ ran: true, ok: true, diagnostics: "" });
+        return;
+      }
+      // Keep lines that reference THIS candidate's files so the model
+      // isn't drowning in errors from siblings (which usually resolve
+      // themselves once the model fixes its own file).
+      const candidatePattern = new RegExp(
+        `\\b${escapeRegex(candidateName)}(?:\\.test|\\.integration\\.test)?\\.ts\\b`,
+      );
+      const ownLines: string[] = [];
+      const otherLines: string[] = [];
+      for (const line of combined.split("\n")) {
+        if (candidatePattern.test(line)) ownLines.push(line);
+        else if (/\berror TS\d+:/i.test(line)) otherLines.push(line);
+      }
+      // Prefer own-file errors; fall back to sibling errors if none.
+      const kept = ownLines.length > 0 ? ownLines : otherLines.slice(0, 10);
+      const rendered =
+        kept.length > 0 ? kept.join("\n") : combined.slice(-1500);
+      resolve({ ran: true, ok: false, diagnostics: rendered });
+    });
+  });
+}
+
+/**
  * Phase M3 — per-projectDir file-content cache. Dispatch attempts
  * re-materialize EVERY file in the graph on each test run (so siblings'
  * green bodies reach disk). For an N-function project, that's N small
@@ -410,6 +487,34 @@ export async function runTests(
         "testrun",
         `npm install FAILED mid-dispatch: ${install.stderr.slice(0, 400)}`,
       );
+    }
+    // W5b — run tsc BEFORE vitest. tsc catches TS1361 / TS2304 / etc
+    // with line numbers; tsx/vitest would silently strip types and
+    // then throw a generic ReferenceError at runtime, leaving the
+    // model to debug the symptom instead of the cause.
+    const tsc = await runTscCheck(dir, candidate.name);
+    if (tsc.ran && !tsc.ok) {
+      debug(
+        "testrun",
+        `tsc FAILED ${candidate.module}#${candidate.name} — skipping test run, surfacing compile diagnostics`,
+      );
+      return {
+        ok: false,
+        passed: 0,
+        failed: 1,
+        output: [
+          "[COMPILE ERRORS — tsc --noEmit failed before tests ran.]",
+          "Fix these typechecking issues first; test-level changes are",
+          "pointless until the file compiles.",
+          "",
+          tsc.diagnostics,
+        ].join("\n"),
+        failingTestNames: [`${candidate.name}.test.ts (compile error)`],
+        fullFailureMessages: new Map([
+          [`${candidate.name}.test.ts (compile error)`, tsc.diagnostics],
+        ]),
+        loadFailure: true,
+      };
     }
     const result = await invokeTestRunner(
       dir,

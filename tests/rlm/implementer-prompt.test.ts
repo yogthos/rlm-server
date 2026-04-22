@@ -402,6 +402,92 @@ describe("W6 — TDD split + previous test file in retry feedback", () => {
   });
 });
 
+describe("W9 — cumulative step-back nudge", () => {
+  it("fires STEP BACK when totalDispatchCycles ≥ 3", async () => {
+    const g = seedGraph();
+    g.addFunction("src/a.ts", "foo", { params: [], returnType: "void" }, "");
+    const prompt = await buildImplementerPrompt(g, "src/a.ts", "foo", {
+      attempt: 0,
+      maxAttempts: 8,
+      previousBody: "// body",
+      testOutput: "",
+      totalDispatchCycles: 5,
+    });
+    expect(prompt).toMatch(/STEP BACK/);
+    expect(prompt).toContain("dispatch cycle #5");
+    expect(prompt).toMatch(/test strategy|body architecture/i);
+  });
+
+  it("suppresses nudge at cycle 1 or 2", async () => {
+    const g = seedGraph();
+    g.addFunction("src/a.ts", "foo", { params: [], returnType: "void" }, "");
+    const prompt = await buildImplementerPrompt(g, "src/a.ts", "foo", {
+      attempt: 0,
+      maxAttempts: 8,
+      previousBody: "// body",
+      testOutput: "",
+      totalDispatchCycles: 2,
+    });
+    expect(prompt).not.toMatch(/STEP BACK/);
+  });
+});
+
+describe("design-graph — totalDispatchCycles (W9)", () => {
+  it("starts at 0 and increments on each call", () => {
+    const g = seedGraph();
+    g.addFunction("src/a.ts", "foo", { params: [], returnType: "void" }, "");
+    expect(g.getFunction("src/a.ts", "foo")!.totalDispatchCycles).toBe(0);
+    expect(g.incrementDispatchCycles("src/a.ts", "foo")).toBe(1);
+    expect(g.incrementDispatchCycles("src/a.ts", "foo")).toBe(2);
+    expect(g.incrementDispatchCycles("src/a.ts", "foo")).toBe(3);
+    expect(g.getFunction("src/a.ts", "foo")!.totalDispatchCycles).toBe(3);
+  });
+});
+
+describe("W7 — body-unchanged directive", () => {
+  it("fires BODY UNCHANGED banner when bodyUnchangedStreak ≥ 2", async () => {
+    const g = seedGraph();
+    g.addFunction("src/a.ts", "foo", { params: [], returnType: "void" }, "");
+    const prompt = await buildImplementerPrompt(g, "src/a.ts", "foo", {
+      attempt: 3,
+      maxAttempts: 8,
+      previousBody: "// same body",
+      testOutput: "test failed",
+      previousPassed: 0,
+      previousFailed: 1,
+      bodyUnchangedStreak: 2,
+    });
+    expect(prompt).toMatch(/BODY UNCHANGED/);
+    expect(prompt).toMatch(/CHANGE THE BODY/);
+  });
+
+  it("skips the banner when body did change (streak=0)", async () => {
+    const g = seedGraph();
+    g.addFunction("src/a.ts", "foo", { params: [], returnType: "void" }, "");
+    const prompt = await buildImplementerPrompt(g, "src/a.ts", "foo", {
+      attempt: 1,
+      maxAttempts: 8,
+      previousBody: "// body",
+      testOutput: "x",
+      previousPassed: 0,
+      previousFailed: 1,
+    });
+    expect(prompt).not.toMatch(/BODY UNCHANGED/);
+  });
+});
+
+describe("W8 — mocking strategy guidance", () => {
+  it("initial prompt mentions :memory: and real ephemeral instances", async () => {
+    const g = seedGraph();
+    g.addFunction("src/a.ts", "foo", { params: [], returnType: "void" }, "");
+    const prompt = await buildImplementerPrompt(g, "src/a.ts", "foo");
+    expect(prompt).toMatch(/MOCKING STRATEGY/);
+    expect(prompt).toMatch(/:memory:/);
+    expect(prompt).toMatch(/ephemeral/);
+    expect(prompt).toMatch(/native module/i);
+  });
+});
+
 describe("W5 — compile/load failure banner", () => {
   it("routes to a COMPILE/LOAD FAILURE banner when loadFailure is set", async () => {
     const g = seedGraph();
