@@ -14,12 +14,42 @@ import { spawn } from "node:child_process";
 import { mkdtemp, mkdir, writeFile, rm, symlink } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { createHash } from "node:crypto";
 import { ensureDepsInstalled } from "./install-deps.js";
 import { repairPackageJson } from "./design-package-json-repair.js";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import type { DesignGraph } from "./design-graph.js";
 import { debug } from "./debug.js";
+
+/**
+ * Phase M3 — per-projectDir file-content cache. Dispatch attempts
+ * re-materialize EVERY file in the graph on each test run (so siblings'
+ * green bodies reach disk). For an N-function project, that's N small
+ * writes per attempt × many attempts. The cache tracks the last-written
+ * SHA-256 per `<dir>/<relPath>` and skips `writeFile` when the content
+ * is unchanged. Invalidated implicitly: if a caller deletes/renames the
+ * projectDir, the old entries are harmless — they just won't match
+ * whatever's being written to the new dir.
+ */
+const fileHashCache = new Map<string, string>();
+
+function shortHash(content: string): string {
+  return createHash("sha256").update(content).digest("hex").slice(0, 32);
+}
+
+async function writeFileIfChanged(
+  full: string,
+  content: string,
+): Promise<boolean> {
+  const h = shortHash(content);
+  if (fileHashCache.get(full) === h && existsSync(full)) {
+    return false;
+  }
+  await writeFile(full, content, "utf8");
+  fileHashCache.set(full, h);
+  return true;
+}
 
 export interface CandidateBody {
   module: string;
@@ -351,14 +381,15 @@ export async function runTests(
   // compared to a vitest run.
   if (options.projectDir) {
     const dir = options.projectDir;
+    let wrote = 0;
     for (const [rel, content] of Object.entries(files)) {
       const full = path.join(dir, rel);
       await mkdir(path.dirname(full), { recursive: true });
-      await writeFile(full, content, "utf8");
+      if (await writeFileIfChanged(full, content)) wrote++;
     }
     debug(
       "testrun",
-      `reused project dir ${dir} — rewrote ${Object.keys(files).length} files`,
+      `reused project dir ${dir} — rewrote ${wrote}/${Object.keys(files).length} files (rest unchanged)`,
     );
     // Phase H2 — if package.json was among the rewritten files,
     // `ensureDepsInstalled` will re-run the install. When unchanged,

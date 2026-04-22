@@ -23,7 +23,7 @@ import { fileURLToPath } from "node:url";
 const RLM_PORT = process.env.RLM_PORT ?? "3000";
 const RLM_URL = `http://localhost:${RLM_PORT}/v1/chat/completions`;
 const SCENARIO_ROOT = path.dirname(fileURLToPath(import.meta.url));
-const DEFAULT_TIMEOUT_MS = Number(process.env.RLM_SCENARIO_TIMEOUT_MS ?? 1_800_000);
+const DEFAULT_TIMEOUT_MS = Number(process.env.RLM_SCENARIO_TIMEOUT_MS ?? 3_600_000);
 
 interface ScenarioMeta {
   name: string;

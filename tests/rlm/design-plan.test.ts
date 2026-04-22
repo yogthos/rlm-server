@@ -593,6 +593,72 @@ describe("designPlan", () => {
     expect(report.failedSpecs).toEqual([]);
   });
 
+  // Phase H1 — spec extraction is N independent LLM calls, each per
+  // function. They must issue concurrently, not serially. The barrier
+  // below only resolves when all expected calls have arrived; a serial
+  // loop would deadlock and time out.
+  it("phase 2 issues spec-extraction LLM calls concurrently (H1)", async () => {
+    const g = createDesignGraph();
+    seedVitestProjectConfig(g);
+    const FUNCTIONS = 4;
+    const fnList = Array.from({ length: FUNCTIONS }, (_, i) => ({
+      module: `src/m${i}.ts`,
+      name: `fn${i}`,
+      signature: { params: [], returnType: "void" },
+      description: `fn${i} does a thing`,
+    }));
+
+    let specCallsInFlight = 0;
+    let peakConcurrency = 0;
+    const barrier = new Promise<void>((resolve) => {
+      (globalThis as any).__barrierResolve = resolve;
+    });
+    const chat = async (prompt: string) => {
+      if (prompt.includes("list the top-level functions")) {
+        return "```json\n" + JSON.stringify(fnList) + "\n```";
+      }
+      // Phase 2 spec prompt — count concurrency.
+      specCallsInFlight++;
+      peakConcurrency = Math.max(peakConcurrency, specCallsInFlight);
+      if (specCallsInFlight >= FUNCTIONS) {
+        (globalThis as any).__barrierResolve();
+      }
+      await barrier;
+      specCallsInFlight--;
+      return specResp;
+    };
+    await designPlan(g, "task", {
+      chat,
+      dispatch: async (_g, mod, name) => ({
+        module: mod,
+        name,
+        status: "tests-green",
+        implementation: "// ok",
+        attempts: 1,
+        testOutput: "",
+      }),
+      finalize: async () => ({
+        ok: true,
+        files: {},
+        unimplemented: [],
+        consistency: { ok: true, violations: [], advisories: [] },
+        testsPassed: 0,
+        testsFailed: 0,
+        testOutput: "",
+        typecheckOk: true,
+        typecheckOutput: "",
+      }),
+    });
+    // If spec calls ran serially, peakConcurrency would be 1 and the
+    // barrier would never resolve (test would time out before reaching
+    // here). All N calls must be in flight at once.
+    expect(peakConcurrency).toBe(FUNCTIONS);
+    // Every function got its spec.
+    for (const fn of fnList) {
+      expect(g.getFunction(fn.module, fn.name)!.spec).not.toBeNull();
+    }
+  }, 10_000);
+
   it("phase 1 lists functions; phase 2 attaches specs; build runs", async () => {
     const g = createDesignGraph();
     seedVitestProjectConfig(g);

@@ -179,6 +179,72 @@ describe("designLeafUpBuild", () => {
     expect(maxInFlight).toBe(4);
   });
 
+  // Phase H2 — when projectDir IS set, dispatches must still run in
+  // parallel (the old code forced sequential to avoid filesystem races
+  // on the shared dir). Each dispatch now gets its own overlay subdir
+  // under projectDir so they don't clobber each other's files.
+  it("runs same-level dispatches concurrently even when projectDir is set (H2)", async () => {
+    const { mkdtemp, rm, stat } = await import("node:fs/promises");
+    const { tmpdir } = await import("node:os");
+    const path = await import("node:path");
+    const projectDir = await mkdtemp(path.join(tmpdir(), "rlm-h2-"));
+    try {
+      const g = createDesignGraph();
+      for (const n of ["a", "b", "c", "d"]) {
+        g.addFunction("src/a.ts", n, sig());
+        g.setSpec("src/a.ts", n, spec());
+      }
+      let inFlight = 0;
+      let maxInFlight = 0;
+      const projectDirsSeen = new Set<string>();
+      const dispatch = async (
+        _g: any,
+        mod: string,
+        name: string,
+        opts?: { projectDir?: string },
+      ) => {
+        inFlight++;
+        if (inFlight > maxInFlight) maxInFlight = inFlight;
+        // Each dispatch must receive its OWN projectDir (an overlay),
+        // not the shared one.
+        if (opts?.projectDir) projectDirsSeen.add(opts.projectDir);
+        // Yield so parallel dispatches actually overlap.
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        inFlight--;
+        _g.setImplementation(mod, name, "// ok");
+        _g.setTestStatus(mod, name, "tests-green", "");
+        return {
+          module: mod,
+          name,
+          status: "tests-green" as const,
+          implementation: "// ok",
+          attempts: 1,
+          testOutput: "",
+        };
+      };
+      await designLeafUpBuild(g, {
+        dispatch,
+        projectDir,
+        maxConcurrent: 4,
+      });
+      // Parallelism preserved even with projectDir set.
+      expect(maxInFlight).toBe(4);
+      // Each dispatch got a DIFFERENT overlay (not the raw projectDir).
+      expect(projectDirsSeen.size).toBe(4);
+      for (const d of projectDirsSeen) {
+        expect(d).not.toBe(projectDir);
+        // Overlays should be subdirs of projectDir (so node_modules
+        // resolution walks up to find the installed deps).
+        expect(d.startsWith(projectDir)).toBe(true);
+        // Overlay dir must exist on disk during dispatch.
+        const s = await stat(d);
+        expect(s.isDirectory()).toBe(true);
+      }
+    } finally {
+      await rm(projectDir, { recursive: true, force: true });
+    }
+  });
+
   it("clamps maxConcurrent=0 to 1 (doesn't silently block everything)", async () => {
     const g = createDesignGraph();
     g.addFunction("src/a.ts", "solo", sig());
@@ -198,39 +264,6 @@ describe("designLeafUpBuild", () => {
     // Clamped to 1 → solo dispatched + green.
     expect(report.ok).toBe(true);
     expect(report.blocked).toEqual([]);
-  });
-
-  it("forces sequential dispatch when projectDir is set (shared-dir safety)", async () => {
-    const g = createDesignGraph();
-    for (const n of ["a", "b", "c"]) {
-      g.addFunction("src/a.ts", n, sig());
-      g.setSpec("src/a.ts", n, spec());
-    }
-    let inFlight = 0;
-    let maxInFlight = 0;
-    const dispatch = async (_g: any, mod: string, name: string) => {
-      inFlight++;
-      if (inFlight > maxInFlight) maxInFlight = inFlight;
-      await new Promise((resolve) => setTimeout(resolve, 5));
-      inFlight--;
-      _g.setImplementation(mod, name, "// ok");
-      _g.setTestStatus(mod, name, "tests-green", "");
-      return {
-        module: mod,
-        name,
-        status: "tests-green" as const,
-        implementation: "// ok",
-        attempts: 1,
-        testOutput: "",
-      };
-    };
-    await designLeafUpBuild(g, {
-      dispatch,
-      maxConcurrent: 4,
-      projectDir: "/tmp/fake",
-    });
-    // projectDir set → maxConcurrent clamped to 1.
-    expect(maxInFlight).toBe(1);
   });
 
   it("respects maxConcurrent cap — never dispatches more than N at once", async () => {

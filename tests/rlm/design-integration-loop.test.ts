@@ -208,6 +208,43 @@ describe("runIntegrationLoop", () => {
     expect(report.ok).toBe(false);
   });
 
+  // Phase H3 — when the attribution fallback chat aborts (top-level
+  // timeout / user cancel), we must bail IMMEDIATELY. The previous
+  // behavior swallowed each abort and kept looping, burning one LLM
+  // call per failure. For a run with 10 failures all needing fallback,
+  // that was 10 aborted calls. With the fix, the first abort surfaces
+  // and the loop exits cleanly.
+  it("bails on first fallback-chat abort instead of calling N more times (H3)", async () => {
+    const g = seed();
+    let chatCalls = 0;
+    // Produce 5 failures with NO project-frame in the stack — every
+    // one will fall through to the LLM fallback path.
+    const failures = Array.from({ length: 5 }, (_, i) => ({
+      testName: `t${i}`,
+      stackTrace: "at /tmp/proj/scaffold.ts:1:1",
+      message: "boom",
+    }));
+    const report = await runIntegrationLoop(g, {
+      runner: async () => ({ ok: false, failures }),
+      dispatch: async () => {
+        throw new Error("dispatch should never run — attribution must bail");
+      },
+      chat: async () => {
+        chatCalls++;
+        const err = new Error("This operation was aborted");
+        err.name = "AbortError";
+        throw err;
+      },
+      maxIterations: 1,
+    });
+    expect(report.ok).toBe(false);
+    // Exactly ONE attribution chat call — loop must bail before
+    // attempting the remaining four.
+    expect(chatCalls).toBe(1);
+    // Error surface should make the abort root cause obvious.
+    expect(report.error ?? "").toMatch(/aborted|abort/i);
+  });
+
   it("augments tests on a recurring failure (2nd consecutive cycle) via LLM", async () => {
     const g = seed();
     let runCount = 0;

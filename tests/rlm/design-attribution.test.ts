@@ -97,6 +97,46 @@ Error: ETIMEDOUT
     expect(result.function).toBeNull();
     expect(result.confidence).toBe("unknown");
   });
+
+  // Phase H3 — abort errors (network cancelled, top-level timeout) must
+  // re-throw rather than be swallowed as "unknown." When the attribution
+  // caller sees an abort, it needs to bail its loop; swallowing forces
+  // it to keep calling attributeFailure for every remaining failure and
+  // burn N aborted LLM calls in a row.
+  it("re-throws when the fallback chat aborts (H3)", async () => {
+    const g = seed();
+    const trace = "Error: network died\n    at /tmp/proj/scaffold.ts:1:1";
+    const chat = async () => {
+      const err = new Error("This operation was aborted");
+      err.name = "AbortError";
+      throw err;
+    };
+    await expect(attributeFailure(g, trace, { chat })).rejects.toThrow(
+      /aborted/i,
+    );
+  });
+
+  it("re-throws when chat error message contains 'aborted' (H3)", async () => {
+    const g = seed();
+    const trace = "Error: boom\n    at /tmp/proj/scaffold.ts:1:1";
+    const chat = async () => {
+      throw new Error("request aborted mid-flight");
+    };
+    await expect(attributeFailure(g, trace, { chat })).rejects.toThrow(
+      /aborted/i,
+    );
+  });
+
+  it("still swallows non-abort errors as unknown (H3)", async () => {
+    const g = seed();
+    const trace = "Error: boom\n    at /tmp/proj/scaffold.ts:1:1";
+    const chat = async () => {
+      throw new Error("rate limited, try later");
+    };
+    const result = await attributeFailure(g, trace, { chat });
+    expect(result.function).toBeNull();
+    expect(result.confidence).toBe("unknown");
+  });
 });
 
 describe("extractSubgraph", () => {

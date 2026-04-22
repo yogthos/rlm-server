@@ -994,25 +994,33 @@ export async function designPlan(
   // ── Phase 2: Architect fills the SPEC for each function ────────
   // The spec becomes the Implementer's contract. Tests are written
   // later, by the Implementer, during dispatch.
+  //
+  // Phase H1 — each function's spec is independent; all LLM calls are
+  // issued concurrently via Promise.all. Graph mutations (setSpec)
+  // happen after every call resolves, in a single synchronous pass,
+  // so no two tasks race on `graph.setSpec`.
   let specsAttached = 0;
   const failedSpecs: string[] = [];
-  for (let i = 0; i < plannedNames.length; i++) {
-    const fn = plannedNames[i];
+  // Snapshot the known-names set ONCE — siblings don't change during
+  // phase 2 (we don't add new functions here), so this is the same
+  // value every iteration would have computed inside the serial loop.
+  const knownNames = new Set(graph.listFunctions().map((f) => f.name));
+  const allFunctions = graph.listFunctions();
+  type SpecTask =
+    | { kind: "skip"; fn: PlannedFunction; key: string }
+    | {
+        kind: "work";
+        fn: PlannedFunction;
+        key: string;
+        normalizedFn: PlannedFunction;
+        siblings: PlannedFunction[];
+      };
+  const specTasks: SpecTask[] = plannedNames.map((fn) => {
     const key = `${fn.module}#${fn.name}`;
     const stored = graph.getFunction(fn.module, fn.name);
     if (stored && stored.spec !== null) {
-      debug("plan", `phase 2 SKIPPED (resume) ${key} — spec already attached`);
-      debug(
-        "progress",
-        `plan: phase 2 ${i + 1}/${plannedNames.length} skipped ${key} (spec already attached)`,
-      );
-      specsAttached++;
-      continue;
+      return { kind: "skip", fn, key };
     }
-    debug("progress", `plan: phase 2 ${i + 1}/${plannedNames.length} — ${key}`);
-    // Use the graph's normalized signature (isAsync/Promise reconciled
-    // at ingest) rather than the raw phase-1 claim, so both the prompt
-    // display AND the spec parser see the canonical shape.
     const normalizedFn: PlannedFunction = stored
       ? {
           module: stored.module,
@@ -1024,8 +1032,7 @@ export async function designPlan(
     // Sibling list: EVERY function in the graph (except the target).
     // During decompose this includes top-level roots + the parent, not
     // just co-children — critical so the LLM can list top-level deps.
-    const siblingsForPrompt: PlannedFunction[] = graph
-      .listFunctions()
+    const siblings: PlannedFunction[] = allFunctions
       .filter((f) => f.name !== normalizedFn.name)
       .map((f) => ({
         module: f.module,
@@ -1033,48 +1040,80 @@ export async function designPlan(
         signature: f.signature,
         description: f.description,
       }));
-    const phase2 = await withJsonRetry(
-      options.chat,
-      buildPhase2Prompt(task, normalizedFn, siblingsForPrompt),
-      (raw) => parseFunctionSpec(raw, normalizedFn.signature),
-      maxRetries,
-      `phase2-spec[${key}]`,
-    );
-    if ("error" in phase2) {
-      debug("plan", `phase 2 failed for ${key}: ${phase2.error}`);
+    return { kind: "work", fn, key, normalizedFn, siblings };
+  });
+  type SpecResult = Awaited<ReturnType<typeof withJsonRetry<FunctionSpec>>>;
+  // Fire all work tasks concurrently. Skipped tasks don't need an await.
+  const results = await Promise.all(
+    specTasks.map(async (specTask): Promise<{ task: SpecTask; parsed: SpecResult | null }> => {
+      if (specTask.kind === "skip") return { task: specTask, parsed: null };
+      const parsed = await withJsonRetry(
+        options.chat,
+        buildPhase2Prompt(task, specTask.normalizedFn, specTask.siblings),
+        (raw) => parseFunctionSpec(raw, specTask.normalizedFn.signature),
+        maxRetries,
+        `phase2-spec[${specTask.key}]`,
+      );
+      return { task: specTask, parsed };
+    }),
+  );
+  // Commit specs sequentially in the original order so debug logs read
+  // like the old serial loop and resume ordering is stable.
+  for (let i = 0; i < results.length; i++) {
+    const { task: specTask, parsed } = results[i];
+    if (specTask.kind === "skip") {
+      debug(
+        "plan",
+        `phase 2 SKIPPED (resume) ${specTask.key} — spec already attached`,
+      );
       debug(
         "progress",
-        `plan: phase 2 ${i + 1}/${plannedNames.length} FAILED ${key} — proceeding without spec`,
+        `plan: phase 2 ${i + 1}/${specTasks.length} skipped ${specTask.key} (spec already attached)`,
       );
-      failedSpecs.push(key);
+      specsAttached++;
       continue;
     }
+    debug(
+      "progress",
+      `plan: phase 2 ${i + 1}/${specTasks.length} — ${specTask.key}`,
+    );
+    if (parsed !== null && "error" in parsed) {
+      debug("plan", `phase 2 failed for ${specTask.key}: ${parsed.error}`);
+      debug(
+        "progress",
+        `plan: phase 2 ${i + 1}/${specTasks.length} FAILED ${specTask.key} — proceeding without spec`,
+      );
+      failedSpecs.push(specTask.key);
+      continue;
+    }
+    const phase2 = parsed!;
     // Filter spec.dependencies against the graph — the LLM sometimes
     // hallucinates sibling names. Unknown entries would pollute the
     // Implementer prompt ("depends on foo") for a sibling that isn't
     // wired into ctx.fns, producing a runtime TypeError at test time.
-    const knownNames = new Set(graph.listFunctions().map((f) => f.name));
     const unknownDeps = phase2.dependencies.filter((d) => !knownNames.has(d));
     if (unknownDeps.length > 0) {
       debug(
         "plan",
-        `phase 2 ${key} — dropping unknown deps: ${unknownDeps.join(", ")}`,
+        `phase 2 ${specTask.key} — dropping unknown deps: ${unknownDeps.join(", ")}`,
       );
       debug(
         "progress",
-        `plan: phase 2 ${key} — dropped unknown deps: ${unknownDeps.join(", ")}`,
+        `plan: phase 2 ${specTask.key} — dropped unknown deps: ${unknownDeps.join(", ")}`,
       );
-      phase2.dependencies = phase2.dependencies.filter((d) => knownNames.has(d));
+      phase2.dependencies = phase2.dependencies.filter((d) =>
+        knownNames.has(d),
+      );
     }
     debug(
       "plan",
-      `phase 2 ${key} → purpose=${phase2.purpose.length}ch deps=${phase2.dependencies.length} edges=${phase2.edgeCases.length}`,
+      `phase 2 ${specTask.key} → purpose=${phase2.purpose.length}ch deps=${phase2.dependencies.length} edges=${phase2.edgeCases.length}`,
     );
     debug(
       "progress",
-      `plan: phase 2 ${i + 1}/${plannedNames.length} ok ${key} — ${phase2.dependencies.length} deps, ${phase2.edgeCases.length} edge cases`,
+      `plan: phase 2 ${i + 1}/${specTasks.length} ok ${specTask.key} — ${phase2.dependencies.length} deps, ${phase2.edgeCases.length} edge cases`,
     );
-    graph.setSpec(fn.module, fn.name, phase2);
+    graph.setSpec(specTask.fn.module, specTask.fn.name, phase2);
     specsAttached++;
   }
 

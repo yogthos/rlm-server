@@ -23,6 +23,20 @@ import type { DesignGraph, FunctionNode } from "./design-graph.js";
 import { extractJson } from "./design-plan.js";
 import { debug } from "./debug.js";
 
+/**
+ * True when an error looks like an abort/cancellation signal. Node's
+ * AbortController uses `name: "AbortError"`; the OpenAI SDK surfaces
+ * "aborted" in the message. Anything else is a real per-call failure
+ * (rate limit, 5xx, parse error) that callers should swallow locally.
+ */
+export function isAbortError(e: unknown): boolean {
+  if (!(e instanceof Error)) return false;
+  if (e.name === "AbortError" || e.name === "AbortException") return true;
+  if (/\bAbortError\b/.test(e.name)) return true;
+  if (/\baborted?\b/i.test(e.message)) return true;
+  return false;
+}
+
 export type AttributionConfidence = "direct" | "fallback" | "unknown";
 
 export interface AttributionResult {
@@ -208,6 +222,15 @@ export async function attributeFailure(
   try {
     response = await options.chat(prompt);
   } catch (e) {
+    // Phase H3 — abort-style errors (top-level cancellation, network
+    // aborted mid-call) must propagate so the caller can bail its
+    // loop instead of burning one aborted LLM call per remaining
+    // failure. Other errors (rate limit, parse failure, upstream 5xx)
+    // are still swallowed as "unknown" — those are recoverable per-
+    // call and shouldn't take down the whole iteration.
+    if (isAbortError(e)) {
+      throw e;
+    }
     debug(
       "attribution",
       `fallback chat threw: ${e instanceof Error ? e.message : String(e)}`,

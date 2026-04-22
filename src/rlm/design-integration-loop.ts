@@ -22,6 +22,7 @@ import type { DispatchResult } from "./design-dispatch.js";
 import {
   attributeFailure,
   attributeStackDirect,
+  isAbortError,
 } from "./design-attribution.js";
 import {
   extractProjectTestFile,
@@ -431,6 +432,11 @@ export async function runIntegrationLoop(
     const grouped = new Map<string, IntegrationFailure[]>();
     const projectTestFailures: IntegrationFailure[] = [];
     const attrCache = new Map<string, string | null>();
+    // Phase H3 — if the fallback chat aborts (top-level cancel / timeout),
+    // every remaining failure would hit the same abort. Bail the whole
+    // iteration instead of burning N aborted LLM calls in a row.
+    let attributionAborted = false;
+    let abortMessage = "";
     for (const failure of result.failures) {
       if (isProjectTestFailure(failure)) {
         projectTestFailures.push(failure);
@@ -438,11 +444,20 @@ export async function runIntegrationLoop(
       }
       let fnName = attrCache.get(failure.stackTrace);
       if (fnName === undefined) {
-        const attr = await attributeFailure(graph, failure.stackTrace, {
-          chat: options.chat,
-        });
-        fnName = attr.function;
-        attrCache.set(failure.stackTrace, fnName);
+        try {
+          const attr = await attributeFailure(graph, failure.stackTrace, {
+            chat: options.chat,
+          });
+          fnName = attr.function;
+          attrCache.set(failure.stackTrace, fnName);
+        } catch (e) {
+          if (isAbortError(e)) {
+            attributionAborted = true;
+            abortMessage = e instanceof Error ? e.message : String(e);
+            break;
+          }
+          throw e;
+        }
       }
       if (!fnName) {
         debug(
@@ -453,6 +468,19 @@ export async function runIntegrationLoop(
       }
       if (!grouped.has(fnName)) grouped.set(fnName, []);
       grouped.get(fnName)!.push(failure);
+    }
+    if (attributionAborted) {
+      debug(
+        "integration-loop",
+        `attribution aborted at iter ${iter} — bailing without dispatches`,
+      );
+      return {
+        ok: false,
+        iterations: iter,
+        failuresByIteration,
+        dispatched,
+        error: `attribution aborted at iter ${iter}: ${abortMessage}`,
+      };
     }
     if (grouped.size === 0 && projectTestFailures.length === 0) {
       // Nothing we can act on; bail rather than spin. Surface a

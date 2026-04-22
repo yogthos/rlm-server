@@ -25,6 +25,59 @@
 import type { DesignGraph } from "./design-graph.js";
 import type { DispatchResult } from "./design-dispatch.js";
 import { debug } from "./debug.js";
+import { mkdir, symlink, copyFile } from "node:fs/promises";
+import path from "node:path";
+import { randomBytes } from "node:crypto";
+
+/**
+ * Phase H2 — per-dispatch overlay dir. Used when `projectDir` is set
+ * and the batch dispatches more than one function concurrently.
+ *
+ * Each overlay is a subdir of `parent`. Structure:
+ *   <parent>/.rlm-overlays/<fnName>-<salt>/
+ *     package.json   (copied from parent)
+ *     tsconfig.json  (copied from parent)
+ *     node_modules   (symlink → parent's node_modules)
+ *
+ * Co-ready dispatches can now rewrite their own function files + run
+ * their own test spawns without clobbering siblings' work. Node ESM
+ * walks up the tree for any imports the tests issue that need parent-
+ * level deps; the symlinked node_modules keeps vitest / tsx happy.
+ */
+async function createOverlayDir(
+  parent: string,
+  fnName: string,
+): Promise<string> {
+  const overlayRoot = path.join(parent, ".rlm-overlays");
+  await mkdir(overlayRoot, { recursive: true });
+  const salt = randomBytes(3).toString("hex");
+  const overlay = path.join(overlayRoot, `${fnName}-${salt}`);
+  await mkdir(overlay, { recursive: true });
+  // Copy config files the test runner expects in the dir it spawns.
+  // Also copy the install-hash marker so ensureDepsInstalled skips
+  // re-running `npm install` in every overlay (parent's node_modules
+  // is already set up; hash matches mean "no work needed").
+  for (const f of ["package.json", "tsconfig.json", ".rlm-install-hash"]) {
+    try {
+      await copyFile(path.join(parent, f), path.join(overlay, f));
+    } catch {
+      // File may not exist in parent (e.g. deno runtime, skip).
+    }
+  }
+  // Symlink node_modules so vitest/tsx/jest resolve within the overlay.
+  try {
+    await symlink(
+      path.join(parent, "node_modules"),
+      path.join(overlay, "node_modules"),
+      "dir",
+    );
+  } catch {
+    // If the parent doesn't have node_modules yet, or the symlink
+    // already exists, silently proceed — Node's upward resolution
+    // will fall back to the parent's node_modules anyway.
+  }
+  return overlay;
+}
 
 export type DispatchFn = (
   graph: DesignGraph,
@@ -231,19 +284,11 @@ export async function designLeafUpBuild(
   // empty batch on every iteration and terminate immediately with
   // everything blocked — surprising failure mode for a misconfig.
   const maxConcurrent = Math.max(1, options.maxConcurrent ?? 4);
-  // Guard against shared-projectDir + concurrent dispatch. When a
-  // projectDir is set, multiple dispatches would materialize
-  // different function files into the SAME dir simultaneously and
-  // clobber each other's writes mid-test-run. Force sequential in
-  // that case. (Current production wiring doesn't pass projectDir
-  // through leaf-up, so this is defensive.)
-  const effectiveConcurrency = options.projectDir ? 1 : maxConcurrent;
-  if (options.projectDir && maxConcurrent > 1) {
-    debug(
-      "leaf-up-build",
-      `projectDir set — forcing sequential dispatch (maxConcurrent=${maxConcurrent} ignored)`,
-    );
-  }
+  // Phase H2 — projectDir no longer forces sequential dispatch. Each
+  // co-ready dispatch gets its own overlay subdir so filesystem writes
+  // + test spawns don't race. node_modules is shared via symlink so
+  // vitest/tsx start cold on only the first install.
+  const effectiveConcurrency = maxConcurrent;
   let iter = 0;
   while (iter++ < MAX_ITERATIONS) {
     let levels: Map<string, number>;
@@ -275,13 +320,25 @@ export async function designLeafUpBuild(
     // so they don't call each other's unfinished work). Safe to run
     // LLM calls + tests in parallel. Each dispatch uses its own fresh
     // tmp dir inside test-runner, so no file-system contention.
-    const results = await Promise.all(
+    // Phase H2 — when projectDir is set AND the batch has more than
+    // one function, each dispatch gets its own overlay subdir. Single-
+    // function batches can use the parent dir directly (no overlay
+    // overhead — same as pre-H2 behavior when batch was always one).
+    const dispatchDirs = await Promise.all(
       batch.map(async (p) => {
+        if (!options.projectDir || batch.length === 1) {
+          return options.projectDir;
+        }
+        return await createOverlayDir(options.projectDir, p.name);
+      }),
+    );
+    const results = await Promise.all(
+      batch.map(async (p, idx) => {
         try {
           const hint = pendingHints.get(p.name);
           if (hint !== undefined) pendingHints.delete(p.name);
           const r = await options.dispatch(graph, p.module, p.name, {
-            projectDir: options.projectDir,
+            projectDir: dispatchDirs[idx],
             feedback: hint,
           });
           return { pick: p, result: r, error: null as unknown };
