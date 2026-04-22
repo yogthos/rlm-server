@@ -480,6 +480,7 @@ function buildPhase2Prompt(
 }
 
 function buildPhase0Prompt(task: string): string {
+  const nodeVersion = process.version; // e.g. "v25.9.0"
   return [
     `Phase 0 — project initialization.`,
     "",
@@ -492,6 +493,21 @@ function buildPhase0Prompt(task: string): string {
     `is yours. The decisions you record here are injected into every`,
     `later Implementer / Architect prompt so the whole pipeline speaks`,
     `your chosen stack.`,
+    "",
+    `Host environment (this is where the project WILL be built and run):`,
+    `  Node.js: ${nodeVersion}`,
+    `  Platform: ${process.platform} / ${process.arch}`,
+    "",
+    `When pinning dependencies in your package.json, pick versions`,
+    `that support ${nodeVersion}. This matters especially for NATIVE`,
+    `modules (anything using node-gyp / prebuild-install — e.g.`,
+    `better-sqlite3, bcrypt, sharp, sqlite3). Native-module major`,
+    `versions often drop support for older Node or add support for`,
+    `newer Node in distinct releases; picking a version below the`,
+    `floor required for the host Node will fail to build on install`,
+    `with cryptic C++ compile errors about V8 API changes. When in`,
+    `doubt, pick the LATEST stable major of a native module — it's`,
+    `almost always the one that supports current Node.`,
     "",
     `Task:`,
     task,
