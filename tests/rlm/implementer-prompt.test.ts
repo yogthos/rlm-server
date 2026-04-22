@@ -1,6 +1,9 @@
 import { describe, it, expect } from "vitest";
 import { createDesignGraph } from "../../src/rlm/design-graph.js";
-import { buildImplementerPrompt } from "../../src/rlm/implementer-prompt.js";
+import {
+  buildImplementerPrompt,
+  renderFailureTrend,
+} from "../../src/rlm/implementer-prompt.js";
 
 function seedGraph() {
   const g = createDesignGraph();
@@ -349,5 +352,171 @@ describe("buildImplementerPrompt", () => {
     });
     const p = await buildImplementerPrompt(g, "src/a.ts", "load");
     expect(p).toContain("async function load(): Promise<string>");
+  });
+});
+
+describe("W6 — TDD split + previous test file in retry feedback", () => {
+  it("initial prompt includes TDD-ordering directive (tests first, then body)", async () => {
+    const g = seedGraph();
+    g.addFunction("src/a.ts", "foo", { params: [], returnType: "void" }, "");
+    const prompt = await buildImplementerPrompt(g, "src/a.ts", "foo");
+    expect(prompt).toMatch(/TDD ordering/i);
+    expect(prompt).toMatch(/tests first/i);
+  });
+
+  it("retry prompt surfaces previousTestFile alongside previousBody", async () => {
+    const g = seedGraph();
+    g.addFunction("src/a.ts", "foo", { params: [], returnType: "void" }, "");
+    const prompt = await buildImplementerPrompt(g, "src/a.ts", "foo", {
+      attempt: 2,
+      maxAttempts: 8,
+      previousBody: "export default function foo() { return 1; }",
+      previousTestFile:
+        "import foo from './foo.js';\nit('returns 2', () => expect(foo()).toBe(2));",
+      testOutput: "expected 1 to be 2",
+      previousPassed: 0,
+      previousFailed: 1,
+    });
+    expect(prompt).toContain("Your previous body");
+    expect(prompt).toContain("Your previous unit-test-file");
+    expect(prompt).toContain("expect(foo()).toBe(2)");
+    // Both visible, placed together so the model can diagnose which side
+    // is wrong.
+    expect(prompt.indexOf("previous body")).toBeLessThan(
+      prompt.indexOf("previous unit-test-file"),
+    );
+  });
+
+  it("skips previous-test-file block when feedback has none", async () => {
+    const g = seedGraph();
+    g.addFunction("src/a.ts", "foo", { params: [], returnType: "void" }, "");
+    const prompt = await buildImplementerPrompt(g, "src/a.ts", "foo", {
+      attempt: 1,
+      maxAttempts: 8,
+      previousBody: "// body",
+      testOutput: "x",
+      previousPassed: 0,
+      previousFailed: 1,
+    });
+    expect(prompt).not.toContain("Your previous unit-test-file");
+  });
+});
+
+describe("W5 — compile/load failure banner", () => {
+  it("routes to a COMPILE/LOAD FAILURE banner when loadFailure is set", async () => {
+    const g = seedGraph();
+    g.addFunction(
+      "src/a.ts",
+      "foo",
+      { params: [], returnType: "void" },
+      "",
+    );
+    const prompt = await buildImplementerPrompt(g, "src/a.ts", "foo", {
+      attempt: 1,
+      maxAttempts: 8,
+      previousBody: "export default function foo() {}",
+      testOutput: "error TS2304: Cannot find name 'Entry'",
+      previousPassed: 0,
+      previousFailed: 0,
+      loadFailure: true,
+    });
+    expect(prompt).toContain("COMPILE / LOAD FAILURE");
+    expect(prompt).toMatch(/TS2304|TS2307/);
+    // Should NOT tell the model to tweak assertions first.
+    expect(prompt.indexOf("COMPILE / LOAD FAILURE")).toBeLessThan(
+      prompt.indexOf("Raw test output"),
+    );
+  });
+});
+
+describe("W4 — structured failure block", () => {
+  it("renders Failed tests list + First failure message ahead of raw output", async () => {
+    const g = seedGraph();
+    g.addFunction("src/a.ts", "foo", { params: [], returnType: "void" }, "");
+    const prompt = await buildImplementerPrompt(g, "src/a.ts", "foo", {
+      attempt: 1,
+      maxAttempts: 8,
+      previousBody: "// body",
+      testOutput: "tail of raw tap output",
+      previousPassed: 3,
+      previousFailed: 2,
+      failingTestNames: ["test one", "test two"],
+      firstFailureMessage: "AssertionError: expected 1 to be 2",
+    });
+    expect(prompt).toContain("Failed tests (2):");
+    expect(prompt).toContain("- test one");
+    expect(prompt).toContain("- test two");
+    expect(prompt).toContain("First failure");
+    expect(prompt).toContain("expected 1 to be 2");
+    // Structured block must come before the raw dump.
+    expect(prompt.indexOf("Failed tests")).toBeLessThan(
+      prompt.indexOf("Raw test output"),
+    );
+  });
+});
+
+describe("renderFailureTrend (W2)", () => {
+  it("returns null with insufficient history", () => {
+    expect(renderFailureTrend(undefined, 5, 3)).toBeNull();
+    expect(renderFailureTrend([], 5, 3)).toBeNull();
+  });
+
+  it("reports converging when failed count decreases", () => {
+    const t = renderFailureTrend(
+      [
+        { passed: 5, failed: 8 },
+        { passed: 7, failed: 6 },
+      ],
+      10,
+      3,
+    );
+    expect(t).toContain("8→6→3");
+    expect(t).toContain("converging");
+  });
+
+  it("reports stalled when failed count is identical 3+ times", () => {
+    const t = renderFailureTrend(
+      [
+        { passed: 10, failed: 5 },
+        { passed: 10, failed: 5 },
+      ],
+      10,
+      5,
+    );
+    expect(t).toContain("5→5→5");
+    expect(t).toContain("stalled");
+    expect(t).toMatch(/different approach/i);
+  });
+
+  it("reports regression when failed count increases", () => {
+    const t = renderFailureTrend([{ passed: 10, failed: 2 }], 5, 7);
+    expect(t).toContain("2→7");
+    expect(t).toContain("regressed");
+  });
+
+  it("reports oscillation when counts fluctuate without converging", () => {
+    const t = renderFailureTrend(
+      [
+        { passed: 10, failed: 3 },
+        { passed: 8, failed: 5 },
+      ],
+      10,
+      3,
+    );
+    expect(t).toContain("3→5→3");
+    // Last is less than prev → converging takes priority over oscillation
+    // in this case. That's fine. But when last == prev after changing,
+    // we tag it oscillating:
+    const t2 = renderFailureTrend(
+      [
+        { passed: 10, failed: 3 },
+        { passed: 8, failed: 5 },
+      ],
+      10,
+      5,
+    );
+    expect(t2).toContain("3→5→5");
+    // With 2+ distinct values and current == prev, we mark oscillation.
+    expect(t2).toMatch(/oscillat|stalled/i);
   });
 });

@@ -75,6 +75,13 @@ export interface TestRunResult {
    *  including the stack trace. Surfaced to the Implementer on request
    *  via the `stack-trace` info channel. Optional for back-compat. */
   fullFailureMessages?: Map<string, string>;
+  /** W5 — true when the test FILE failed to load (0 passed, 0 failed,
+   *  ok=false). The function body or test file has a compile / import
+   *  error — the runner never got to the assertion stage. Dispatch
+   *  uses this to surface the feedback as a compile issue, not a test
+   *  issue, so the Implementer routes to "fix imports / syntax"
+   *  instead of "tweak assertions." */
+  loadFailure?: boolean;
 }
 
 export function materializeWithOverride(
@@ -541,13 +548,20 @@ function invokeTestRunner(
       const ok = parsed
         ? parsed.failed === 0 && (parsed.passed > 0 || !hasTests)
         : false;
+      const passedN = parsed?.passed ?? 0;
+      const failedN = parsed?.failed ?? 0;
+      // W5 — load-failure detection: hasTests && 0/0 means the runner
+      // never executed any assertion (typically because the file
+      // failed to parse / resolve imports / compile).
+      const loadFailure = hasTests && !ok && passedN === 0 && failedN === 0;
       resolve({
         ok,
-        passed: parsed?.passed ?? 0,
-        failed: parsed?.failed ?? 0,
+        passed: passedN,
+        failed: failedN,
         output: output.slice(-4000),
         failingTestNames: parsed?.failingTestNames ?? [],
         fullFailureMessages: parsed?.fullFailureMessages ?? new Map(),
+        loadFailure,
       });
     });
   });
@@ -562,8 +576,13 @@ function invokeTestRunner(
  */
 export function extractStderrDiagnostic(stderr: string): string {
   if (!stderr) return "";
+  // W5 — also catch tsx/tsc style error codes (`error TS2304:`, `TS2503:`)
+  // and node's ERR_MODULE_NOT_FOUND. These show up when TypeScript
+  // can't resolve an identifier/import before any test runs. Without
+  // them, the Implementer sees a generic "test output" dump for what
+  // is actually a compile error.
   const markers =
-    /^.*\b(SyntaxError|TypeError|ReferenceError|RangeError|URIError|EvalError|Error \[ERR_[A-Z_]+\]):.*$/gm;
+    /^.*\b(SyntaxError|TypeError|ReferenceError|RangeError|URIError|EvalError|Error \[ERR_[A-Z_]+\]|error TS\d+|TS\d{4}):.*$/gm;
   const hits = stderr.match(markers);
   if (!hits || hits.length === 0) return "";
   // Dedupe in order, cap at a handful so a repeating error doesn't

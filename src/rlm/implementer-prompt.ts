@@ -19,6 +19,60 @@ import type {
 import { computeRelevantFunctions } from "./prompt-scope.js";
 import { renderDecisionsBlock } from "./decisions-prompt.js";
 
+/**
+ * W1 — take the FIRST `limit` chars and, if truncated, append an
+ * explicit note so the model knows there's more content it isn't
+ * seeing. Analyzer/architect violation lists are in source order;
+ * the root cause is usually violation #1, so keep the head.
+ */
+function truncateHead(s: string, limit: number): string {
+  if (s.length <= limit) return s;
+  const kept = s.slice(0, limit);
+  const dropped = s.length - limit;
+  return `${kept}\n…[${dropped} more chars truncated — fix these first, then resubmit to see remaining violations if any]`;
+}
+
+/**
+ * W2 — format a compact one-line progress trend so the Implementer can
+ * see whether it's converging. Combines prior history (oldest-first)
+ * with the most recent attempt. Returns null when there's no history
+ * worth reporting (0 or 1 data points).
+ *
+ * Examples:
+ *   "Progress: failed 8→6→3 (converging ↓)"
+ *   "Progress: failed 5→5→5 (stalled — same count 3× in a row; try a DIFFERENT approach, not another tweak)"
+ *   "Progress: failed 3→5→2 (oscillating; tests you thought were passing now fail — revisit)"
+ */
+export function renderFailureTrend(
+  history: Array<{ passed: number; failed: number }> | undefined,
+  currentPassed: number,
+  currentFailed: number,
+): string | null {
+  const recent = (history ?? []).slice(-4);
+  const series = [...recent, { passed: currentPassed, failed: currentFailed }];
+  if (series.length < 2) return null;
+  const failedCounts = series.map((s) => s.failed);
+  const arrow = failedCounts.join("→");
+  const last = failedCounts[failedCounts.length - 1];
+  const prev = failedCounts[failedCounts.length - 2];
+  const allSame = failedCounts.every((n) => n === failedCounts[0]);
+  if (allSame && failedCounts.length >= 3) {
+    return `Progress: failed ${arrow} (stalled — same count ${failedCounts.length}× in a row; try a DIFFERENT approach, not another tweak to the same shape)`;
+  }
+  if (last < prev) {
+    return `Progress: failed ${arrow} (converging ↓ — keep going)`;
+  }
+  if (last > prev) {
+    return `Progress: failed ${arrow} (regressed ↑ — you broke a previously-passing test; revert or fix what you just changed)`;
+  }
+  // Same count as prior, but earlier differs → oscillation.
+  const oscillating = failedCounts.length >= 3 && !allSame;
+  if (oscillating) {
+    return `Progress: failed ${arrow} (oscillating — fixing one test breaks another; step back and reconsider your mental model, don't tweak)`;
+  }
+  return `Progress: failed ${arrow}`;
+}
+
 function renderParam(p: ParamSpec): string {
   const q = p.optional ? "?" : "";
   const def = p.defaultValue !== undefined ? ` = ${p.defaultValue}` : "";
@@ -109,6 +163,35 @@ export interface ImplementerFeedback {
    *  adding new tests). */
   previousPassed?: number;
   previousFailed?: number;
+  /** W2 — recent history of (passed, failed) counts in oldest-first
+   *  order, excluding the most recent attempt (that's `previousPassed`
+   *  / `previousFailed`). Used to compute a one-line progress trend
+   *  ("converging 8→6→3" vs. "stalled: 5 failed for 3 consecutive
+   *  attempts"). The Implementer seeing this explicitly works better
+   *  than asking it to infer the trend from a stagnating flag. */
+  failureHistory?: Array<{ passed: number; failed: number }>;
+  /** W4 — structured list of failing test names from the last run.
+   *  Rendered as an explicit "Failed tests:" block so the Implementer
+   *  doesn't have to parse TAP/vitest output to identify which tests
+   *  failed. */
+  failingTestNames?: string[];
+  /** W4 — first failure's full message (assertion text + one-line
+   *  stack hint). Rendered under "First failure:" so the root cause
+   *  is visible without requiring a `request-info stack-trace` round
+   *  trip. */
+  firstFailureMessage?: string;
+  /** W5 — true when the test file failed to LOAD (compile/import error
+   *  before any assertion ran). The prompt tags the failure as a
+   *  compile-stage problem ("fix imports / syntax") rather than a
+   *  test-stage problem ("tweak assertions") — different debugging
+   *  approach. */
+  loadFailure?: boolean;
+  /** W6 — full content of the unit test file the Implementer emitted
+   *  on the last attempt. Rendered alongside `previousBody` on retry
+   *  so the model can see BOTH halves of the TDD pair when deciding
+   *  what to revise. Body-only retries let the model forget what the
+   *  tests were asserting; this closes that loop. */
+  previousTestFile?: string;
 }
 
 export interface ImplementerPromptOptions {}
@@ -282,10 +365,39 @@ export async function buildImplementerPrompt(
     "  Use `import type` for imports referenced only in type positions.",
     "- Siblings are ordinary modules — import them with the `.js`",
     "  extension (ESM convention). No framework-provided `ctx` object.",
+    "- CUSTOM cross-function types (e.g. `Entry`, `User`, `Config`) must",
+    "  be DECLARED INLINE at the top of your file — the harness does",
+    '  NOT create a shared "./types.js" or "./common.ts" module, and any',
+    "  relative import that doesn't resolve to a sibling function file",
+    "  will fail the structural check. Duplicate the type across files",
+    "  that need it:",
+    "    interface Entry { id: number; name: string; message: string; }",
+    "    export default function renderPage(entries: Entry[]): string {",
+    "      // ...",
+    "    }",
+    "  Types from external packages (`Database` from better-sqlite3,",
+    "  `IncomingMessage` from node:http, etc.) must be IMPORTED from",
+    "  those packages; don't redeclare them.",
     "",
     ...existingTestsBlock,
     ...existingBlock,
     ...decisionsBlock,
+    "",
+    "**TDD ordering** — write the TESTS FIRST (from the SPEC and edge",
+    "cases above), then write the BODY that satisfies them. Do this",
+    "mentally in two passes even though you emit both fences in one",
+    "response:",
+    "  (1) Read the SPEC; translate each edge-case + example into a",
+    "      concrete `it(\"...\")` case with explicit inputs and",
+    "      expected outputs. Don't peek at the body you're about to",
+    "      write — the tests must encode the contract, not mirror the",
+    "      implementation.",
+    "  (2) NOW write the body. Use the tests as the target: anything",
+    "      they assert is required; anything they don't check is free.",
+    "This ordering prevents the \"model wrote tests to match its own",
+    "buggy body\" failure mode. If the tests and body disagree later,",
+    "you can revise either — but the FIRST iteration must put the",
+    "tests ahead of the code in your thinking.",
     "",
     "Task — emit TWO (or THREE) fenced blocks in your response:",
     "",
@@ -416,6 +528,23 @@ export async function buildImplementerPrompt(
       feedback.previousBody,
       "```",
     );
+    // W6 — show the previous test file alongside the body so the model
+    // can revise EITHER. Body-only retries invite the model to tweak
+    // the implementation to match buggy tests (or vice versa). Seeing
+    // both lets it diagnose which side is wrong.
+    if (feedback.previousTestFile && feedback.previousTestFile.length > 0) {
+      lines.push(
+        "",
+        "Your previous unit-test-file (review this alongside the body —",
+        "if a failing assertion doesn't match what the SPEC requires,",
+        "the TEST is the bug, not the body):",
+        "```",
+        feedback.previousTestFile.length > 4000
+          ? `${feedback.previousTestFile.slice(0, 4000)}\n…[${feedback.previousTestFile.length - 4000} more chars]`
+          : feedback.previousTestFile,
+        "```",
+      );
+    }
     if (typeof feedback.previousPassed === "number") {
       lines.push(
         "",
@@ -424,6 +553,16 @@ export async function buildImplementerPrompt(
         "were already passing. If a previously-passing test now fails,",
         "your new body broke something that was working.",
       );
+      // W2 — progress trend. Include up to 4 most-recent prior counts
+      // (+ the current "previous") so the model can see whether its
+      // work is converging. A stalled trend is a strong signal to
+      // change approach, not to tweak.
+      const trend = renderFailureTrend(
+        feedback.failureHistory,
+        feedback.previousPassed,
+        feedback.previousFailed ?? 0,
+      );
+      if (trend) lines.push("", trend);
     }
     // Body-size advisory — a large body usually means the function is
     // doing more than the ~30-line budget admits, which itself causes
@@ -441,12 +580,16 @@ export async function buildImplementerPrompt(
       );
     }
     if (feedback.analyzerFeedback) {
+      // W1 — take the FIRST slice of violations, not the last. Violations
+      // tend to be in source order (top of file down), and violation #1
+      // is usually the root cause — later ones cascade. Truncating from
+      // the end drops the most actionable message.
       lines.push(
         "",
         "Static-analysis violation (tests were NOT run — the body failed",
         "a structural proc-ts check):",
         "```",
-        feedback.analyzerFeedback.slice(-2000),
+        truncateHead(feedback.analyzerFeedback, 2000),
         "```",
         "",
         "Fix the listed violation(s) and resubmit. This is a structural",
@@ -458,15 +601,70 @@ export async function buildImplementerPrompt(
         "Architect review feedback (tests PASSED — the Architect rejected",
         "the body against the SPEC; this is NOT a test failure):",
         "```",
-        feedback.architectFeedback.slice(-2000),
+        truncateHead(feedback.architectFeedback, 2000),
         "```",
         "",
         "Revise the body (and/or tests) to address the Architect's concerns.",
       );
     } else {
+      // W5 — compile-stage failure: the test file didn't even load
+      // (0 passed / 0 failed). Route the model to fix imports,
+      // syntax, or missing type declarations BEFORE thinking about
+      // assertions. Common causes: TS2304 Cannot find name,
+      // TS2307 Cannot find module, TS2503 Cannot find namespace,
+      // ERR_MODULE_NOT_FOUND.
+      if (feedback.loadFailure) {
+        lines.push(
+          "",
+          "**COMPILE / LOAD FAILURE** — no tests ran. The test file or",
+          "your body has a syntax error, a bad import, or references",
+          "an undeclared type/symbol. Fix the compile error first, then",
+          "resubmit; assertion-level revisions are pointless until the",
+          "file loads.",
+          "",
+          "Common causes and fixes:",
+          "  - `TS2304: Cannot find name 'X'` — add an `import` for X,",
+          "    or declare the type inline (`interface X { ... }`).",
+          "  - `TS2307: Cannot find module './y.js'` — only sibling",
+          "    function files exist (`./<fn>.js`). The harness does NOT",
+          "    create `./types.js` or shared helpers. Inline what you need.",
+          "  - `ERR_MODULE_NOT_FOUND` — same as TS2307 at runtime; the",
+          "    import target doesn't exist on disk.",
+          "  - `SyntaxError` — parse failed; check braces/brackets/",
+          "    template-string escaping.",
+        );
+      }
+      // W4 — structured failure digest. The raw TAP/vitest dump still
+      // follows but the model sees the shaped version first: which
+      // tests failed, and what the first one's error was. Avoids
+      // forcing a `request-info stack-trace` round trip for the
+      // common "what went wrong" question.
+      if (feedback.failingTestNames && feedback.failingTestNames.length > 0) {
+        lines.push(
+          "",
+          `Failed tests (${feedback.failingTestNames.length}):`,
+        );
+        for (const n of feedback.failingTestNames.slice(0, 20)) {
+          lines.push(`  - ${n}`);
+        }
+        if (feedback.failingTestNames.length > 20) {
+          lines.push(
+            `  …(${feedback.failingTestNames.length - 20} more — fix the listed ones first)`,
+          );
+        }
+      }
+      if (feedback.firstFailureMessage) {
+        lines.push(
+          "",
+          "First failure (full assertion message):",
+          "```",
+          truncateHead(feedback.firstFailureMessage, 1200),
+          "```",
+        );
+      }
       lines.push(
         "",
-        "Test output:",
+        "Raw test output (tail):",
         "```",
         feedback.testOutput.slice(-2000),
         "```",

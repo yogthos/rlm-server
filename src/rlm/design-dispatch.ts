@@ -961,8 +961,26 @@ export function createDesignDispatchBridge(
       let stagnationFired = false;
       let lastFailureSignature: string | null = null;
       let identicalFailureStreak = 0;
+      // W3 — failed count of the prior RED run; used to detect "same
+      // count, different failing-test set" (whack-a-mole).
+      let priorRedFailedCount = -1;
+      // W2 — rolling history of (passed, failed) over prior attempts,
+      // oldest-first, excluding the most recent (that's lastPassed/Failed).
+      // Used to render a converging/stalled/oscillating trend line in
+      // the retry prompt.
+      const failureHistory: Array<{ passed: number; failed: number }> = [];
+      // W3 — whack-a-mole detection: failed count unchanged but the
+      // failing-test SET shifts. Tracks consecutive runs where the
+      // count matches the prior run BUT the set differs — the
+      // signature of "fix one, break another." Parallel to
+      // `identicalFailureStreak` but catches the dual pattern.
+      let shiftingSetStreak = 0;
       /** Max consecutive identical test-red signatures before bail. */
       const STAGNATION_BAIL_STREAK = 2;
+      /** Max consecutive "same count, shifting set" runs before bail.
+       *  One extra than the identical-set streak because oscillation
+       *  can look like genuine (if small) progress on any single hop. */
+      const OSCILLATION_BAIL_STREAK = 3;
       // Track the MOST-RECENT tests-green body so we never regress to
       // null on exhaustion. If the Implementer gets a green pass but
       // the architect REVISE's indefinitely, keep the green body; on
@@ -1005,13 +1023,14 @@ export function createDesignDispatchBridge(
           knownSiblings: preKnownNames,
         });
         if (preViolations.length > 0) {
+          const firstPreViolation = preViolations[0].slice(0, 240);
           debug(
             "dispatch",
-            `pre-test body-analyzer REJECTED ${key}: ${preViolations.length} violation(s)`,
+            `pre-test body-analyzer REJECTED ${key}: ${preViolations.length} violation(s) — first: ${firstPreViolation}`,
           );
           debug(
             "progress",
-            `dispatch: ${key} pre-test body-analyzer REJECTED — ${preViolations.length} violation(s)`,
+            `dispatch: ${key} pre-test body-analyzer REJECTED — ${preViolations.length} violation(s): ${firstPreViolation}`,
           );
           // Prime feedback so attempt 0 of the regenerate loop sees
           // the violation list. Don't run tests — the body is known
@@ -1090,6 +1109,12 @@ export function createDesignDispatchBridge(
       // Last test run's full failure messages, surfaced via the
       // `stack-trace` request-info handler. Populated per test run.
       let lastFullFailureMessages: Map<string, string> | undefined;
+      // W4 — structured failure digest fed to the next retry prompt.
+      let lastFailingTestNames: string[] = [];
+      let lastFirstFailureMessage: string | null = null;
+      // W5 — compile/load failure signal. Set when the test runner
+      // reports 0/0 with hasTests (parse error / missing import).
+      let lastLoadFailure = false;
       for (let attempt = 0; attempt < maxAttempts; attempt++) {
         actualAttempts = attempt + 1;
         // Use feedback on attempt 0 too, as long as something primed it
@@ -1129,6 +1154,12 @@ export function createDesignDispatchBridge(
                 stagnating,
                 previousPassed: lastPassedCount >= 0 ? lastPassedCount : undefined,
                 previousFailed: lastFailedCount >= 0 ? lastFailedCount : undefined,
+                failureHistory: failureHistory.length > 0 ? failureHistory : undefined,
+                failingTestNames: lastFailingTestNames.length > 0 ? lastFailingTestNames : undefined,
+                firstFailureMessage: lastFirstFailureMessage ?? undefined,
+                loadFailure: lastLoadFailure,
+                previousTestFile:
+                  graph.getFunction(module, name)?.unitTestFile ?? undefined,
               },
         );
         // Consumed — clear so a subsequent test-failure retry uses
@@ -1281,13 +1312,14 @@ export function createDesignDispatchBridge(
           previousBody = body;
           pendingAnalyzerFeedback = violations.join("\n\n");
           testOutput = ""; // tests were NOT run
+          const firstViolation = violations[0].slice(0, 240);
           debug(
             "dispatch",
-            `body-analyzer REJECTED ${key}: ${violations.length} violation(s)`,
+            `body-analyzer REJECTED ${key}: ${violations.length} violation(s) — first: ${firstViolation}`,
           );
           debug(
             "progress",
-            `dispatch: ${key} body-analyzer REJECTED — ${violations.length} violation(s)`,
+            `dispatch: ${key} body-analyzer REJECTED — ${violations.length} violation(s): ${firstViolation}`,
           );
           continue;
         }
@@ -1444,6 +1476,21 @@ export function createDesignDispatchBridge(
         // `stack-trace` handler can surface them on the next attempt
         // if the Implementer asks.
         lastFullFailureMessages = tr.fullFailureMessages;
+        // W4 — capture the structured digest for the next retry
+        // prompt. The Implementer sees a "Failed tests:" list plus
+        // the first failure's full message without needing to issue
+        // a request-info stack-trace.
+        lastFailingTestNames = [...(tr.failingTestNames ?? [])];
+        if (lastFailingTestNames.length > 0 && tr.fullFailureMessages) {
+          const firstName = lastFailingTestNames[0];
+          lastFirstFailureMessage =
+            tr.fullFailureMessages.get(firstName) ?? null;
+        } else {
+          lastFirstFailureMessage = null;
+        }
+        // W5 — capture load/compile failure signal so the retry prompt
+        // can route the model to compile-stage fixes.
+        lastLoadFailure = tr.loadFailure === true;
         // On load failure (0/0 with hasTests), append the RENDERED
         // test file so the implementer can see what the harness
         // actually materialized — they write tests as JSON
@@ -1485,6 +1532,17 @@ export function createDesignDispatchBridge(
           }
         }
         priorBodyLength = body.length;
+        // W2 — record history BEFORE overwriting lastFailedCount, so
+        // the history holds the attempt we just completed (the one
+        // that's about to become "previous"). Kept to a 4-deep window;
+        // trend rendering only needs the recent shape.
+        if (lastFailedCount >= 0 && lastPassedCount >= 0) {
+          failureHistory.push({
+            passed: lastPassedCount,
+            failed: lastFailedCount,
+          });
+          if (failureHistory.length > 4) failureHistory.shift();
+        }
         lastFailedCount = tr.failed;
         lastPassedCount = tr.passed;
 
@@ -1512,10 +1570,28 @@ export function createDesignDispatchBridge(
               : `counts:${tr.failed}/${tr.passed}|${(tr.output ?? "").slice(0, 300)}`;
           if (sig === lastFailureSignature) {
             identicalFailureStreak++;
+            // Identical set also zeros the oscillation streak — the
+            // test set isn't shifting, so whack-a-mole isn't the
+            // diagnosis here; the identical-set detector handles it.
+            shiftingSetStreak = 0;
           } else {
             identicalFailureStreak = 1;
+            // W3 — track the whack-a-mole pattern: same COUNT but
+            // different SET. Only kicks in once we have a prior
+            // signature to compare against (≥ second red run) and the
+            // failed counts actually match.
+            if (
+              lastFailureSignature !== null &&
+              tr.failed === priorRedFailedCount
+            ) {
+              shiftingSetStreak++;
+            } else {
+              shiftingSetStreak = 1;
+            }
           }
           lastFailureSignature = sig;
+          priorRedFailedCount = tr.failed;
+          // Bail on identical-set stagnation (original detector).
           if (identicalFailureStreak >= STAGNATION_BAIL_STREAK) {
             debug(
               "dispatch",
@@ -1560,9 +1636,55 @@ export function createDesignDispatchBridge(
               error: "stagnation: identical failing-test set across attempts",
             };
           }
+          // W3 — bail on oscillation: same failed count, shifting test
+          // set. This is the parseFormData whack-a-mole pattern that
+          // the identical-set detector misses. Trigger one streak
+          // later than the identical-set path because ANY single hop
+          // can plausibly look like progress mid-convergence.
+          if (shiftingSetStreak >= OSCILLATION_BAIL_STREAK) {
+            debug(
+              "dispatch",
+              `oscillation bail ${key} — ${shiftingSetStreak} runs with failed=${tr.failed} but shifting failing-test set`,
+            );
+            debug(
+              "progress",
+              `dispatch: ${key} OSCILLATION BAIL — ${shiftingSetStreak} runs, same count ${tr.failed}, shifting test set (whack-a-mole)`,
+            );
+            if (lastGreenBody) {
+              graph.setImplementation(module, name, lastGreenBody.body);
+              graph.setTestStatus(
+                module,
+                name,
+                "architect-rejected",
+                lastGreenBody.output,
+              );
+              return {
+                module,
+                name,
+                status: "stagnated",
+                implementation: lastGreenBody.body,
+                attempts: actualAttempts,
+                testOutput: lastGreenBody.output,
+                error: "oscillation: same fail count, shifting test set",
+              };
+            }
+            graph.setImplementation(module, name, body);
+            graph.setTestStatus(module, name, "tests-red", tr.output);
+            return {
+              module,
+              name,
+              status: "stagnated",
+              implementation: body,
+              attempts: actualAttempts,
+              testOutput: tr.output,
+              error: "oscillation: same fail count, shifting test set",
+            };
+          }
         } else {
           // Reset the streak on anything that isn't a red run.
           identicalFailureStreak = 0;
+          shiftingSetStreak = 0;
+          priorRedFailedCount = -1;
           lastFailureSignature = null;
         }
 

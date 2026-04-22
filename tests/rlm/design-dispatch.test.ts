@@ -2173,6 +2173,54 @@ describe("createDesignDispatchBridge", () => {
     expect(attempts).toBeLessThan(8);
   });
 
+  it("bails on oscillation — same failed count, shifting failing-test set (W3)", async () => {
+    // parseFormData pattern: each attempt fixes one failing test but
+    // breaks another. Failed count stays at 2 forever; identical-set
+    // detector can't catch it because the set rotates. W3 detects
+    // "same count + different set" and bails after OSCILLATION_BAIL_STREAK
+    // (3) consecutive runs.
+    const g = createDesignGraph();
+    g.addFunction("src/a.ts", "foo", { params: [], returnType: "void" });
+    let call = 0;
+    // Three distinct failing-test sets, each size 2 — whack-a-mole.
+    const sets = [
+      ["test-empty", "test-null"],
+      ["test-null", "test-undefined"],
+      ["test-undefined", "test-whitespace"],
+      ["test-empty", "test-whitespace"],
+    ];
+    let attempts = 0;
+    const b = createDesignDispatchBridge(
+      g,
+      async () => {
+        attempts++;
+        return (
+          '```ts\nreturn undefined;\n```\n' +
+          '```unit-tests\n[{"name":"t","code":"expect(foo()).toBeDefined();"}]\n```'
+        );
+      },
+      {
+        runTests: async () => {
+          const names = sets[call % sets.length];
+          call++;
+          return {
+            ok: false,
+            passed: 10,
+            failed: 2,
+            output: `failed: ${names.join(", ")}`,
+            failingTestNames: names,
+          };
+        },
+        maxAttempts: 8,
+      },
+    );
+    const result = await b.dispatch("src/a.ts", "foo");
+    expect(result.status).toBe("stagnated");
+    expect(result.error).toMatch(/oscillat/i);
+    // Should have bailed well before maxAttempts.
+    expect(attempts).toBeLessThan(8);
+  });
+
   it("threads externalFeedback into the implementer prompt (integration-loop path)", async () => {
     // When the integration loop calls dispatch with a failure message,
     // the dispatcher must prime the Implementer's first prompt with
