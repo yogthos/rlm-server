@@ -476,6 +476,17 @@ describe("W7 — body-unchanged directive", () => {
   });
 });
 
+describe("W10 — vitest type-usage guidance", () => {
+  it("initial prompt warns about `vi.Mock` as a namespace (TS2503)", async () => {
+    const g = seedGraph();
+    g.addFunction("src/a.ts", "foo", { params: [], returnType: "void" }, "");
+    const prompt = await buildImplementerPrompt(g, "src/a.ts", "foo");
+    expect(prompt).toMatch(/VITEST TYPE USAGE/);
+    expect(prompt).toMatch(/TS2503/);
+    expect(prompt).toMatch(/import type \{ Mock/);
+  });
+});
+
 describe("W8 — mocking strategy guidance", () => {
   it("initial prompt mentions :memory: and real ephemeral instances", async () => {
     const g = seedGraph();
